@@ -43,11 +43,25 @@ func (e *Engine) handleReorg(ctx context.Context, reorg provider.ReorgNotificati
 	// Deregister factory children whose deploy block is in the reverted range.
 	e.reorgFactoryChildren(ctx, reorg.StartBlock, reorg.EndBlock)
 
+	// Deregister discovered contracts whose deploy block is in the reverted range.
+	e.reorgDiscoveredContracts(ctx, reorg.StartBlock, reorg.EndBlock)
+
 	// Reset per-contract cursors to just before the reorg start.
 	newCursor := reorg.StartBlock
 	if newCursor > 0 {
 		newCursor--
 	}
+
+	// Reset discovery cursor if it was past the reorg point.
+	if e.discovery != nil {
+		discCursor, err := e.store.GetCursor(ctx, discoveryCursorName)
+		if err == nil && discCursor >= reorg.StartBlock {
+			if err := e.store.SetCursor(ctx, discoveryCursorName, newCursor); err != nil {
+				e.logger.Error("failed to reset discovery cursor", "error", err)
+			}
+		}
+	}
+
 	for _, cs := range e.contracts {
 		cursor, err := e.store.GetCursor(ctx, cs.config.Name)
 		if err != nil {

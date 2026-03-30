@@ -63,8 +63,8 @@ func Validate(cfg *Config) error {
 		}
 	}
 
-	if len(cfg.Contracts) == 0 {
-		return fieldError("contracts", "at least one contract is required")
+	if len(cfg.Contracts) == 0 && len(cfg.Discover) == 0 {
+		return fieldError("contracts", "at least one contract or discover entry is required")
 	}
 
 	for i := range cfg.Contracts {
@@ -92,6 +92,11 @@ func Validate(cfg *Config) error {
 				return err
 			}
 		}
+	}
+
+	// Validate discover configs.
+	if err := validateDiscover(cfg.Discover); err != nil {
+		return err
 	}
 
 	return nil
@@ -160,6 +165,63 @@ func validateFactory(f *FactoryConfig, prefix string) error {
 	}
 	if err := validateEvents(f.ChildEvents, fPrefix); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateDiscover validates discover config entries for class hash watching.
+func validateDiscover(discovers []DiscoverConfig) error {
+	seenClassHashes := make(map[string]bool)
+	for i := range discovers {
+		d := &discovers[i]
+		prefix := fmt.Sprintf("discover[%d]", i)
+
+		if d.ClassHash == "" {
+			return fieldError(prefix+".class_hash", "required")
+		}
+		if err := validateHexHash(d.ClassHash); err != nil {
+			return fieldError(prefix+".class_hash", err.Error())
+		}
+		if seenClassHashes[d.ClassHash] {
+			return fieldError(prefix+".class_hash", "duplicate class hash")
+		}
+		seenClassHashes[d.ClassHash] = true
+
+		if d.ABI == "" {
+			return fieldError(prefix+".abi", "required")
+		}
+		if len(d.Events) == 0 {
+			return fieldError(prefix+".events", "at least one event is required")
+		}
+		if err := validateEvents(d.Events, prefix); err != nil {
+			return err
+		}
+
+		// Validate optional group name: lowercase alphanumeric + hyphens.
+		if d.Group != "" {
+			for _, c := range d.Group {
+				if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+					return fieldError(prefix+".group", "must be lowercase alphanumeric with hyphens only")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// validateHexHash checks that a string looks like a valid hex hash (0x-prefixed, 1-64 hex chars).
+func validateHexHash(hash string) error {
+	if !strings.HasPrefix(hash, "0x") {
+		return fmt.Errorf("must start with 0x")
+	}
+	hex := hash[2:]
+	if hex == "" || len(hex) > 64 {
+		return fmt.Errorf("hex part must be 1-64 characters")
+	}
+	for _, c := range hex {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return fmt.Errorf("invalid hex character: %c", c)
+		}
 	}
 	return nil
 }

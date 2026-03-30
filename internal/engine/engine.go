@@ -107,6 +107,9 @@ type Engine struct {
 
 	// onContractDeregistered is called after a contract is deregistered.
 	onContractDeregistered func(name string)
+
+	// discovery holds state for class-hash-based contract discovery (3.9).
+	discovery *discoveryState
 }
 
 // New creates an Engine with the given dependencies.
@@ -464,6 +467,11 @@ func (e *Engine) Run(ctx context.Context) error {
 // setup resolves ABIs, builds event registries and table schemas, and creates
 // tables in the store. Also loads persisted dynamic contracts.
 func (e *Engine) setup(ctx context.Context) error {
+	// Initialize contract discovery if configured.
+	if err := e.setupDiscovery(); err != nil {
+		return fmt.Errorf("setup discovery: %w", err)
+	}
+
 	// Load static contracts from config.
 	allContracts := make([]config.ContractConfig, len(e.cfg.Contracts))
 	copy(allContracts, e.cfg.Contracts)
@@ -630,6 +638,20 @@ func (e *Engine) buildSubscriptions(startBlocks map[string]uint64) []provider.Co
 
 		subs = append(subs, sub)
 	}
+
+	// Add UDC subscription for contract discovery by class hash.
+	if e.discovery != nil {
+		udcStart := e.discoveryStartBlock(context.Background())
+		subs = append(subs, provider.ContractSubscription{
+			Address:    e.discovery.udcAddress,
+			StartBlock: udcStart,
+			Keys:       [][]*felt.Felt{{e.discovery.udcSelector}},
+		})
+		e.logger.Info("UDC subscription added for contract discovery",
+			"start_block", udcStart,
+		)
+	}
+
 	return subs
 }
 
@@ -660,6 +682,13 @@ func (e *Engine) eventLoop(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
+
+			// Route UDC events to the discovery handler instead of normal processing.
+			if e.isDiscoveryEvent(&event) {
+				e.handleDiscoveryEvent(ctx, &event)
+				continue
+			}
+
 			if err := e.processEvent(ctx, &event); err != nil {
 				e.logger.Error("event processing failed",
 					"block", event.BlockNumber,

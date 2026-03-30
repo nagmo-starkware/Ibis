@@ -17,6 +17,7 @@ type Config struct {
 	API       APIConfig        `yaml:"api"`
 	Indexer   IndexerConfig    `yaml:"indexer"`
 	Contracts []ContractConfig `yaml:"contracts"`
+	Discover  []DiscoverConfig `yaml:"discover,omitempty"`
 }
 
 type DatabaseConfig struct {
@@ -69,6 +70,9 @@ type ContractConfig struct {
 
 	// SharedTables indicates this child contract writes to shared factory tables.
 	SharedTables bool `yaml:"-" json:"shared_tables,omitempty"`
+
+	// DiscoverClassHash is set on contracts discovered via class hash watching (3.9).
+	DiscoverClassHash string `yaml:"-" json:"discover_class_hash,omitempty"`
 }
 
 // FactoryConfig defines factory contract indexing settings.
@@ -92,6 +96,28 @@ type FactoryConfig struct {
 	// Supports {factory}, {short_address}, and factory event field names.
 	// Default: "{factory}_{short_address}"
 	ChildNameTemplate string `yaml:"child_name_template,omitempty" json:"child_name_template,omitempty"`
+}
+
+// DiscoverConfig defines class-hash-based contract discovery settings.
+// When a ContractDeployed event from the UDC matches a watched class hash,
+// ibis auto-registers the new contract for indexing.
+type DiscoverConfig struct {
+	// ClassHash is the class hash to watch for in UDC deploy events.
+	ClassHash string `yaml:"class_hash" json:"class_hash"`
+
+	// Group is an optional logical namespace for discovered contracts.
+	Group string `yaml:"group,omitempty" json:"group,omitempty"`
+
+	// ABI is the ABI source for discovered contracts ("fetch" or file path).
+	ABI string `yaml:"abi" json:"abi"`
+
+	// Events defines the event/table config template applied to discovered contracts.
+	Events []EventConfig `yaml:"events" json:"events"`
+
+	// NameTemplate is an optional template for naming discovered contracts.
+	// Supports {class_hash_short}, {address_short}, {class_hash}, {address}, {group}.
+	// Default: "{class_hash_short}_{address_short}"
+	NameTemplate string `yaml:"name_template,omitempty" json:"name_template,omitempty"`
 }
 
 type EventConfig struct {
