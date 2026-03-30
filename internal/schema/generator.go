@@ -146,6 +146,46 @@ func BuildTableSchema(contractName string, ev *abi.EventDef, ec config.EventConf
 	}
 }
 
+// ViewMetadataColumns returns the standard metadata columns added to view function tables.
+func ViewMetadataColumns() []types.Column {
+	return []types.Column{
+		{Name: "block_number", Type: "uint64"},
+		{Name: "timestamp", Type: "uint64"},
+		{Name: "contract_address", Type: "string"},
+		{Name: "_view_key", Type: "string"},
+	}
+}
+
+// BuildViewSchema creates a TableSchema for a view function's polled results.
+// Maps function output members to table columns using the same type mapping as events.
+func BuildViewSchema(contractName string, funcDef *abi.FunctionDef, viewCfg config.ViewConfig) *types.TableSchema {
+	tableName := strings.ToLower(contractName + "_" + funcDef.Name)
+
+	columns := ViewMetadataColumns()
+
+	// Add output columns from function definition.
+	for _, output := range funcDef.Outputs {
+		columns = append(columns, types.Column{
+			Name: output.Name,
+			Type: CairoTypeToColumnType(output.Type),
+		})
+	}
+
+	tableType := types.TableTypeLog
+	if viewCfg.Table.Type == "unique" {
+		tableType = types.TableTypeUnique
+	}
+
+	return &types.TableSchema{
+		Name:      tableName,
+		Contract:  contractName,
+		Event:     funcDef.Name,
+		TableType: tableType,
+		Columns:   columns,
+		UniqueKey: viewCfg.Table.UniqueKey,
+	}
+}
+
 // CairoTypeToColumnType maps a Cairo type definition to a store column type string.
 func CairoTypeToColumnType(td *abi.TypeDef) string {
 	switch td.Kind {

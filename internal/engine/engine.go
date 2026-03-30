@@ -110,6 +110,9 @@ type Engine struct {
 
 	// discovery holds state for class-hash-based contract discovery (3.9).
 	discovery *discoveryState
+
+	// poller handles periodic view function polling (3.20).
+	poller *ViewPoller
 }
 
 // New creates an Engine with the given dependencies.
@@ -450,6 +453,18 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Start view poller alongside event subscriber.
+	if e.poller != nil && e.poller.HasEntries() {
+		if e.onEvent != nil {
+			e.poller.SetOnEvent(e.onEvent)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.poller.Run(subCtx)
+		}()
+	}
+
 	// Step 4: Main event loop.
 	err = e.eventLoop(ctx)
 
@@ -553,6 +568,33 @@ func (e *Engine) setup(ctx context.Context) error {
 			)
 		}
 	}
+
+	// Set up view function poller for contracts with views configured.
+	vp := NewViewPoller(e.provider, e.store, e.logger)
+	viewSchemas, err := vp.Setup(e.contracts)
+	if err != nil {
+		return fmt.Errorf("view poller setup: %w", err)
+	}
+	for _, vs := range viewSchemas {
+		// Add view schemas to the contract's schema map so they're
+		// included in Schemas() and accessible by the API server.
+		for _, cs := range e.contracts {
+			if cs.config.Name == vs.Contract {
+				cs.schemas[vs.Event] = vs
+				break
+			}
+		}
+		// Create view table in store.
+		if err := e.store.CreateTable(ctx, vs); err != nil {
+			return fmt.Errorf("create view table %s: %w", vs.Name, err)
+		}
+		e.logger.Info("created view table",
+			"name", vs.Name,
+			"type", vs.TableType,
+			"columns", len(vs.Columns),
+		)
+	}
+	e.poller = vp
 
 	return nil
 }
@@ -768,6 +810,14 @@ func (e *Engine) InjectContractForTest(cc *config.ContractConfig, schemas map[st
 		address: addr,
 		schemas: schemas,
 	})
+}
+
+// ViewStatuses returns status info for all polled view functions.
+func (e *Engine) ViewStatuses() []ViewStatus {
+	if e.poller == nil {
+		return nil
+	}
+	return e.poller.Status()
 }
 
 // Store returns the engine's store (for testing/inspection).

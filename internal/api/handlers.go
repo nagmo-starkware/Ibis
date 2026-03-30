@@ -234,6 +234,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		if len(factories) > 0 {
 			resp["factories"] = factories
 		}
+
+		// Add view function status.
+		views := s.engine.ViewStatuses()
+		if len(views) > 0 {
+			resp["views"] = views
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)

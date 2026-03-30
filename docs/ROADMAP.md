@@ -334,6 +334,87 @@
             type: log
   ```
 
+### 3.22 UDC Event Format Detection & Override
+
+**Description**: The discover code in `handleDiscoveryEvent` hardcodes the v1 (modern Cairo) UDC event layout where `keys[1]` = deployed address and `data[0]` = class hash. The older Cairo 0 UDC puts all fields in the data array (`data[0]` = address, `data[3]` = classHash), with only the event selector in keys. Anyone running ibis against a chain with the older UDC — including early devnet versions and certain appchains — hits silent mismatches. This task adds three layers of UDC format handling: auto-detection from the event shape, a named version enum for the two known layouts, and fine-grained index overrides for truly custom UDC variants.
+
+**Requirements**:
+- [ ] Add `UDCEventFormat` struct to `internal/config/config.go` with fields: `Version` (string: `"auto"` | `"v0"` | `"v1"`, default `"auto"`), `AddressKey` / `AddressData` (optional int pointers for key/data index of deployed address), `ClassHashKey` / `ClassHashData` (optional int pointers for key/data index of class hash)
+- [ ] Add `UDCEvent *UDCEventFormat` field to `IndexerConfig` (`yaml:"udc_event,omitempty"`)
+- [ ] Config validation: reject if both `AddressKey` and `AddressData` are set (mutually exclusive — address is in keys OR data, not both); same for `ClassHashKey`/`ClassHashData`; validate index values are non-negative; validate `version` is one of `auto`, `v0`, `v1`; reject fine-grained overrides when `version` is `v0` or `v1` (overrides only apply with `version: auto` or when version is omitted)
+- [ ] Implement auto-detection in `handleDiscoveryEvent`: if `len(keys) >= 4`, use v1 layout (keys[1] = address, data[0] = classHash); if `len(keys) == 1 && len(data) >= 4`, use v0 layout (data[0] = address, data[3] = classHash); if neither matches, log a warning with the actual key/data lengths and skip the event
+- [ ] When `version` is explicitly `v0` or `v1`, skip auto-detection and use the fixed layout directly
+- [ ] When fine-grained overrides are present (e.g., `address_key: 2`), use the specified indices regardless of auto-detection, falling back to the version's defaults for any unspecified field
+- [ ] Add `extractDeployedAddress` and `extractClassHash` helper methods on `discoveryState` (or a `udcEventParser` struct) that encapsulate the format resolution logic, keeping `handleDiscoveryEvent` clean
+- [ ] Bounds-check all index accesses against actual `len(keys)` and `len(data)` — return a descriptive error rather than panicking on out-of-range access
+- [ ] Log the detected or configured UDC event format at startup (in `setupDiscovery`) so users can verify which layout ibis is using
+- [ ] Unit tests: auto-detection with v0-shaped events (1 key, 4+ data), auto-detection with v1-shaped events (4+ keys), explicit `version: v0` override, explicit `version: v1` override, fine-grained index overrides, bounds-check failures, malformed events that match neither pattern
+
+**Implementation Notes**:
+- The two known UDC layouts are:
+  - **v1 (modern Cairo)**: `keys[0]=selector, keys[1]=address, keys[2]=deployer, keys[3]=unique` / `data[0]=classHash, data[1..n]=calldata, data[n+1]=salt`
+  - **v0 (Cairo 0)**: `keys[0]=selector` / `data[0]=address, data[1]=deployer, data[2]=unique, data[3]=classHash, data[4]=calldata_len, data[5..]=calldata, data[last]=salt`
+- Auto-detection heuristic is reliable because the two layouts have non-overlapping key counts (1 vs 4+). Edge cases where `len(keys) == 2` or `len(keys) == 3` don't correspond to any known UDC and should trigger the warning path.
+- Config YAML shape:
+  ```yaml
+  indexer:
+    udc_address: "0x041a78e7..."
+    udc_event:
+      version: auto          # auto | v0 | v1 (default: auto)
+      # Fine-grained overrides (optional, for custom UDC variants):
+      # address_key: 1       # index in keys[] for deployed address
+      # class_hash_data: 0   # index in data[] for class hash
+  ```
+- The `discoveryState` struct should store the resolved format (either from config or first auto-detection) so that subsequent events don't re-run the heuristic. However, if `version: auto`, re-detect per event since a chain could theoretically have both UDC versions at different addresses (though `udc_address` makes this unlikely).
+- The `starknet-devnet-rs` UDC uses the v1 layout at a different address (handled by the existing `udc_address` config from 3.21). The v0 layout is found on older `starknet-devnet` (Python) and some early appchains.
+- Existing tests in `discover_test.go` construct events with the v1 layout — they should continue passing unchanged since auto-detect will resolve to v1 for those events. Add new test cases for v0 events alongside them.
+
+### 3.23 Shared Tables for Discovered & Admin-Registered Contracts
+
+**Description**: Extend shared table support beyond factory children to class-hash-discovered contracts and admin-registered contracts. Right now `shared_tables` only works for factory children — the `RegisterContract` path passes `nil` for `buildOpts`, and the discover path creates per-instance tables for every discovered contract. But the whole point of class-hash discovery is "these are all the same contract type" — they should naturally share tables. The existing `contract_address` column in log tables already supports per-contract filtering, so shared tables work without schema changes. This task reuses the exact shared-table machinery that factory children already use (`BuildOptions`, `sharedSchemas` caching, composite unique keys) and wires it into the two paths that currently lack it.
+
+**Requirements**:
+- [ ] Add `SharedTables bool` field (`yaml:"shared_tables" json:"shared_tables"`) to `DiscoverConfig` in `internal/config/config.go`
+- [ ] Config validation: when `shared_tables: true` on a discover entry, require `abi` to be a named value (not `"fetch"` or a file path) so there is a clean table prefix — reject with a descriptive error otherwise
+- [ ] In `handleDiscoveryEvent` / discovery registration path (`internal/engine/discover.go`): when `dc.SharedTables` is true, follow the `registerSharedChild` pattern — first discovered contract creates shared tables using `BuildOptions{SharedTable: true, FactoryName: dc.ABI}`, subsequent discoveries reuse cached shared schemas from `discoveryState`
+- [ ] Add a `sharedSchemas map[string][]*types.TableSchema` field to `discoveryState` (keyed by class hash) to cache shared schemas across discoveries of the same class hash
+- [ ] Set `ContractConfig.SharedTables = true` and `ContractConfig.FactoryName = dc.ABI` on discovered child configs when the discover entry has `shared_tables: true`, so schemas rebuild correctly on restart
+- [ ] In `RegisterContract` (`internal/engine/engine.go`): when `cc.SharedTables` is true and `cc.FactoryName` is set, pass `&schema.BuildOptions{SharedTable: true, FactoryName: cc.FactoryName}` instead of `nil` — enabling admin-registered contracts to write to shared tables
+- [ ] For admin registration with shared tables: if shared tables already exist in the store (created by a prior registration with the same `FactoryName`), skip `CreateTable` (use `MigrateTable` or no-op) — same idempotency as factory shared children
+- [ ] Shared table naming follows existing convention: `{abi_name}_{event_name}` (e.g., `optiontoken_writertokendeployed`) — matching how factory shared tables use `{factory_name}_{event_name}`
+- [ ] Unit tests in `discover_test.go`: two contracts discovered with same class hash + `shared_tables: true` produce one set of shared tables; verify `contract_address` column present; verify second discovery reuses cached schemas
+- [ ] Unit tests for `RegisterContract`: verify that `SharedTables: true` + `FactoryName` on ContractConfig produces shared table schemas; verify `nil` buildOpts behavior unchanged when fields are unset
+
+**Implementation Notes**:
+- The discover registration path in `discover.go` currently calls `registerWithABI(ctx, cc, abi)` which always passes `nil` opts. With `shared_tables: true`, switch to the `registerSharedChild` pattern: check `discoveryState.sharedSchemas[classHash]` — if nil, build schemas with `BuildOptions` and create tables; if non-nil, reuse cached schemas and skip table creation.
+- The ABI name (e.g., `OptionToken` from `abi: OptionToken`) serves as the `FactoryName` for `BuildOptions`. This is the table prefix — all discovered instances of that class hash write to `optiontoken_Swap`, `optiontoken_Transfer`, etc. This parallels how factory shared tables use the parent contract's `Name`.
+- For `RegisterContract`, the fix is a 3-line change: check `cc.SharedTables && cc.FactoryName != ""`, and if so, construct `BuildOptions` instead of passing `nil`. The engine's setup phase at `engine.go:534` already handles this pattern for persisted contracts on restart.
+- The `contract_address` column is automatically added by `BuildSchemas` when `SharedTable: true` (see `generator.go:99-102` adding `contract_name`). Log tables also include `contract_address` as a standard metadata column. Both enable per-contract filtering via the existing query system (`?contract_address=eq.0x123`).
+- Deregistration of a discovered shared-table contract should NOT drop the shared tables (same behavior as factory children — see `engine.go:349-359` where `sch.SharedTable` skips `DropTable`). This already works because the `SharedTable` flag on `TableSchema` is set.
+- Config YAML shape for discover:
+  ```yaml
+  discover:
+    - class_hash: "0x47a9dc..."
+      group: uponly
+      abi: OptionToken
+      shared_tables: true    # all discovered instances write to optiontoken_{event}
+      events:
+        - name: "*"
+          table:
+            type: log
+  ```
+- Config YAML shape for admin registration (POST /v1/contracts):
+  ```json
+  {
+    "name": "NewOptionToken",
+    "address": "0x123...",
+    "abi": "fetch",
+    "shared_tables": true,
+    "factory_name": "OptionToken",
+    "events": [{"name": "*", "table": {"type": "log"}}]
+  }
+  ```
+
 ---
 
 ## Phase 4: Future

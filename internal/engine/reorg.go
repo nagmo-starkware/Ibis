@@ -75,6 +75,11 @@ func (e *Engine) handleReorg(ctx context.Context, reorg provider.ReorgNotificati
 		}
 	}
 
+	// Signal view poller to re-poll immediately after reorg.
+	if e.poller != nil {
+		e.poller.NotifyReorg()
+	}
+
 	e.logger.Info("reorg handled", "new_cursor", newCursor)
 	return nil
 }

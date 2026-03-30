@@ -557,6 +557,128 @@ func TestGenerateBadgerKeyPatterns_AggregationTable(t *testing.T) {
 	}
 }
 
+// --- BuildViewSchema Tests ---
+
+func TestBuildViewSchema_BasicFunction(t *testing.T) {
+	funcDef := &abi.FunctionDef{
+		Name:     "total_supply",
+		FullName: "test::total_supply",
+		Selector: abi.ComputeSelector("total_supply"),
+		Outputs:  []abi.FieldDef{{Name: "value", Type: &abi.TypeDef{Kind: abi.CairoU256, Name: "u256"}}},
+	}
+	viewCfg := config.ViewConfig{
+		Function: "total_supply",
+		Interval: "30s",
+		Table: config.TableConfig{
+			Type:      "unique",
+			UniqueKey: "_view_key",
+		},
+	}
+
+	schema := BuildViewSchema("MyToken", funcDef, viewCfg)
+
+	if schema.Name != "mytoken_total_supply" {
+		t.Fatalf("expected table name 'mytoken_total_supply', got '%s'", schema.Name)
+	}
+	if schema.Contract != "MyToken" {
+		t.Fatalf("expected contract 'MyToken', got '%s'", schema.Contract)
+	}
+	if schema.Event != "total_supply" {
+		t.Fatalf("expected event 'total_supply', got '%s'", schema.Event)
+	}
+	if schema.TableType != types.TableTypeUnique {
+		t.Fatal("expected unique table type")
+	}
+	if schema.UniqueKey != "_view_key" {
+		t.Fatalf("expected unique key '_view_key', got '%s'", schema.UniqueKey)
+	}
+}
+
+func TestBuildViewSchema_LogType(t *testing.T) {
+	funcDef := &abi.FunctionDef{
+		Name:    "get_price",
+		Outputs: []abi.FieldDef{{Name: "price", Type: &abi.TypeDef{Kind: abi.CairoU128}}},
+	}
+	viewCfg := config.ViewConfig{
+		Function: "get_price",
+		Interval: "5m",
+		Table:    config.TableConfig{Type: "log"},
+	}
+
+	schema := BuildViewSchema("Oracle", funcDef, viewCfg)
+	if schema.TableType != types.TableTypeLog {
+		t.Fatal("expected log table type")
+	}
+}
+
+func TestBuildViewSchema_Columns(t *testing.T) {
+	funcDef := &abi.FunctionDef{
+		Name: "get_price",
+		Outputs: []abi.FieldDef{
+			{Name: "price", Type: &abi.TypeDef{Kind: abi.CairoU128}},
+			{Name: "decimals", Type: &abi.TypeDef{Kind: abi.CairoU8}},
+			{Name: "is_valid", Type: &abi.TypeDef{Kind: abi.CairoBool}},
+		},
+	}
+	viewCfg := config.ViewConfig{
+		Function: "get_price",
+		Interval: "30s",
+		Table:    config.TableConfig{Type: "log"},
+	}
+
+	schema := BuildViewSchema("Oracle", funcDef, viewCfg)
+
+	colMap := make(map[string]string)
+	for _, col := range schema.Columns {
+		colMap[col.Name] = col.Type
+	}
+
+	// View metadata columns.
+	if colMap["block_number"] != "uint64" {
+		t.Error("missing block_number uint64")
+	}
+	if colMap["timestamp"] != "uint64" {
+		t.Error("missing timestamp uint64")
+	}
+	if colMap["contract_address"] != "string" {
+		t.Error("missing contract_address string")
+	}
+	if colMap["_view_key"] != "string" {
+		t.Error("missing _view_key string")
+	}
+
+	// Output columns.
+	if colMap["price"] != "string" { // u128 -> string
+		t.Errorf("expected price as string, got %s", colMap["price"])
+	}
+	if colMap["decimals"] != "int64" { // u8 -> int64
+		t.Errorf("expected decimals as int64, got %s", colMap["decimals"])
+	}
+	if colMap["is_valid"] != "bool" {
+		t.Errorf("expected is_valid as bool, got %s", colMap["is_valid"])
+	}
+
+	// Should NOT have event-only metadata columns.
+	for _, name := range []string{"log_index", "transaction_hash", "event_name", "status"} {
+		if _, ok := colMap[name]; ok {
+			t.Errorf("view table should not have %s column", name)
+		}
+	}
+}
+
+func TestViewMetadataColumns(t *testing.T) {
+	cols := ViewMetadataColumns()
+	expected := []string{"block_number", "timestamp", "contract_address", "_view_key"}
+	if len(cols) != len(expected) {
+		t.Fatalf("expected %d view metadata columns, got %d", len(expected), len(cols))
+	}
+	for i, col := range cols {
+		if col.Name != expected[i] {
+			t.Errorf("column %d: expected %s, got %s", i, expected[i], col.Name)
+		}
+	}
+}
+
 // --- MetadataColumns Tests ---
 
 func TestMetadataColumns(t *testing.T) {
