@@ -134,6 +134,12 @@ type DiscoverConfig struct {
 	// Events defines the event/table config template applied to discovered contracts.
 	Events []EventConfig `yaml:"events" json:"events"`
 
+	// SharedTables enables shared tables for all discovered instances of this class hash.
+	// When true, all discovered contracts write to the same set of tables named
+	// {abi}_{event_name} (e.g., optiontoken_transfer). Requires ABI to be a named
+	// value (not "fetch" or a file path).
+	SharedTables bool `yaml:"shared_tables" json:"shared_tables"`
+
 	// NameTemplate is an optional template for naming discovered contracts.
 	// Supports {class_hash_short}, {address_short}, {class_hash}, {address}, {group}.
 	// Default: "{class_hash_short}_{address_short}"

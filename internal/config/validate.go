@@ -228,6 +228,16 @@ func validateDiscover(discovers []DiscoverConfig) error {
 				}
 			}
 		}
+
+		// When shared_tables is true, ABI must be a named value (not "fetch" or a file path)
+		// so it can be used as a clean table name prefix.
+		if d.SharedTables {
+			if d.ABI == "fetch" || isFilePath(d.ABI) {
+				return fieldError(prefix+".abi",
+					"must be a named ABI (not \"fetch\" or a file path) when shared_tables is true, "+
+						"because the ABI name is used as the shared table prefix")
+			}
+		}
 	}
 	return nil
 }

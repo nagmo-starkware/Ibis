@@ -10,6 +10,8 @@ import (
 	"github.com/b-j-roberts/ibis/internal/abi"
 	"github.com/b-j-roberts/ibis/internal/config"
 	"github.com/b-j-roberts/ibis/internal/provider"
+	"github.com/b-j-roberts/ibis/internal/schema"
+	"github.com/b-j-roberts/ibis/internal/types"
 )
 
 // UDCAddress is the Universal Deployer Contract address on mainnet/Sepolia.
@@ -48,6 +50,11 @@ type discoveryState struct {
 	classHashes map[felt.Felt]*config.DiscoverConfig // class hash felt -> discover config
 	cachedABI   map[string]*abi.ABI                  // class hash hex string -> resolved ABI
 	udcFormat   *config.UDCEventFormat               // configured format (may be nil for auto)
+
+	// sharedSchemas caches shared table schemas for discovered contracts with shared_tables: true.
+	// Keyed by class hash hex string. First discovery builds schemas and creates tables;
+	// subsequent discoveries reuse the cached schemas.
+	sharedSchemas map[string]map[string]*types.TableSchema
 }
 
 // setupDiscovery initializes discovery state from config. Called during engine setup.
@@ -74,11 +81,12 @@ func (e *Engine) setupDiscovery() error {
 	}
 
 	e.discovery = &discoveryState{
-		udcAddress:  udcAddr,
-		udcSelector: selector,
-		classHashes: classHashes,
-		cachedABI:   make(map[string]*abi.ABI),
-		udcFormat:   e.cfg.Indexer.UDCEvent,
+		udcAddress:    udcAddr,
+		udcSelector:   selector,
+		classHashes:   classHashes,
+		cachedABI:     make(map[string]*abi.ABI),
+		udcFormat:     e.cfg.Indexer.UDCEvent,
+		sharedSchemas: make(map[string]map[string]*types.TableSchema),
 	}
 
 	// Log the configured UDC event format.
@@ -280,17 +288,30 @@ func (e *Engine) handleDiscoveryEvent(ctx context.Context, raw *provider.RawEven
 		DiscoverClassHash: dc.ClassHash,
 	}
 
+	// When shared_tables is enabled, set the flags so schemas use shared table naming.
+	if dc.SharedTables {
+		cc.SharedTables = true
+		cc.FactoryName = dc.ABI
+	}
+
 	// Register using cached ABI if available (same class hash = same code = same ABI).
 	if cachedABI, hasCached := e.discovery.cachedABI[dc.ClassHash]; hasCached {
-		if err := e.registerWithABI(ctx, cc, cachedABI); err != nil {
+		var regErr error
+		if dc.SharedTables {
+			regErr = e.registerSharedDiscoveredChild(ctx, dc, cc, cachedABI)
+		} else {
+			regErr = e.registerWithABI(ctx, cc, cachedABI)
+		}
+		if regErr != nil {
 			e.logger.Error("failed to register discovered contract",
-				"name", contractName, "error", err,
+				"name", contractName, "error", regErr,
 			)
 		} else {
 			e.logger.Info("registered discovered contract",
 				"name", contractName,
 				"address", contractAddr,
 				"class_hash", dc.ClassHash,
+				"shared_tables", dc.SharedTables,
 				"block", raw.BlockNumber,
 			)
 		}
@@ -305,6 +326,7 @@ func (e *Engine) handleDiscoveryEvent(ctx context.Context, raw *provider.RawEven
 				"name", contractName,
 				"address", contractAddr,
 				"class_hash", dc.ClassHash,
+				"shared_tables", dc.SharedTables,
 				"block", raw.BlockNumber,
 			)
 		}
@@ -333,7 +355,107 @@ func (e *Engine) registerDiscoveredContract(ctx context.Context, dc *config.Disc
 	// Cache for future discoveries with same class hash.
 	e.discovery.cachedABI[dc.ClassHash] = contractABI
 
+	if dc.SharedTables {
+		return e.registerSharedDiscoveredChild(ctx, dc, cc, contractABI)
+	}
 	return e.registerWithABI(ctx, cc, contractABI)
+}
+
+// registerSharedDiscoveredChild registers a discovered contract that writes to shared tables.
+// On the first discovery of a class hash with shared_tables, shared schemas are built and
+// tables are created. Subsequent discoveries reuse the cached schemas (no new tables).
+func (e *Engine) registerSharedDiscoveredChild(ctx context.Context, dc *config.DiscoverConfig, cc *config.ContractConfig, contractABI *abi.ABI) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Check for duplicate name.
+	for _, cs := range e.contracts {
+		if cs.config.Name == cc.Name {
+			return fmt.Errorf("contract %q already registered", cc.Name)
+		}
+	}
+
+	cc.Dynamic = true
+
+	registry := abi.NewEventRegistry(contractABI)
+
+	// Build shared schemas on first discovery, reuse for subsequent ones.
+	schemas := e.discovery.sharedSchemas[dc.ClassHash]
+	var schemaList []*types.TableSchema
+
+	if schemas == nil {
+		opts := &schema.BuildOptions{
+			SharedTable: true,
+			FactoryName: dc.ABI,
+		}
+		schemas = schema.BuildSchemas(cc, contractABI, registry, opts)
+
+		// Create shared tables in store.
+		for _, sch := range schemas {
+			if err := e.store.CreateTable(ctx, sch); err != nil {
+				return fmt.Errorf("create shared table %s: %w", sch.Name, err)
+			}
+			e.logger.Info("created shared table for discovery",
+				"name", sch.Name,
+				"type", sch.TableType,
+				"columns", len(sch.Columns),
+				"class_hash", dc.ClassHash,
+				"abi_name", dc.ABI,
+			)
+			schemaList = append(schemaList, sch)
+		}
+
+		e.discovery.sharedSchemas[dc.ClassHash] = schemas
+	}
+
+	// Parse contract address.
+	address, err := new(felt.Felt).SetString(cc.Address)
+	if err != nil {
+		return fmt.Errorf("parsing address for %s: %w", cc.Name, err)
+	}
+
+	// Persist dynamic contract config.
+	if err := e.store.SaveDynamicContract(ctx, cc); err != nil {
+		return fmt.Errorf("persisting discovered contract %s: %w", cc.Name, err)
+	}
+
+	cs := &contractState{
+		config:   *cc,
+		address:  address,
+		abi:      contractABI,
+		registry: registry,
+		schemas:  schemas, // All discovered instances share the same schema references.
+	}
+	e.contracts = append(e.contracts, cs)
+
+	// Spawn subscription if the engine is running.
+	if e.subscriber != nil && e.runCtx != nil {
+		sub := provider.ContractSubscription{
+			Address:    address,
+			StartBlock: derefUint64(cc.StartBlock),
+		}
+
+		if !hasWildcardEvent(cc) {
+			var selectors []*felt.Felt
+			for _, ec := range cc.Events {
+				if ev := registry.MatchName(ec.Name); ev != nil {
+					selectors = append(selectors, ev.Selector)
+				}
+			}
+			if len(selectors) > 0 {
+				sub.Keys = [][]*felt.Felt{selectors}
+			}
+		}
+
+		e.subscriber.AddContract(e.runCtx, sub)
+	}
+
+	// Notify API server (schemas only for first discovery when tables were created).
+	if e.onContractRegistered != nil {
+		e.onContractRegistered(cc, schemaList)
+	}
+
+	return nil
 }
 
 // buildDiscoveredName generates a name for a discovered contract.

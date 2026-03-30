@@ -12,6 +12,7 @@ import (
 	"github.com/b-j-roberts/ibis/internal/abi"
 	"github.com/b-j-roberts/ibis/internal/config"
 	"github.com/b-j-roberts/ibis/internal/provider"
+	"github.com/b-j-roberts/ibis/internal/schema"
 	"github.com/b-j-roberts/ibis/internal/store"
 	"github.com/b-j-roberts/ibis/internal/store/memory"
 	"github.com/b-j-roberts/ibis/internal/types"
@@ -24,6 +25,18 @@ func testDiscoverConfig(classHash string) config.DiscoverConfig {
 	return config.DiscoverConfig{
 		ClassHash: classHash,
 		ABI:       "fetch",
+		Events: []config.EventConfig{
+			{Name: "*", Table: config.TableConfig{Type: "log"}},
+		},
+	}
+}
+
+// testDiscoverConfigShared creates a DiscoverConfig with shared_tables enabled.
+func testDiscoverConfigShared(classHash string) config.DiscoverConfig {
+	return config.DiscoverConfig{
+		ClassHash:    classHash,
+		ABI:          "OptionToken",
+		SharedTables: true,
 		Events: []config.EventConfig{
 			{Name: "*", Table: config.TableConfig{Type: "log"}},
 		},
@@ -87,6 +100,43 @@ func newDiscoveryTestEngine(st store.Store, classHash string) *Engine {
 		cachedABI: map[string]*abi.ABI{
 			classHash: testChildABI(), // Pre-cache to avoid network calls.
 		},
+		sharedSchemas: make(map[string]map[string]*types.TableSchema),
+	}
+
+	return e
+}
+
+// newSharedDiscoveryTestEngine creates an Engine configured for shared-table discovery testing.
+func newSharedDiscoveryTestEngine(st store.Store, classHash string) *Engine {
+	discoverCfg := testDiscoverConfigShared(classHash)
+	cfg := &config.Config{
+		Indexer:  config.IndexerConfig{StartBlock: config.Uint64Ptr(0), UDCAddress: UDCAddress},
+		Discover: []config.DiscoverConfig{discoverCfg},
+	}
+
+	e := &Engine{
+		cfg:          cfg,
+		store:        st,
+		logger:       noopLogger(),
+		pending:      NewPendingTracker(),
+		logIndices:   make(map[uint64]uint64),
+		contracts:    []*contractState{},
+		confirmDepth: 100,
+	}
+
+	udcAddr, _ := new(felt.Felt).SetString(UDCAddress)
+	classHashFelt, _ := new(felt.Felt).SetString(classHash)
+
+	e.discovery = &discoveryState{
+		udcAddress:  udcAddr,
+		udcSelector: abi.ComputeSelector("ContractDeployed"),
+		classHashes: map[felt.Felt]*config.DiscoverConfig{
+			*classHashFelt: &cfg.Discover[0],
+		},
+		cachedABI: map[string]*abi.ABI{
+			classHash: testChildABI(),
+		},
+		sharedSchemas: make(map[string]map[string]*types.TableSchema),
 	}
 
 	return e
@@ -1352,6 +1402,351 @@ func TestValidate_DiscoverConfig(t *testing.T) {
 }
 
 // --- HandleReorg Integration ---
+
+// --- Shared Tables for Discovery Tests ---
+
+func TestDiscovery_SharedTables_TwoContractsOneTableSet(t *testing.T) {
+	st := memory.New()
+	ctx := context.Background()
+
+	classHash := "0xABCDEF"
+	e := newSharedDiscoveryTestEngine(st, classHash)
+	classHashFelt, _ := new(felt.Felt).SetString(classHash)
+
+	// Discover two contracts with the same class hash.
+	addr1 := new(felt.Felt).SetUint64(0x1111)
+	addr2 := new(felt.Felt).SetUint64(0x2222)
+
+	raw1 := makeUDCEvent(addr1, classHashFelt, 100)
+	e.handleDiscoveryEvent(ctx, &raw1)
+
+	raw2 := makeUDCEvent(addr2, classHashFelt, 101)
+	e.handleDiscoveryEvent(ctx, &raw2)
+
+	// Both contracts should be registered.
+	e.mu.RLock()
+	count := len(e.contracts)
+	e.mu.RUnlock()
+	if count != 2 {
+		t.Fatalf("expected 2 registered contracts, got %d", count)
+	}
+
+	// Both should share the same schema objects (same pointer).
+	e.mu.RLock()
+	schemas1 := e.contracts[0].schemas
+	schemas2 := e.contracts[1].schemas
+	e.mu.RUnlock()
+
+	if len(schemas1) == 0 {
+		t.Fatal("expected non-empty schemas")
+	}
+
+	// Verify schemas are the same map (shared references).
+	for eventName, s1 := range schemas1 {
+		s2, ok := schemas2[eventName]
+		if !ok {
+			t.Fatalf("second contract missing schema for event %s", eventName)
+		}
+		if s1 != s2 {
+			t.Fatalf("schemas for event %s should be the same shared reference", eventName)
+		}
+	}
+
+	// Verify shared table naming: {abi_name}_{event_name}, not {contract_name}_{event_name}.
+	for _, sch := range schemas1 {
+		if !strings.HasPrefix(sch.Name, "optiontoken_") {
+			t.Fatalf("shared table name should start with 'optiontoken_', got %s", sch.Name)
+		}
+		if !sch.SharedTable {
+			t.Fatalf("schema %s should have SharedTable=true", sch.Name)
+		}
+	}
+
+	// Verify sharedSchemas cache was populated.
+	cachedSchemas := e.discovery.sharedSchemas[classHash]
+	if cachedSchemas == nil {
+		t.Fatal("expected sharedSchemas cache to be populated for class hash")
+	}
+}
+
+func TestDiscovery_SharedTables_ContractAddressColumnPresent(t *testing.T) {
+	st := memory.New()
+	ctx := context.Background()
+
+	classHash := "0xABCDEF"
+	e := newSharedDiscoveryTestEngine(st, classHash)
+	classHashFelt, _ := new(felt.Felt).SetString(classHash)
+
+	addr := new(felt.Felt).SetUint64(0x1111)
+	raw := makeUDCEvent(addr, classHashFelt, 100)
+	e.handleDiscoveryEvent(ctx, &raw)
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if len(e.contracts) != 1 {
+		t.Fatalf("expected 1 contract, got %d", len(e.contracts))
+	}
+
+	// Verify contract_address column is present in shared schemas.
+	for _, sch := range e.contracts[0].schemas {
+		hasContractAddr := false
+		hasContractName := false
+		for _, col := range sch.Columns {
+			if col.Name == "contract_address" {
+				hasContractAddr = true
+			}
+			if col.Name == "contract_name" {
+				hasContractName = true
+			}
+		}
+		if !hasContractAddr {
+			t.Fatalf("shared table %s missing contract_address column", sch.Name)
+		}
+		if !hasContractName {
+			t.Fatalf("shared table %s missing contract_name column (added for shared tables)", sch.Name)
+		}
+	}
+}
+
+func TestDiscovery_SharedTables_ContractConfigFlags(t *testing.T) {
+	st := memory.New()
+	ctx := context.Background()
+
+	classHash := "0xABCDEF"
+	e := newSharedDiscoveryTestEngine(st, classHash)
+	classHashFelt, _ := new(felt.Felt).SetString(classHash)
+
+	addr := new(felt.Felt).SetUint64(0x3333)
+	raw := makeUDCEvent(addr, classHashFelt, 100)
+	e.handleDiscoveryEvent(ctx, &raw)
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if len(e.contracts) != 1 {
+		t.Fatalf("expected 1 contract, got %d", len(e.contracts))
+	}
+
+	cs := e.contracts[0]
+	if !cs.config.SharedTables {
+		t.Fatal("expected SharedTables=true on discovered contract config")
+	}
+	if cs.config.FactoryName != "OptionToken" {
+		t.Fatalf("expected FactoryName='OptionToken', got %s", cs.config.FactoryName)
+	}
+	if !cs.config.Dynamic {
+		t.Fatal("expected Dynamic=true")
+	}
+}
+
+func TestDiscovery_SharedTables_DeregistrationSkipsSharedTables(t *testing.T) {
+	st := memory.New()
+	ctx := context.Background()
+
+	classHash := "0xABCDEF"
+	e := newSharedDiscoveryTestEngine(st, classHash)
+	classHashFelt, _ := new(felt.Felt).SetString(classHash)
+
+	// Discover two contracts sharing tables.
+	addr1 := new(felt.Felt).SetUint64(0x4444)
+	addr2 := new(felt.Felt).SetUint64(0x5555)
+
+	raw1 := makeUDCEvent(addr1, classHashFelt, 100)
+	e.handleDiscoveryEvent(ctx, &raw1)
+
+	raw2 := makeUDCEvent(addr2, classHashFelt, 101)
+	e.handleDiscoveryEvent(ctx, &raw2)
+
+	e.mu.RLock()
+	if len(e.contracts) != 2 {
+		t.Fatalf("expected 2 contracts, got %d", len(e.contracts))
+	}
+	firstName := e.contracts[0].config.Name
+	e.mu.RUnlock()
+
+	// Deregister the first contract with dropTables=true.
+	if err := e.DeregisterContract(ctx, firstName, true); err != nil {
+		t.Fatalf("deregister failed: %v", err)
+	}
+
+	// Verify only 1 contract remains.
+	e.mu.RLock()
+	remaining := len(e.contracts)
+	e.mu.RUnlock()
+	if remaining != 1 {
+		t.Fatalf("expected 1 remaining contract, got %d", remaining)
+	}
+
+	// The shared table should NOT have been dropped (SharedTable flag prevents it).
+	// Verify the second contract can still see its schemas.
+	e.mu.RLock()
+	for _, sch := range e.contracts[0].schemas {
+		if !sch.SharedTable {
+			t.Fatalf("remaining contract's schema %s should still have SharedTable=true", sch.Name)
+		}
+	}
+	e.mu.RUnlock()
+}
+
+// --- RegisterContract with SharedTables Tests ---
+
+func TestRegisterContract_SharedTables_ProducesSharedSchemas(t *testing.T) {
+	// Simulate an admin-registered contract with shared tables.
+	childABI := testChildABI()
+	cc := &config.ContractConfig{
+		Name:         "NewOptionToken",
+		Address:      "0x123",
+		ABI:          "fetch",
+		SharedTables: true,
+		FactoryName:  "OptionToken",
+		Events:       []config.EventConfig{{Name: "*", Table: config.TableConfig{Type: "log"}}},
+	}
+
+	// Test that RegisterContract's schema building path uses BuildOptions
+	// when SharedTables and FactoryName are set.
+	registry := abi.NewEventRegistry(childABI)
+
+	var buildOpts *schema.BuildOptions
+	if cc.SharedTables && cc.FactoryName != "" {
+		buildOpts = &schema.BuildOptions{
+			SharedTable: true,
+			FactoryName: cc.FactoryName,
+		}
+	}
+	schemas := schema.BuildSchemas(cc, childABI, registry, buildOpts)
+
+	// Verify shared table naming.
+	for _, sch := range schemas {
+		if !strings.HasPrefix(sch.Name, "optiontoken_") {
+			t.Fatalf("expected shared table name starting with 'optiontoken_', got %s", sch.Name)
+		}
+		if !sch.SharedTable {
+			t.Fatalf("expected SharedTable=true on schema %s", sch.Name)
+		}
+		if sch.Contract != "OptionToken" {
+			t.Fatalf("expected Contract='OptionToken', got %s", sch.Contract)
+		}
+	}
+}
+
+func TestRegisterContract_NoSharedTables_NormalSchemas(t *testing.T) {
+	// Verify that without SharedTables+FactoryName, nil buildOpts are used.
+	childABI := testChildABI()
+	cc := &config.ContractConfig{
+		Name:   "MyContract",
+		Events: []config.EventConfig{{Name: "*", Table: config.TableConfig{Type: "log"}}},
+	}
+
+	registry := abi.NewEventRegistry(childABI)
+	schemas := schema.BuildSchemas(cc, childABI, registry, nil)
+
+	for _, sch := range schemas {
+		if !strings.HasPrefix(sch.Name, "mycontract_") {
+			t.Fatalf("expected normal table name starting with 'mycontract_', got %s", sch.Name)
+		}
+		if sch.SharedTable {
+			t.Fatalf("expected SharedTable=false on schema %s", sch.Name)
+		}
+	}
+}
+
+// --- Config Validation for shared_tables ---
+
+func TestValidate_DiscoverSharedTables(t *testing.T) {
+	baseCfg := config.Config{
+		Network:  "mainnet",
+		RPC:      "wss://example.com",
+		Database: config.DatabaseConfig{Backend: "memory"},
+	}
+
+	tests := []struct {
+		name    string
+		cfg     config.Config
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "shared_tables with named ABI is valid",
+			cfg: func() config.Config {
+				c := baseCfg
+				c.Discover = []config.DiscoverConfig{
+					{
+						ClassHash:    "0xabc123",
+						ABI:          "OptionToken",
+						SharedTables: true,
+						Events:       []config.EventConfig{{Name: "*", Table: config.TableConfig{Type: "log"}}},
+					},
+				}
+				return c
+			}(),
+		},
+		{
+			name: "shared_tables with fetch ABI is rejected",
+			cfg: func() config.Config {
+				c := baseCfg
+				c.Discover = []config.DiscoverConfig{
+					{
+						ClassHash:    "0xabc123",
+						ABI:          "fetch",
+						SharedTables: true,
+						Events:       []config.EventConfig{{Name: "*", Table: config.TableConfig{Type: "log"}}},
+					},
+				}
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "named ABI",
+		},
+		{
+			name: "shared_tables with file path ABI is rejected",
+			cfg: func() config.Config {
+				c := baseCfg
+				c.Discover = []config.DiscoverConfig{
+					{
+						ClassHash:    "0xabc123",
+						ABI:          "./abis/token.json",
+						SharedTables: true,
+						Events:       []config.EventConfig{{Name: "*", Table: config.TableConfig{Type: "log"}}},
+					},
+				}
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "named ABI",
+		},
+		{
+			name: "shared_tables=false with fetch is fine",
+			cfg: func() config.Config {
+				c := baseCfg
+				c.Discover = []config.DiscoverConfig{
+					{
+						ClassHash: "0xabc123",
+						ABI:       "fetch",
+						Events:    []config.EventConfig{{Name: "*", Table: config.TableConfig{Type: "log"}}},
+					},
+				}
+				return c
+			}(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := config.Validate(&tt.cfg)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected validation error")
+				}
+				if tt.errMsg != "" && !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tt.errMsg)) {
+					t.Fatalf("expected error containing %q, got: %v", tt.errMsg, err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
 
 func TestHandleReorg_WithDiscoveredContracts(t *testing.T) {
 	st := memory.New()

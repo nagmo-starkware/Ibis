@@ -238,7 +238,17 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 	}
 
 	registry := abi.NewEventRegistry(contractABI)
-	schemas := schema.BuildSchemas(cc, contractABI, registry, nil)
+
+	// For admin-registered contracts with shared tables, use BuildOptions
+	// so schemas are named after the factory/ABI name instead of the contract.
+	var buildOpts *schema.BuildOptions
+	if cc.SharedTables && cc.FactoryName != "" {
+		buildOpts = &schema.BuildOptions{
+			SharedTable: true,
+			FactoryName: cc.FactoryName,
+		}
+	}
+	schemas := schema.BuildSchemas(cc, contractABI, registry, buildOpts)
 
 	// Parse contract address.
 	address, err := new(felt.Felt).SetString(cc.Address)
@@ -246,7 +256,8 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 		return fmt.Errorf("parsing address for %s: %w", cc.Name, err)
 	}
 
-	// Create tables in store.
+	// Create tables in store. For shared tables that already exist (created by a
+	// prior registration with the same FactoryName), CreateTable is idempotent.
 	var schemaList []*types.TableSchema
 	for _, sch := range schemas {
 		if err := e.store.CreateTable(ctx, sch); err != nil {
