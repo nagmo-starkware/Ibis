@@ -778,6 +778,12 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 		limit = 50
 	}
 
+	// For shared tables, use composite DISTINCT ON so each contract keeps its own row.
+	distinctCols := uniqueKey
+	if hasSchema && sch.SharedTable {
+		distinctCols = "contract_address, " + uniqueKey
+	}
+
 	// Use DISTINCT ON to get latest per unique key, then wrap for ordering/pagination.
 	query = fmt.Sprintf(
 		`SELECT %s FROM (
@@ -785,8 +791,8 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 			FROM %s%s
 			ORDER BY %s, block_number DESC, log_index DESC
 		) sub ORDER BY %s %s, log_index %s LIMIT $%d OFFSET $%d`,
-		cols, uniqueKey, cols, table, where,
-		uniqueKey,
+		cols, distinctCols, cols, table, where,
+		distinctCols,
 		orderBy, dir, dir, argIdx, argIdx+1)
 	args = append(args, limit, q.Offset)
 

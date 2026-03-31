@@ -74,6 +74,13 @@ func (s *MemoryStore) RevertOperations(ctx context.Context, ops []store.Operatio
 func (s *MemoryStore) applyOp(op store.Operation) {
 	schema, hasSchema := s.schemas[op.Table]
 	key := eventKey(op.BlockNumber, op.LogIndex)
+	// For shared tables, include contract_address in the key so concurrent
+	// polls from different contracts don't overwrite each other.
+	if hasSchema && schema.SharedTable {
+		if addr, ok := op.Data["contract_address"]; ok {
+			key = fmt.Sprint(addr) + ":" + key
+		}
+	}
 
 	switch op.Type {
 	case store.OpInsert:
