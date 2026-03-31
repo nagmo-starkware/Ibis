@@ -158,10 +158,24 @@ func ViewMetadataColumns() []types.Column {
 
 // BuildViewSchema creates a TableSchema for a view function's polled results.
 // Maps function output members to table columns using the same type mapping as events.
-func BuildViewSchema(contractName string, funcDef *abi.FunctionDef, viewCfg config.ViewConfig) *types.TableSchema {
+// Pass opts for shared view tables (e.g., discovered contracts with shared_tables: true); nil for normal contracts.
+func BuildViewSchema(contractName string, funcDef *abi.FunctionDef, viewCfg *config.ViewConfig, opts *BuildOptions) *types.TableSchema {
 	tableName := strings.ToLower(contractName + "_" + funcDef.Name)
+	contract := contractName
+	shared := false
+
+	if opts != nil && opts.SharedTable {
+		tableName = strings.ToLower(opts.FactoryName + "_" + funcDef.Name)
+		contract = opts.FactoryName
+		shared = true
+	}
 
 	columns := ViewMetadataColumns()
+
+	// Add contract_name column for shared view tables.
+	if shared {
+		columns = append(columns, types.Column{Name: "contract_name", Type: "string"})
+	}
 
 	// Add output columns from function definition.
 	for _, output := range funcDef.Outputs {
@@ -177,12 +191,13 @@ func BuildViewSchema(contractName string, funcDef *abi.FunctionDef, viewCfg conf
 	}
 
 	return &types.TableSchema{
-		Name:      tableName,
-		Contract:  contractName,
-		Event:     funcDef.Name,
-		TableType: tableType,
-		Columns:   columns,
-		UniqueKey: viewCfg.Table.UniqueKey,
+		Name:        tableName,
+		Contract:    contract,
+		Event:       funcDef.Name,
+		TableType:   tableType,
+		Columns:     columns,
+		UniqueKey:   viewCfg.Table.UniqueKey,
+		SharedTable: shared,
 	}
 }
 

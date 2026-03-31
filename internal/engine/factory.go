@@ -292,6 +292,17 @@ func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig,
 		e.subscriber.AddContract(e.runCtx, sub)
 	}
 
+	// Start view polling for this contract if it has views configured.
+	if e.runCtx != nil {
+		viewSchemas, err := e.startViewsForContract(e.runCtx, cs)
+		if err != nil {
+			e.logger.Error("failed to start views for factory child",
+				"contract", cc.Name, "error", err)
+		} else {
+			schemaList = append(schemaList, viewSchemas...)
+		}
+	}
+
 	// Notify API server.
 	if e.onContractRegistered != nil {
 		e.onContractRegistered(cc, schemaList)

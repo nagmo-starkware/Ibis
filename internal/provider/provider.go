@@ -143,7 +143,7 @@ func (p *StarknetProvider) GetEvents(ctx context.Context, opts GetEventsOptions)
 
 // Call executes a read-only function call on a Starknet contract.
 // Returns the raw felt array result from starknet_call.
-func (p *StarknetProvider) Call(ctx context.Context, contractAddress *felt.Felt, entryPointSelector *felt.Felt, calldata []*felt.Felt, blockID rpc.BlockID) ([]*felt.Felt, error) {
+func (p *StarknetProvider) Call(ctx context.Context, contractAddress, entryPointSelector *felt.Felt, calldata []*felt.Felt, blockID rpc.BlockID) ([]*felt.Felt, error) {
 	return p.httpRPC.Call(ctx, rpc.FunctionCall{
 		ContractAddress:    contractAddress,
 		EntryPointSelector: entryPointSelector,

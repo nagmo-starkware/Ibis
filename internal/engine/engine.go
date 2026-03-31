@@ -325,6 +325,17 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 		)
 	}
 
+	// Start view polling for this contract if it has views configured.
+	if e.runCtx != nil {
+		viewSchemas, err := e.startViewsForContract(e.runCtx, cs)
+		if err != nil {
+			e.logger.Error("failed to start views for dynamic contract",
+				"contract", cc.Name, "error", err)
+		} else {
+			schemaList = append(schemaList, viewSchemas...)
+		}
+	}
+
 	// Notify API server.
 	if e.onContractRegistered != nil {
 		e.onContractRegistered(cc, schemaList)
@@ -464,11 +475,14 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Always set the onEvent callback on the poller so dynamically added views
+	// (via discovery or admin API) inherit it even if no views exist at startup.
+	if e.poller != nil && e.onEvent != nil {
+		e.poller.SetOnEvent(e.onEvent)
+	}
+
 	// Start view poller alongside event subscriber.
 	if e.poller != nil && e.poller.HasEntries() {
-		if e.onEvent != nil {
-			e.poller.SetOnEvent(e.onEvent)
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -829,6 +843,34 @@ func (e *Engine) ViewStatuses() []ViewStatus {
 		return nil
 	}
 	return e.poller.Status()
+}
+
+// startViewsForContract sets up view function polling for a dynamically registered
+// contract. It calls ViewPoller.AddContract to build entries and spawn goroutines,
+// creates view tables in the store, and adds schemas to the contract state.
+// Returns the view schemas so the caller can notify the API server.
+func (e *Engine) startViewsForContract(ctx context.Context, cs *contractState) ([]*types.TableSchema, error) {
+	if e.poller == nil || len(cs.config.Views) == 0 {
+		return nil, nil
+	}
+
+	viewSchemas, err := e.poller.AddContract(ctx, cs)
+	if err != nil {
+		return nil, fmt.Errorf("add views for %s: %w", cs.config.Name, err)
+	}
+
+	for _, vs := range viewSchemas {
+		if err := e.store.CreateTable(ctx, vs); err != nil {
+			return nil, fmt.Errorf("create view table %s: %w", vs.Name, err)
+		}
+		cs.schemas[vs.Event] = vs
+		e.logger.Info("created view table (dynamic)",
+			"name", vs.Name,
+			"contract", cs.config.Name,
+		)
+	}
+
+	return viewSchemas, nil
 }
 
 // Store returns the engine's store (for testing/inspection).

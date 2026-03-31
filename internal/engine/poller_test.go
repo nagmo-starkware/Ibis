@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,7 +34,7 @@ func (m *mockProvider) BlockNumber(_ context.Context) (uint64, error) {
 	return m.blockNumber, nil
 }
 
-func (m *mockProvider) Call(_ context.Context, _ *felt.Felt, _ *felt.Felt, _ []*felt.Felt, _ rpc.BlockID) ([]*felt.Felt, error) {
+func (m *mockProvider) Call(_ context.Context, _, _ *felt.Felt, _ []*felt.Felt, _ rpc.BlockID) ([]*felt.Felt, error) {
 	m.callCount.Add(1)
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -635,4 +636,204 @@ func TestViewPoller_MultiOutputDecode(t *testing.T) {
 	if data["decimals"] != uint64(18) {
 		t.Fatalf("expected decimals 18, got %v", data["decimals"])
 	}
+}
+
+// --- AddContract Tests ---
+
+func TestViewPoller_AddContract_SpawnsPolling(t *testing.T) {
+	addr := new(felt.Felt).SetUint64(0xDEF)
+	funcDef := testFunctionDef("total_supply")
+	cs := testContractStateWithViews(addr, "DynamicToken", map[string]*abi.FunctionDef{
+		"total_supply": funcDef,
+	})
+
+	returnValue := new(felt.Felt).SetUint64(999)
+	mp := &mockProvider{
+		blockNumber: 800,
+		callResult:  []*felt.Felt{returnValue},
+	}
+	st := memory.New()
+	vp := NewViewPoller(mp, st, noopLogger())
+
+	// Poller starts with no entries.
+	if vp.HasEntries() {
+		t.Fatal("expected no entries before AddContract")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// AddContract should return view schemas and spawn polling goroutines.
+	schemas, err := vp.AddContract(ctx, cs)
+	if err != nil {
+		t.Fatalf("AddContract failed: %v", err)
+	}
+	if len(schemas) != 1 {
+		t.Fatalf("expected 1 schema, got %d", len(schemas))
+	}
+	if schemas[0].Name != "dynamictoken_total_supply" {
+		t.Fatalf("expected table name 'dynamictoken_total_supply', got %s", schemas[0].Name)
+	}
+
+	// Create table so the poll can store data.
+	for _, s := range schemas {
+		if err := st.CreateTable(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// HasEntries should be true now.
+	if !vp.HasEntries() {
+		t.Fatal("expected entries after AddContract")
+	}
+
+	// Wait for the spawned goroutine to poll at least once.
+	time.Sleep(300 * time.Millisecond)
+
+	if mp.callCount.Load() < 1 {
+		t.Fatalf("expected at least 1 poll call, got %d", mp.callCount.Load())
+	}
+
+	// Verify data was stored.
+	events, err := st.GetUniqueEvents(context.Background(), "dynamictoken_total_supply", store.Query{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected at least 1 poll result stored after AddContract")
+	}
+	if events[0].Data["value"] != uint64(999) {
+		t.Fatalf("expected value 999, got %v", events[0].Data["value"])
+	}
+
+	cancel()
+}
+
+func TestViewPoller_AddContract_NoViews(t *testing.T) {
+	addr := new(felt.Felt).SetUint64(0xABC)
+	cs := &contractState{
+		config: config.ContractConfig{
+			Name:    "NoViews",
+			Address: addr.String(),
+		},
+		address: addr,
+		abi: &abi.ABI{
+			Types:     make(map[string]*abi.TypeDef),
+			Functions: make(map[string]*abi.FunctionDef),
+		},
+		schemas: make(map[string]*types.TableSchema),
+	}
+
+	mp := &mockProvider{blockNumber: 100}
+	st := memory.New()
+	vp := NewViewPoller(mp, st, noopLogger())
+
+	schemas, err := vp.AddContract(context.Background(), cs)
+	if err != nil {
+		t.Fatalf("AddContract failed: %v", err)
+	}
+	if len(schemas) != 0 {
+		t.Fatalf("expected 0 schemas for contract without views, got %d", len(schemas))
+	}
+	if vp.HasEntries() {
+		t.Fatal("expected no entries for contract without views")
+	}
+}
+
+func TestViewPoller_AddContract_OnEventCallback(t *testing.T) {
+	addr := new(felt.Felt).SetUint64(0xDEF)
+	funcDef := testFunctionDef("total_supply")
+	cs := testContractStateWithViews(addr, "DynToken", map[string]*abi.FunctionDef{
+		"total_supply": funcDef,
+	})
+
+	returnValue := new(felt.Felt).SetUint64(42)
+	mp := &mockProvider{
+		blockNumber: 100,
+		callResult:  []*felt.Felt{returnValue},
+	}
+	st := memory.New()
+	vp := NewViewPoller(mp, st, noopLogger())
+
+	// Set onEvent before AddContract (mirrors engine behavior).
+	var callbackFired atomic.Bool
+	vp.SetOnEvent(func(contract, event, table string, blockNumber, logIndex uint64, data map[string]any) {
+		callbackFired.Store(true)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	schemas, err := vp.AddContract(ctx, cs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range schemas {
+		st.CreateTable(ctx, s)
+	}
+
+	// Wait for polling goroutine to fire.
+	time.Sleep(300 * time.Millisecond)
+
+	if !callbackFired.Load() {
+		t.Fatal("expected onEvent callback to fire from dynamically added view")
+	}
+
+	cancel()
+}
+
+func TestViewPoller_AddContract_ConcurrentWithStatus(t *testing.T) {
+	funcDef := testFunctionDef("total_supply")
+
+	returnValue := new(felt.Felt).SetUint64(1)
+	mp := &mockProvider{
+		blockNumber: 100,
+		callResult:  []*felt.Felt{returnValue},
+	}
+	st := memory.New()
+	vp := NewViewPoller(mp, st, noopLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Concurrently call AddContract and Status to verify no races.
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			cs := testContractStateWithViews(
+				new(felt.Felt).SetUint64(uint64(0x100+idx)),
+				fmt.Sprintf("Token%d", idx),
+				map[string]*abi.FunctionDef{"total_supply": funcDef},
+			)
+			schemas, err := vp.AddContract(ctx, cs)
+			if err != nil {
+				t.Errorf("AddContract[%d] failed: %v", idx, err)
+				return
+			}
+			for _, s := range schemas {
+				st.CreateTable(ctx, s)
+			}
+		}(i)
+	}
+
+	// Concurrently call Status.
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = vp.Status()
+		}()
+	}
+
+	wg.Wait()
+
+	// Should have 5 entries.
+	statuses := vp.Status()
+	if len(statuses) != 5 {
+		t.Fatalf("expected 5 status entries, got %d", len(statuses))
+	}
+
+	cancel()
 }

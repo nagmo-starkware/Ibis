@@ -575,7 +575,7 @@ func TestBuildViewSchema_BasicFunction(t *testing.T) {
 		},
 	}
 
-	schema := BuildViewSchema("MyToken", funcDef, viewCfg)
+	schema := BuildViewSchema("MyToken", funcDef, &viewCfg, nil)
 
 	if schema.Name != "mytoken_total_supply" {
 		t.Fatalf("expected table name 'mytoken_total_supply', got '%s'", schema.Name)
@@ -605,7 +605,7 @@ func TestBuildViewSchema_LogType(t *testing.T) {
 		Table:    config.TableConfig{Type: "log"},
 	}
 
-	schema := BuildViewSchema("Oracle", funcDef, viewCfg)
+	schema := BuildViewSchema("Oracle", funcDef, &viewCfg, nil)
 	if schema.TableType != types.TableTypeLog {
 		t.Fatal("expected log table type")
 	}
@@ -626,7 +626,7 @@ func TestBuildViewSchema_Columns(t *testing.T) {
 		Table:    config.TableConfig{Type: "log"},
 	}
 
-	schema := BuildViewSchema("Oracle", funcDef, viewCfg)
+	schema := BuildViewSchema("Oracle", funcDef, &viewCfg, nil)
 
 	colMap := make(map[string]string)
 	for _, col := range schema.Columns {
@@ -663,6 +663,47 @@ func TestBuildViewSchema_Columns(t *testing.T) {
 		if _, ok := colMap[name]; ok {
 			t.Errorf("view table should not have %s column", name)
 		}
+	}
+}
+
+func TestBuildViewSchema_SharedTable(t *testing.T) {
+	funcDef := &abi.FunctionDef{
+		Name:     "get_strike",
+		FullName: "test::get_strike",
+		Selector: abi.ComputeSelector("get_strike"),
+		Outputs:  []abi.FieldDef{{Name: "strike", Type: &abi.TypeDef{Kind: abi.CairoU256, Name: "u256"}}},
+	}
+	viewCfg := config.ViewConfig{
+		Function: "get_strike",
+		Interval: "5m",
+		Table: config.TableConfig{
+			Type:      "unique",
+			UniqueKey: "_view_key",
+		},
+	}
+
+	opts := &BuildOptions{SharedTable: true, FactoryName: "OptionToken"}
+	schema := BuildViewSchema("47a9dc12_abcdef01", funcDef, &viewCfg, opts)
+
+	// Table name should use the ABI/factory name, not the contract name.
+	if schema.Name != "optiontoken_get_strike" {
+		t.Fatalf("expected shared table name 'optiontoken_get_strike', got '%s'", schema.Name)
+	}
+	// Contract field should be the factory/ABI name.
+	if schema.Contract != "OptionToken" {
+		t.Fatalf("expected contract 'OptionToken', got '%s'", schema.Contract)
+	}
+	if !schema.SharedTable {
+		t.Fatal("expected SharedTable to be true")
+	}
+
+	// Should have contract_name column for shared tables.
+	colMap := make(map[string]string)
+	for _, col := range schema.Columns {
+		colMap[col.Name] = col.Type
+	}
+	if colMap["contract_name"] != "string" {
+		t.Fatal("shared view table should have contract_name column")
 	}
 }
 

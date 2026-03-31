@@ -415,6 +415,46 @@
   }
   ```
 
+### 3.24 Admin & Discovery View Functions
+
+**Description**: View function polling currently only works for static contracts defined in `ibis.config.yaml`. Two dynamic contract registration paths — class-hash discovery (`discover:` config) and admin registration (`POST /v1/admin/contracts`) — do not wire up view functions, even though the underlying `ViewPoller` machinery is fully functional. This task closes the gap so that discovered and admin-registered contracts can poll view functions with the same semantics as statically configured contracts.
+
+**Requirements**:
+- [x] Add `Views []ViewConfig` field (`yaml:"views,omitempty" json:"views,omitempty"`) to `DiscoverConfig` in `internal/config/config.go`
+- [x] Copy `dc.Views` to `cc.Views` when building `ContractConfig` in `handleDiscoveryEvent` (`internal/engine/discover.go:282-289`)
+- [x] Add `validateViews(dc.Views, prefix)` call in `validateDiscover` (`internal/config/validate.go`) for each discover entry
+- [x] Add `ViewPoller.AddContract(ctx context.Context, cs *contractState) ([]*types.TableSchema, error)` method that: builds entries via `buildEntry()`, appends to `vp.entries` (with mutex protection), spawns per-function polling goroutines, and returns view schemas
+- [x] Protect `ViewPoller.entries` with a `sync.Mutex` so `AddContract` is safe to call concurrently with `Status()` and `Run()`
+- [x] Call `ViewPoller.AddContract()` from `RegisterContract` (`engine.go`) when the contract has views — create view tables, add schemas to `contractState`, and notify the API server
+- [x] Call `ViewPoller.AddContract()` from `registerWithABI` (`factory.go`) and `registerSharedDiscoveredChild` (`discover.go`) when the contract has views
+- [x] Ensure `ViewPoller.SetOnEvent` is called during engine setup regardless of whether initial entries exist, so dynamically added views fire SSE callbacks
+- [x] Unit tests: discovered contract with views triggers view polling; admin-registered contract with views triggers view polling; AddContract on a running poller spawns goroutines that actually poll
+- [ ] Integration test: discover config with `views:` section — verify view tables are created and polled after UDC event is processed
+
+**Implementation Notes**:
+- The `ViewPoller.Run()` method currently returns immediately when `entries` is empty. Dynamic view addition via `AddContract` should not depend on `Run()` being active — `AddContract` spawns its own goroutines with the provided context, making it safe to add views whether or not the poller's `Run()` goroutine was started. This avoids needing to change `Run()` behavior.
+- The engine always creates a `ViewPoller` in `setup()` (engine.go:584), so `e.poller` is never nil during runtime. But the `Run()` goroutine only starts if `HasEntries()` was true at launch (engine.go:468). For dynamically added views, `AddContract` manages its own goroutine lifecycle.
+- The `onEvent` callback is currently set on the poller only when `HasEntries()` is true at startup (engine.go:469). Move the `SetOnEvent` call before the HasEntries check so dynamic additions inherit the callback.
+- Three registration paths need the same view wiring: `RegisterContract` (admin API), `registerWithABI` (factory children + non-shared discovery), and `registerSharedDiscoveredChild` (shared-table discovery). Extract a helper like `e.startViewsForContract(ctx, cs)` to avoid duplicating the AddContract + CreateTable + schema registration logic in all three places.
+- For shared-table discovered contracts with views, view table naming should follow the shared convention (`{abi_name}_{function_name}`) so all instances of the same class hash share view tables too. This parallels how event shared tables work.
+- Config YAML shape for discover with views:
+  ```yaml
+  discover:
+    - class_hash: "0x47a9dc..."
+      abi: OptionToken
+      shared_tables: true
+      events:
+        - name: "*"
+          table:
+            type: log
+      views:
+        - function: get_strike
+          interval: 5m
+          table:
+            type: unique
+            unique_key: _view_key
+  ```
+
 ---
 
 ## Phase 4: Future

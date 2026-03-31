@@ -62,6 +62,7 @@ type viewEntry struct {
 
 // ViewPoller manages periodic starknet_call polling for view functions.
 type ViewPoller struct {
+	mu       sync.Mutex // protects entries for concurrent AddContract calls
 	entries  []*viewEntry
 	provider viewPollerProvider
 	store    store.Store
@@ -99,7 +100,7 @@ func (vp *ViewPoller) Setup(contracts []*contractState) ([]*types.TableSchema, e
 		}
 
 		for _, viewCfg := range cs.config.Views {
-			entry, viewSchema, err := vp.buildEntry(cs, viewCfg)
+			entry, viewSchema, err := vp.buildEntry(cs, &viewCfg)
 			if err != nil {
 				return nil, err
 			}
@@ -119,7 +120,7 @@ func (vp *ViewPoller) Setup(contracts []*contractState) ([]*types.TableSchema, e
 }
 
 // buildEntry resolves a single ViewConfig into a viewEntry and its schema.
-func (vp *ViewPoller) buildEntry(cs *contractState, viewCfg config.ViewConfig) (*viewEntry, *types.TableSchema, error) {
+func (vp *ViewPoller) buildEntry(cs *contractState, viewCfg *config.ViewConfig) (*viewEntry, *types.TableSchema, error) {
 	// Resolve function definition from parsed ABI.
 	funcDef, ok := cs.abi.Functions[viewCfg.Function]
 	if !ok {
@@ -142,8 +143,15 @@ func (vp *ViewPoller) buildEntry(cs *contractState, viewCfg config.ViewConfig) (
 		return nil, nil, fmt.Errorf("contract %s, function %s: parsing interval: %w", cs.config.Name, viewCfg.Function, err)
 	}
 
-	// Build table schema.
-	viewSchema := schema.BuildViewSchema(cs.config.Name, funcDef, viewCfg)
+	// Build table schema, using shared naming when the contract has shared tables.
+	var buildOpts *schema.BuildOptions
+	if cs.config.SharedTables && cs.config.FactoryName != "" {
+		buildOpts = &schema.BuildOptions{
+			SharedTable: true,
+			FactoryName: cs.config.FactoryName,
+		}
+	}
+	viewSchema := schema.BuildViewSchema(cs.config.Name, funcDef, viewCfg, buildOpts)
 
 	entry := &viewEntry{
 		contractName:    cs.config.Name,
@@ -160,8 +168,13 @@ func (vp *ViewPoller) buildEntry(cs *contractState, viewCfg config.ViewConfig) (
 
 // Status returns the current status of all view function pollers.
 func (vp *ViewPoller) Status() []ViewStatus {
-	statuses := make([]ViewStatus, len(vp.entries))
-	for i, entry := range vp.entries {
+	vp.mu.Lock()
+	entries := make([]*viewEntry, len(vp.entries))
+	copy(entries, vp.entries)
+	vp.mu.Unlock()
+
+	statuses := make([]ViewStatus, len(entries))
+	for i, entry := range entries {
 		entry.statusMu.Lock()
 		statuses[i] = ViewStatus{
 			FunctionName:      entry.functionDef.Name,
@@ -286,6 +299,11 @@ func (vp *ViewPoller) poll(ctx context.Context, entry *viewEntry) {
 	decoded["timestamp"] = uint64(now.Unix())
 	decoded["contract_address"] = entry.contractAddress.String()
 
+	// For shared view tables, include contract_name to distinguish rows from different contracts.
+	if entry.schema.SharedTable {
+		decoded["contract_name"] = entry.contractName
+	}
+
 	// Generate poll index for key generation.
 	entry.statusMu.Lock()
 	pollIdx := entry.pollIndex
@@ -371,5 +389,50 @@ func (vp *ViewPoller) handlePollError(entry *viewEntry, err error) {
 
 // HasEntries returns true if there are any view functions to poll.
 func (vp *ViewPoller) HasEntries() bool {
+	vp.mu.Lock()
+	defer vp.mu.Unlock()
 	return len(vp.entries) > 0
+}
+
+// AddContract dynamically adds view functions for a contract that was registered
+// after engine startup (e.g., via discovery or admin API). It builds view entries,
+// creates tables in the store, spawns per-function polling goroutines, and returns
+// the view schemas for API registration.
+func (vp *ViewPoller) AddContract(ctx context.Context, cs *contractState) ([]*types.TableSchema, error) {
+	if len(cs.config.Views) == 0 {
+		return nil, nil
+	}
+
+	var newEntries []*viewEntry
+	var schemas []*types.TableSchema
+
+	for _, viewCfg := range cs.config.Views {
+		entry, viewSchema, err := vp.buildEntry(cs, &viewCfg)
+		if err != nil {
+			return nil, err
+		}
+		newEntries = append(newEntries, entry)
+		schemas = append(schemas, viewSchema)
+
+		vp.logger.Info("registered view function (dynamic)",
+			"contract", cs.config.Name,
+			"function", entry.functionDef.Name,
+			"interval", entry.interval,
+			"table", viewSchema.Name,
+		)
+	}
+
+	// Append entries under lock.
+	vp.mu.Lock()
+	vp.entries = append(vp.entries, newEntries...)
+	vp.mu.Unlock()
+
+	// Spawn per-function polling goroutines using the provided context.
+	for _, entry := range newEntries {
+		go func(e *viewEntry) {
+			vp.runView(ctx, e)
+		}(entry)
+	}
+
+	return schemas, nil
 }

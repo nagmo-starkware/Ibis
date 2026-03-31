@@ -140,6 +140,9 @@ type DiscoverConfig struct {
 	// value (not "fetch" or a file path).
 	SharedTables bool `yaml:"shared_tables" json:"shared_tables"`
 
+	// Views defines view functions to poll for discovered contracts.
+	Views []ViewConfig `yaml:"views,omitempty" json:"views,omitempty"`
+
 	// NameTemplate is an optional template for naming discovered contracts.
 	// Supports {class_hash_short}, {address_short}, {class_hash}, {address}, {group}.
 	// Default: "{class_hash_short}_{address_short}"

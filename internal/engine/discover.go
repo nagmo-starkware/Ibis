@@ -284,6 +284,7 @@ func (e *Engine) handleDiscoveryEvent(ctx context.Context, raw *provider.RawEven
 		Address:           contractAddr,
 		ABI:               dc.ABI,
 		Events:            dc.Events,
+		Views:             dc.Views,
 		StartBlock:        config.Uint64Ptr(raw.BlockNumber),
 		DiscoverClassHash: dc.ClassHash,
 	}
@@ -448,6 +449,17 @@ func (e *Engine) registerSharedDiscoveredChild(ctx context.Context, dc *config.D
 		}
 
 		e.subscriber.AddContract(e.runCtx, sub)
+	}
+
+	// Start view polling for this contract if it has views configured.
+	if e.runCtx != nil {
+		viewSchemas, err := e.startViewsForContract(e.runCtx, cs)
+		if err != nil {
+			e.logger.Error("failed to start views for discovered contract",
+				"contract", cc.Name, "error", err)
+		} else {
+			schemaList = append(schemaList, viewSchemas...)
+		}
 	}
 
 	// Notify API server (schemas only for first discovery when tables were created).

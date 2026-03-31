@@ -238,6 +238,11 @@ func validateDiscover(discovers []DiscoverConfig) error {
 						"because the ABI name is used as the shared table prefix")
 			}
 		}
+
+		// Validate view configs if present.
+		if err := validateViews(d.Views, prefix); err != nil {
+			return err
+		}
 	}
 	return nil
 }
