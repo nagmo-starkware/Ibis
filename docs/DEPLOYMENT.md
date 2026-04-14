@@ -252,7 +252,7 @@ database:
 
 ### Start Block
 
-Set `start_block` to the block number where your contract was deployed (or the earliest block you care about). Setting it to `0` starts from the latest block, which means you miss historical events:
+Set `start_block` to the block number where your contract was deployed (or the earliest block you care about). Setting it to `0` starts from block 0 (genesis), which backfills the entire chain history. Omit `start_block` entirely to start from the latest block (you'll only see new events):
 
 ```yaml
 indexer:

@@ -20,6 +20,11 @@ const (
 	// Max consecutive WSS dial failures before falling back to polling.
 	maxWSSDialFailures = 3
 
+	// Max consecutive WSS session failures (dial succeeds, session drops with
+	// zero events) before falling back to polling. Higher than dial failures
+	// since session drops can be transient.
+	maxWSSSessionFailures = 5
+
 	// Polling intervals.
 	catchupPollInterval = 100 * time.Millisecond
 	tipPollInterval     = 2 * time.Second
@@ -215,10 +220,12 @@ func (s *EventSubscriber) subscribeContract(ctx context.Context, contract Contra
 
 // subscribeWSS manages a WSS subscription with automatic reconnection using
 // exponential backoff (1s → 30s). Falls back to polling after maxWSSDialFailures
-// consecutive dial failures.
+// consecutive dial failures or maxWSSSessionFailures consecutive session failures
+// (sessions that connect but drop without processing any events).
 func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSubscription, lastBlock *uint64, logger *slog.Logger) error {
 	backoff := minBackoff
 	consecutiveDialFails := 0
+	consecutiveSessionFails := 0
 
 	for {
 		if ctx.Err() != nil {
@@ -265,15 +272,32 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 		logger.Info("WSS subscription active", "from_block", *lastBlock)
 
 		// Process events until session error.
-		err = s.processWSSEvents(ctx, session, lastBlock, logger)
+		eventsProcessed, err := s.processWSSEvents(ctx, session, lastBlock, logger)
 		session.close()
 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
+		// Track session stability: sessions that process zero events are
+		// considered unstable (e.g. WSS connects but drops with 1013 timeout).
+		if eventsProcessed == 0 {
+			consecutiveSessionFails++
+			if consecutiveSessionFails >= maxWSSSessionFailures {
+				logger.Warn("WSS sessions unstable, falling back to polling",
+					"session_failures", consecutiveSessionFails,
+					"error", err,
+				)
+				return fmt.Errorf("WSS session failed %d consecutive times: %w", consecutiveSessionFails, err)
+			}
+		} else {
+			// Session was healthy (processed events) — reset counter.
+			consecutiveSessionFails = 0
+		}
+
 		logger.Warn("WSS session ended, reconnecting",
 			"error", err,
+			"events_processed", eventsProcessed,
 			"backoff", backoff,
 			"resume_block", *lastBlock,
 		)
@@ -289,15 +313,17 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 }
 
 // processWSSEvents reads events from an active WSS session until an error
-// occurs or the context is canceled.
-func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSession, lastBlock *uint64, logger *slog.Logger) error {
+// occurs or the context is canceled. Returns the number of events successfully
+// processed and the error that ended the session.
+func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSession, lastBlock *uint64, logger *slog.Logger) (int, error) {
+	eventsProcessed := 0
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return eventsProcessed, ctx.Err()
 
 		case err := <-session.errs:
-			return fmt.Errorf("subscription error: %w", err)
+			return eventsProcessed, fmt.Errorf("subscription error: %w", err)
 
 		case reorg := <-session.reorgs:
 			if reorg != nil {
@@ -313,7 +339,7 @@ func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSess
 						EndBlock:   reorg.EndBlockNum,
 					}:
 					case <-ctx.Done():
-						return ctx.Err()
+						return eventsProcessed, ctx.Err()
 					}
 				}
 				// Reset to reorg start so the subscriber re-fetches.
@@ -339,11 +365,12 @@ func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSess
 
 			select {
 			case s.events <- rawEvent:
+				eventsProcessed++
 				if evt.BlockNumber > *lastBlock {
 					*lastBlock = evt.BlockNumber
 				}
 			case <-ctx.Done():
-				return ctx.Err()
+				return eventsProcessed, ctx.Err()
 			}
 		}
 	}

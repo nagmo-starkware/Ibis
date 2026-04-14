@@ -238,7 +238,7 @@ api:
 | Required | No |
 | Default | — |
 
-Global starting block for indexing. When set to `0`, ibis starts from the latest block. When set to a specific block number, ibis backfills from that block on startup.
+Global starting block for indexing. When set to `0`, ibis starts from block 0 (genesis). When set to a specific block number, ibis backfills from that block on startup. Omit this field entirely to start from the latest block (chain tip).
 
 Individual contracts can override this with their own `start_block`.
 

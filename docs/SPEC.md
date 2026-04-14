@@ -241,7 +241,7 @@ api:
   admin_key: ${IBIS_ADMIN_KEY}          # Optional API key for admin endpoints
 
 indexer:
-  start_block: 0                        # 0 = latest, or specific block number
+  start_block: 0                        # 0 = genesis block. Omit to start from latest
   pending_blocks: true                  # Index pre-confirmed blocks
   batch_size: 10                        # Blocks per batch for backfill
   udc_address: "0x04a64cd09..."         # Universal Deployer Contract address (auto-set for mainnet/sepolia)

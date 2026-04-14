@@ -131,7 +131,7 @@ api:
   admin_key: ${IBIS_ADMIN_KEY}   # Optional: protects admin endpoints
 
 indexer:
-  start_block: 0        # 0 = latest, or specific block number
+  start_block: 0        # 0 = genesis block. Omit to start from latest
   pending_blocks: true
   batch_size: 10
 

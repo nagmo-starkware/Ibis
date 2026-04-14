@@ -34,7 +34,7 @@ api:
 
 # OPTIONAL: Indexer settings
 indexer:
-  start_block: 0                     # Default: 0 (latest block). Use specific number for historical backfill
+  start_block: 0                     # 0 = genesis block. Omit to start from latest. Use specific number for historical backfill
   pending_blocks: true               # Default: true (index pre-confirmed blocks)
   batch_size: 10                     # Default: 10 (blocks per backfill query)
   udc_address: "0x04a64cd09a853868621571d..."  # Default: mainnet UDC. Override for devnet/appchains

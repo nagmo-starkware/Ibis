@@ -751,6 +751,173 @@ func TestSubscriberBackfill(t *testing.T) {
 	}
 }
 
+// mockWSSDialerSessionDrops returns a wssDialer where every session dials
+// successfully but drops immediately with sessionErr (zero events processed).
+func mockWSSDialerSessionDrops(sessionErr error) wssDialer {
+	return func(ctx context.Context, wsURL string, input *rpc.EventSubscriptionInput) (*wssSession, error) {
+		eventCh := make(chan *rpc.EmittedEventWithFinalityStatus, 1)
+		errCh := make(chan error, 1)
+		reorgCh := make(chan *client.ReorgEvent, 1)
+
+		// Session connects but immediately errors (zero events).
+		go func() {
+			errCh <- sessionErr
+		}()
+
+		return &wssSession{
+			events: eventCh,
+			errs:   errCh,
+			reorgs: reorgCh,
+			close:  func() {},
+		}, nil
+	}
+}
+
+// mockWSSDialerEventsBeforeDrop returns a wssDialer where each session delivers
+// the given events then drops with sessionErr. The counter tracks dial attempts.
+// Uses an unbuffered event channel so each event is consumed by processWSSEvents
+// before the error is sent — this prevents the select race where the error
+// arrives before the event is read.
+func mockWSSDialerEventsBeforeDrop(events []*rpc.EmittedEventWithFinalityStatus, sessionErr error, dialCount *atomic.Int32) wssDialer {
+	return func(ctx context.Context, wsURL string, input *rpc.EventSubscriptionInput) (*wssSession, error) {
+		dialCount.Add(1)
+		eventCh := make(chan *rpc.EmittedEventWithFinalityStatus) // unbuffered
+		errCh := make(chan error, 1)
+		reorgCh := make(chan *client.ReorgEvent, 1)
+
+		go func() {
+			for _, e := range events {
+				select {
+				case eventCh <- e: // blocks until processWSSEvents reads
+				case <-ctx.Done():
+					return
+				}
+			}
+			errCh <- sessionErr
+		}()
+
+		return &wssSession{
+			events: eventCh,
+			errs:   errCh,
+			reorgs: reorgCh,
+			close:  func() {},
+		}, nil
+	}
+}
+
+func TestSubscriberWSSSessionInstabilityFallback(t *testing.T) {
+	// WSS dials succeed but sessions drop immediately (zero events) N times.
+	// After maxWSSSessionFailures (5) consecutive drops, should fall back to polling.
+	var pollCalls atomic.Int32
+
+	server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return 105, nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			n := pollCalls.Add(1)
+			if n == 1 {
+				return map[string]interface{}{
+					"events": []map[string]interface{}{
+						{
+							"block_number":     100,
+							"block_hash":       "0x1",
+							"transaction_hash": "0x2",
+							"from_address":     "0x3",
+							"keys":             []string{"0x4"},
+							"data":             []string{"0x5"},
+						},
+					},
+				}, nil
+			}
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	})
+	defer server.Close()
+
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	events := make(chan RawEvent, 10)
+	sub := p.NewSubscriber(
+		[]ContractSubscription{{Address: newTestFelt(0xABC), StartBlock: 100}},
+		events,
+		&SubscriberConfig{BlocksPerQuery: 10},
+	)
+
+	// WSS dials succeed but sessions drop immediately with an error.
+	sub.dialWSS = mockWSSDialerSessionDrops(fmt.Errorf("websocket: close 1013: Connection timeout exceeded"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	go sub.Start(ctx)
+
+	// Should eventually fall back to polling and deliver an event.
+	select {
+	case evt := <-events:
+		if evt.BlockNumber != 100 {
+			t.Errorf("polled event.BlockNumber = %d, want 100", evt.BlockNumber)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for polled event after session instability fallback")
+	}
+}
+
+func TestSubscriberWSSSessionHealthyResets(t *testing.T) {
+	// WSS sessions that process events before dropping should reset the
+	// consecutiveSessionFails counter, preventing premature fallback.
+	var dialCount atomic.Int32
+
+	server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return 1000, nil
+		},
+	})
+	defer server.Close()
+
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	events := make(chan RawEvent, 100)
+	sub := p.NewSubscriber(
+		[]ContractSubscription{{Address: newTestFelt(0xABC), StartBlock: 100}},
+		events,
+		nil,
+	)
+
+	// Each session delivers 1 event then drops. Since events are processed,
+	// the session failure counter resets each time → no fallback to polling.
+	mockEvents := []*rpc.EmittedEventWithFinalityStatus{newTestEvent(200)}
+	sub.dialWSS = mockWSSDialerEventsBeforeDrop(mockEvents, fmt.Errorf("connection reset"), &dialCount)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go sub.Start(ctx)
+
+	// Collect multiple events from repeated healthy sessions.
+	for i := 0; i < 3; i++ {
+		select {
+		case evt := <-events:
+			if evt.BlockNumber != 200 {
+				t.Errorf("event[%d].BlockNumber = %d, want 200", i, evt.BlockNumber)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for event %d; only %d sessions dialed (expected no premature fallback)", i, dialCount.Load())
+		}
+	}
+
+	// Verify multiple sessions were created (proving reconnection, not fallback).
+	if dialCount.Load() < 3 {
+		t.Errorf("expected at least 3 WSS dial attempts (reconnections), got %d", dialCount.Load())
+	}
+}
+
 func TestSubscriberMultipleContracts(t *testing.T) {
 	server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){
 		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {

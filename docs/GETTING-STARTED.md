@@ -40,6 +40,15 @@ curl -L https://github.com/b-j-roberts/ibis/releases/latest/download/ibis_linux_
 sudo mv ibis /usr/local/bin/
 ```
 
+> **Tip**: To install without `sudo`, add the binary to a user-local directory instead:
+> ```bash
+> # Persistent (if ~/.local/bin is in your PATH)
+> mkdir -p ~/.local/bin && mv ibis ~/.local/bin/
+>
+> # Temporary (current terminal session only)
+> export PATH="$(pwd):$PATH"
+> ```
+
 ### Option 3: Build from source
 
 Requires Go 1.25+:
@@ -56,6 +65,15 @@ Add it to your PATH or move it:
 ```bash
 sudo mv ./bin/ibis /usr/local/bin/
 ```
+
+> **Tip**: To install without `sudo`, add the binary to your PATH directly:
+> ```bash
+> # Persistent (if ~/.local/bin is in your PATH)
+> mkdir -p ~/.local/bin && cp ./bin/ibis ~/.local/bin/
+>
+> # Temporary (current terminal session only)
+> export PATH="$(pwd)/bin:$PATH"
+> ```
 
 ### Verify the installation
 
@@ -92,7 +110,9 @@ Use "ibis [command] --help" for more information about a command.
 
 ## Your First Indexer
 
-We'll index the **STRK token** on Starknet mainnet. It's an ERC-20 token with frequent Transfer events, so you'll see data immediately.
+We'll index the **STRK token** on Starknet mainnet. It's an ERC-20 token with frequent Transfer events, so you'll see data as the indexer processes blocks.
+
+> **Note**: The default generated config sets `start_block: 0`, which means the indexer starts from genesis and backfills the entire chain — you'll see data accumulating as it catches up. To start from the chain tip instead (only new events), remove the `start_block` field from your config. To backfill a specific range, set `start_block` to a recent block number. See [Verify data is flowing](#step-4-verify-data-is-flowing) and [Troubleshooting](#no-data-appearing) for more.
 
 ### Step 1: Generate a config
 
@@ -195,7 +215,7 @@ contracts:
 | `rpc` | The RPC endpoint URL. WSS endpoints enable real-time subscriptions; HTTP falls back to polling |
 | `database.backend` | Where to store indexed data. `memory` is ephemeral (lost on restart), `badger` persists to disk, `postgres` is production-grade |
 | `api` | The REST API server address. Default: `0.0.0.0:8080` |
-| `indexer.start_block` | Where to start indexing. `0` means the latest block (you'll only see new events). Set a specific block number to backfill history |
+| `indexer.start_block` | Where to start indexing. `0` starts from block 0 (genesis). Omit this field to start from the latest block. Set a specific block number to backfill from that point |
 | `indexer.pending_blocks` | Whether to index pending (unconfirmed) blocks for lower latency |
 | `indexer.batch_size` | How many blocks to fetch per batch during backfill |
 | `contracts` | The contracts to index -- name, address, ABI source, and event configuration |
@@ -218,17 +238,22 @@ Loaded config from ./ibis.config.yaml
   API:      0.0.0.0:8080
   Contracts: 1
     - STRK (0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d): 1 events
+time=... level=WARN msg="RPC spec version mismatch (provider still usable)" error=...
+time=... level=INFO msg="using in-memory store"
 time=... level=INFO msg="created table" component=engine name=strk_transfer type=log columns=10
 time=... level=INFO msg="created table" component=engine name=strk_approval type=log columns=10
 ... (one line per event table)
 
 API server listening on 0.0.0.0:8080
 Starting indexer...
+time=... level=INFO msg="start block resolved" component=engine contract=STRK source=config value=0
 time=... level=INFO msg="contract start block" component=engine contract=STRK start_block=0
-time=... level=INFO msg="WSS subscription active" component=subscriber contract=0x04718f...938d from_block=0
+time=... level=INFO msg="API server starting" component=api addr=0.0.0.0:8080
+time=... level=WARN msg="WSS dial failed, retrying" error=... backoff=1s attempt=1  # may appear once or twice — normal
+time=... level=INFO msg="WSS subscription active" component=subscriber contract=0x4718f...938d from_block=0
 ```
 
-> **Note**: You'll see structured log lines for each table created and the WebSocket subscription being established — this is normal. You may also see a `level=WARN msg="RPC spec version mismatch"` warning — this is safe to ignore. If your RPC endpoint doesn't support WebSocket, you'll see `"WSS subscription failed, falling back to polling"` followed by `"starting polling fallback"` — polling works the same way.
+> **Note**: You will likely see these WARN lines — they are shown in the output above and are safe to ignore. The `"RPC spec version mismatch"` warning means the node reports a different Starknet spec version than the client expects, but the provider still works. If your RPC endpoint doesn't support WebSocket, you'll see `"WSS subscription failed, falling back to polling"` followed by `"starting polling fallback"` — polling works the same way.
 
 Here's what Ibis is doing:
 
@@ -242,11 +267,31 @@ Here's what Ibis is doing:
 
 Leave this running in your terminal. Open a new terminal for the next steps.
 
+### Step 4: Verify data is flowing
+
+Wait 30–60 seconds, then check the indexer status:
+
+```bash
+curl http://localhost:8080/v1/status
+```
+
+Look at the `current_block` field — a positive number means the indexer is advancing through the chain. If it shows `0`, the indexer hasn't processed any blocks yet.
+
+Next, check whether events have arrived:
+
+```bash
+curl http://localhost:8080/v1/STRK/Transfer/count
+```
+
+A `count` greater than 0 means Transfer events are being indexed.
+
+> **What if I see no data?** Don't worry — this can take a minute or two depending on your RPC endpoint. (1) Wait 1–2 minutes for the subscription to stabilize, (2) check the indexer terminal for error messages, (3) try a different RPC endpoint. See [Troubleshooting](#troubleshooting) below for details.
+
 ---
 
 ## Querying Data
 
-Once the indexer is running, data flows in continuously. You can query it via the REST API, SSE streaming, or the CLI.
+Setup is complete. The sections below show different ways to query your indexed data.
 
 ### REST API queries
 
@@ -288,6 +333,8 @@ curl "http://localhost:8080/v1/STRK/Transfer?limit=5&order=block_number.desc"
 
 > **Note**: Every event includes metadata fields (`block_number`, `log_index`, `transaction_hash`, `timestamp`, `contract_address`, `contract_name`, `event_name`, `status`) alongside the event-specific fields defined in the contract ABI.
 
+> **Note**: If no events match your query, `data` will be an empty array: `{"data":[],"count":0,"limit":5,"offset":0}`.
+
 **Filter by block range:**
 
 ```bash
@@ -317,6 +364,8 @@ curl "http://localhost:8080/v1/STRK/Transfer/latest"
   }
 }
 ```
+
+> **Note**: If no events have been indexed yet, this endpoint returns `404` with `{"error":"no events found"}`. Check `/v1/status` to verify the indexer is advancing.
 
 **Count events:**
 
@@ -350,9 +399,11 @@ curl "http://localhost:8080/v1/status"
 }
 ```
 
-This returns the current block height and the contracts being indexed (with each contract's name, address, event count, and per-contract block cursor).
+`current_block` shows the highest block number the indexer has processed. `0` means no blocks have been processed yet — the indexer is waiting for events from the chain tip. Each contract in the `contracts` array has its own `current_block`, showing that contract's independent indexing progress. See [Verify data is flowing](#step-4-verify-data-is-flowing) for how to check that the indexer is advancing.
 
-The REST API supports the same filter operators as the CLI (see table below). Pass filters as query parameters: `?field=operator.value`.
+All API errors use a consistent format: `{"error":"<message>"}` with an appropriate HTTP status code (e.g., `404` for missing data, `400` for invalid queries).
+
+The REST API supports filter operators — see the [filter operator table](#filter-operators) below. Pass filters as query parameters: `?field=operator.value`.
 
 ### SSE streaming (real-time)
 
@@ -376,7 +427,25 @@ Press `Ctrl+C` to stop streaming. The `-N` flag disables curl's output buffering
 
 ### CLI queries
 
-> **Important**: The `ibis query` command reads directly from the database by opening its own connection. With the `memory` backend, this creates a **separate, empty** in-memory store — it cannot see data from the running `ibis run` process. CLI queries only work with persistent backends (`badger` or `postgres`). If you're using `memory` (as in this guide), use the REST API or SSE streaming above to query data.
+**The `ibis query` command opens its own database connection. With the `memory` backend, this creates a separate, empty in-memory store — it cannot see data from the running `ibis run` process.** CLI queries only work with persistent backends (`badger` or `postgres`). If you're using `memory` (as in this guide), skip to the [filter operator table](#filter-operators) below — use the REST API examples above to query your data.
+
+Both the CLI and REST API support the same filter operators:
+
+<a id="filter-operators"></a>
+
+| Operator | Meaning |
+|----------|---------|
+| `eq` | Equal to |
+| `neq` | Not equal to |
+| `gt` | Greater than |
+| `gte` | Greater than or equal |
+| `lt` | Less than |
+| `lte` | Less than or equal |
+
+In the REST API, pass filters as query parameters: `?field=operator.value`. In the CLI, use the `--filter` flag: `--filter "field=operator.value"`. You can combine multiple filters in both interfaces.
+
+<details>
+<summary><strong>CLI query examples (requires <code>badger</code> or <code>postgres</code> backend)</strong></summary>
 
 The `ibis query` command is useful when you have a persistent backend configured. Basic syntax: `ibis query <contract> <event>`.
 
@@ -454,17 +523,6 @@ ibis query STRK Transfer --count
 ibis query STRK Transfer --filter "from=eq.0x0123..." --format table
 ```
 
-The `--filter` flag uses the syntax `field=operator.value`. Available operators:
-
-| Operator | Meaning |
-|----------|---------|
-| `eq` | Equal to |
-| `neq` | Not equal to |
-| `gt` | Greater than |
-| `gte` | Greater than or equal |
-| `lt` | Less than |
-| `lte` | Less than or equal |
-
 You can combine multiple filters:
 
 ```bash
@@ -475,6 +533,8 @@ ibis query STRK Transfer \
   --order block_number.asc \
   --format table
 ```
+
+</details>
 
 ---
 
@@ -492,7 +552,7 @@ Now that you have a running indexer, explore these topics:
 When you're ready to move beyond the in-memory database:
 
 1. **Switch to PostgreSQL** -- change `database.backend` to `postgres` and add connection details (or use `make docker-compose-up` for a quick setup)
-2. **Set a start block** -- change `indexer.start_block` from `0` to a specific block number to backfill historical data
+2. **Set a start block** -- set `indexer.start_block` to a specific block number (e.g., your contract's deploy block) to backfill historical data from that point
 3. **Use WSS for real-time** -- replace the HTTP RPC URL with a WebSocket endpoint for instant event delivery via `starknet_subscribeEvents`
 
 ---
@@ -513,6 +573,21 @@ Error: creating provider: dial tcp: lookup free-rpc.nethermind.io: no such host
 - `https://rpc.starknet.lava.build` (Lava)
 
 See [Starknet RPC providers](https://www.starknet.io/fullnodes-rpc-services/) for more options.
+
+### WebSocket connection instability
+
+```
+time=... level=WARN msg="WSS dial failed, retrying" error=... backoff=1s attempt=1
+time=... level=WARN msg="WSS session ended, reconnecting" error="websocket: close 1013: Connection timeout exceeded"
+time=... level=WARN msg="WSS sessions unstable, falling back to polling" session_failures=5
+time=... level=INFO msg="starting polling fallback" component=subscriber contract=STRK
+```
+
+**Cause**: Some public RPC endpoints have short WebSocket timeout limits or rate-limit long-lived connections. The WebSocket connects successfully but drops shortly after (often with error code `1013`).
+
+**Behavior**: Ibis retries dropped sessions with exponential backoff. After 5 consecutive session failures without processing any events, it automatically falls back to HTTP polling — which works the same way, just with slightly higher latency.
+
+**Fix**: If you see frequent reconnects, try a different RPC provider (see the alternatives listed in [RPC connection failures](#rpc-connection-failures) above) or use a provider that offers a dedicated WSS endpoint.
 
 ### ABI fetch errors
 
@@ -550,9 +625,9 @@ lsof -i :8080
 
 ### No data appearing
 
-**Cause**: If `start_block` is `0`, Ibis begins from the latest block and only indexes new events going forward. If the contract hasn't emitted events since you started, the tables will be empty.
+**Cause**: If `start_block` is `0`, Ibis begins from block 0 (genesis) and backfills the entire chain. On mainnet with a public RPC, this can be very slow or overwhelm the endpoint. If `start_block` is omitted, Ibis starts from the latest block and only indexes new events going forward — so tables will be empty until new events arrive.
 
-**Fix**: Set `indexer.start_block` to a recent block number to backfill historical events:
+**Fix**: Set `indexer.start_block` to a recent block number to backfill a manageable range of historical events:
 
 ```yaml
 indexer:
