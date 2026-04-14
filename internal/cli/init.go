@@ -18,6 +18,7 @@ import (
 
 var (
 	initContracts      []string
+	initNames          []string
 	initOutput         string
 	initNetwork        string
 	initRPC            string
@@ -34,12 +35,13 @@ Interactive mode (default):
   ibis init --contract 0x049d36...
 
 Non-interactive mode (for CI/scripting):
-  ibis init --contract 0x049d36... --network mainnet --rpc wss://... --database memory --non-interactive`,
+  ibis init --contract 0x049d36... --name MyToken --network mainnet --rpc wss://... --database memory --non-interactive`,
 	RunE: runInit,
 }
 
 func init() {
 	initCmd.Flags().StringSliceVar(&initContracts, "contract", nil, "contract address(es) to index (can be specified multiple times)")
+	initCmd.Flags().StringSliceVar(&initNames, "name", nil, "contract name(s), applied in order to --contract addresses")
 	initCmd.Flags().StringVar(&initOutput, "output", "./ibis.config.yaml", "output path for generated config")
 	initCmd.Flags().StringVar(&initNetwork, "network", "", "network: mainnet, sepolia, or custom")
 	initCmd.Flags().StringVar(&initRPC, "rpc", "", "RPC endpoint URL (WSS or HTTP)")
@@ -49,8 +51,8 @@ func init() {
 
 // defaultRPCURLs maps network names to default public RPC endpoints.
 var defaultRPCURLs = map[string]string{
-	"mainnet": "https://free-rpc.nethermind.io/mainnet-juno",
-	"sepolia": "https://free-rpc.nethermind.io/sepolia-juno",
+	"mainnet": "https://starknet-rpc.publicnode.com",
+	"sepolia": "https://starknet-sepolia-rpc.publicnode.com",
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -84,6 +86,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Validate --name count matches --contract count when provided.
+	if len(initNames) > 0 && len(initNames) != len(contracts) {
+		return fmt.Errorf("--name count (%d) must match --contract count (%d)", len(initNames), len(contracts))
+	}
+
 	// Step 5: Fetch ABIs and configure events for each contract.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
@@ -99,8 +106,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 	resolver := config.NewABIResolver(prov)
 
 	var contractConfigs []config.ContractConfig
-	for _, addr := range contracts {
-		cc, err := configureContract(ctx, p, resolver, addr)
+	for i, addr := range contracts {
+		var nameOverride string
+		if i < len(initNames) {
+			nameOverride = initNames[i]
+		}
+		cc, err := configureContract(ctx, p, resolver, addr, nameOverride)
 		if err != nil {
 			return fmt.Errorf("configuring contract %s: %w", addr, err)
 		}
@@ -213,22 +224,25 @@ func resolveContracts(p *prompter) ([]string, error) {
 }
 
 // configureContract fetches the ABI for a contract and prompts for event configuration.
-func configureContract(ctx context.Context, p *prompter, resolver *config.ABIResolver, address string) (config.ContractConfig, error) {
+// If nameOverride is non-empty, it is used as the contract name without prompting.
+func configureContract(ctx context.Context, p *prompter, resolver *config.ABIResolver, address string, nameOverride string) (config.ContractConfig, error) {
 	cc := config.ContractConfig{
 		Address: address,
 		ABI:     "fetch",
 	}
 
 	// Prompt for contract name.
-	defaultName := shortContractName(address)
-	if !initNonInteractive {
+	if nameOverride != "" {
+		cc.Name = nameOverride
+	} else if !initNonInteractive {
+		defaultName := shortContractName(address)
 		name, err := p.input(fmt.Sprintf("\nName for contract %s", truncateAddress(address)), defaultName)
 		if err != nil {
 			return cc, err
 		}
 		cc.Name = name
 	} else {
-		cc.Name = defaultName
+		cc.Name = shortContractName(address)
 	}
 
 	// Fetch ABI from chain.

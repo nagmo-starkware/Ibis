@@ -21,6 +21,7 @@ Scaffold an `ibis.config.yaml` by inspecting contracts on-chain. Fetches the con
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--contract <address>` | *(required in non-interactive)* | Contract address(es) to index. Repeatable: `--contract 0xA --contract 0xB` |
+| `--name <name>` | *(auto-generated)* | Contract name(s), applied in order to `--contract` addresses. Sets the query identifier used in `ibis query` and REST API paths |
 | `--output <path>` | `./ibis.config.yaml` | Output path for generated config |
 | `--network <name>` | *(prompted)* | Network: `mainnet`, `sepolia`, or `custom` |
 | `--rpc <url>` | *(prompted)* | RPC endpoint URL (WSS or HTTP) |
@@ -32,7 +33,7 @@ Scaffold an `ibis.config.yaml` by inspecting contracts on-chain. Fetches the con
 When run without `--non-interactive`, ibis walks you through each configuration step:
 
 1. **Select network** -- choose `mainnet`, `sepolia`, or `custom`
-2. **RPC endpoint** -- enter URL (defaults to `https://free-rpc.nethermind.io/mainnet-juno` for mainnet, similar for sepolia)
+2. **RPC endpoint** -- enter URL (defaults to `https://starknet-rpc.publicnode.com` for mainnet, similar for sepolia)
 3. **Database backend** -- choose `memory`, `badger`, or `postgres`
 4. **Contract addresses** -- enter one or more `0x...` addresses
 5. **Contract naming** -- name each contract (defaults to `Contract_` + first 6 hex chars)
@@ -52,6 +53,7 @@ Provide all values via flags for CI/scripting use. Events default to wildcard (`
 # Non-interactive: fully automated
 ibis init \
   --contract 0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7 \
+  --name STRK \
   --network mainnet \
   --rpc wss://starknet-mainnet.example.com \
   --database postgres \
@@ -62,15 +64,15 @@ In non-interactive mode:
 - `--network` defaults to `mainnet` if omitted
 - `--database` defaults to `memory` if omitted
 - `--contract` is required (at least one)
+- `--name` sets human-friendly names; if omitted, names are auto-generated from addresses (e.g., `Contract_04718f`)
 - `--rpc` is required for `custom` network; mainnet/sepolia use public defaults
-- Contract names are auto-generated from addresses
 - All events are indexed as `log` tables via wildcard
 
 ### Examples
 
 ```bash
-# Multiple contracts
-ibis init --contract 0xAAA --contract 0xBBB
+# Multiple contracts with names
+ibis init --contract 0xAAA --contract 0xBBB --name TokenA --name TokenB
 
 # Custom output path
 ibis init --contract 0xAAA --output ./configs/my-indexer.yaml

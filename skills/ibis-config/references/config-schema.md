@@ -152,8 +152,8 @@ api:
 
 | Network  | HTTP                                               | WSS                |
 |----------|----------------------------------------------------|--------------------|
-| mainnet  | https://free-rpc.nethermind.io/mainnet-juno         | (user-provided)    |
-| sepolia  | https://free-rpc.nethermind.io/sepolia-juno         | (user-provided)    |
+| mainnet  | https://starknet-rpc.publicnode.com         | (user-provided)    |
+| sepolia  | https://starknet-sepolia-rpc.publicnode.com         | (user-provided)    |
 
 ## Table Types
 
@@ -383,7 +383,7 @@ Only these types support sum/avg operations:
 
 ```yaml
 network: mainnet
-rpc: https://free-rpc.nethermind.io/mainnet-juno
+rpc: https://starknet-rpc.publicnode.com
 
 database:
   backend: memory

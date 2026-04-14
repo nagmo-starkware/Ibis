@@ -65,7 +65,7 @@ No additional fields are required — `type: log` is all you need.
 
 ```bash
 # Get all Transfer events (paginated)
-curl "http://localhost:8080/v1/STRK/Transfer?limit=10&order=desc"
+curl "http://localhost:8080/v1/STRK/Transfer?limit=10&order=block_number.desc"
 
 # Filter by sender
 curl "http://localhost:8080/v1/STRK/Transfer?from=eq.0x123..."
@@ -78,7 +78,7 @@ curl "http://localhost:8080/v1/STRK/Transfer/count"
 
 ```bash
 # Latest 10 transfers
-ibis query STRK Transfer --limit 10 --order desc
+ibis query STRK Transfer --limit 10 --order block_number.desc
 
 # Filter by sender
 ibis query STRK Transfer --filter "from=eq.0x123..."
@@ -133,29 +133,29 @@ The `unique_key` field is **required** and must match a field name from the even
 
 ### Querying
 
-Unique tables have a dedicated `/latest` endpoint that returns one row per key:
+Unique tables have a dedicated `/unique` endpoint that returns one row per key:
 
 **REST API:**
 
 ```bash
 # Get all current scores (one per player)
-curl "http://localhost:8080/v1/GameLeaderboard/ScoreUpdate/latest"
+curl "http://localhost:8080/v1/GameLeaderboard/ScoreUpdate/unique"
 
 # Filter to a specific player
-curl "http://localhost:8080/v1/GameLeaderboard/ScoreUpdate/latest?player_address=eq.0x456..."
+curl "http://localhost:8080/v1/GameLeaderboard/ScoreUpdate/unique?player_address=eq.0x456..."
 ```
 
 **CLI:**
 
 ```bash
 # All current scores
-ibis query GameLeaderboard ScoreUpdate --latest
+ibis query GameLeaderboard ScoreUpdate --unique
 
 # Specific player
-ibis query GameLeaderboard ScoreUpdate --latest --filter "player_address=eq.0x456..."
+ibis query GameLeaderboard ScoreUpdate --unique --filter "player_address=eq.0x456..."
 ```
 
-> **Note:** The underlying log of all events is still stored. The `/latest` endpoint provides the deduplicated view, while the base endpoint (`/v1/GameLeaderboard/ScoreUpdate`) still returns the full event history.
+> **Note:** The underlying log of all events is still stored. The `/unique` endpoint provides the deduplicated view, while the base endpoint (`/v1/GameLeaderboard/ScoreUpdate`) still returns the full event history.
 
 ### How It Works
 

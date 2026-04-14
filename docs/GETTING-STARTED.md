@@ -100,7 +100,7 @@ What each flag does:
 
 Ibis enters interactive mode. It will:
 
-1. **Prompt for an RPC endpoint** -- press Enter to accept the default (`https://free-rpc.nethermind.io/mainnet-juno`)
+1. **Prompt for an RPC endpoint** -- press Enter to accept the default (`https://starknet-rpc.publicnode.com`)
 2. **Ask you to name the contract** -- type `STRK` and press Enter
 3. **Fetch the ABI** from the chain and list the available events (e.g., `Transfer`, `Approval`)
 4. **Ask which events to index** -- select "Yes" to index all events with the wildcard (`*`)
@@ -109,7 +109,7 @@ Ibis enters interactive mode. It will:
 Ibis Config Generator
 ========================================
 
-(default: https://free-rpc.nethermind.io/mainnet-juno)
+(default: https://starknet-rpc.publicnode.com)
 RPC endpoint URL: <press Enter>
 
 Name for contract 0x04718f...938d: STRK
@@ -127,15 +127,18 @@ Run `ibis run --config ./ibis.config.yaml` to start indexing.
 
 > **Tip: Agent skills** -- If you use [Claude Code](https://claude.com/claude-code) or another AI coding assistant, the `ibis-config` skill can generate configs from natural language. For example: *"index all Transfer events from the STRK token"*. Install with `npx skills add b-j-roberts/ibis --skill ibis-config`. See the [Agent Skills Guide](AGENT-SKILLS.md) for details.
 
-For scripting or CI, add `--non-interactive` to skip all prompts:
+For scripting or CI, add `--non-interactive` to skip all prompts. Use `--name` to set the contract's query identifier (used in `ibis query <name> <event>` and REST API paths like `/v1/<name>/<event>`):
 
 ```bash
 ibis init \
   --contract 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d \
+  --name STRK \
   --network mainnet \
   --database memory \
   --non-interactive
 ```
+
+> **Note**: Without `--name`, non-interactive mode auto-generates a name from the contract address (e.g., `Contract_04718f`). Always pass `--name` if you plan to query by a human-friendly name.
 
 ### Step 2: Understand the config
 
@@ -148,7 +151,7 @@ Open `ibis.config.yaml`. Here's what was generated:
 # Run `ibis run` to start indexing with this config.
 
 network: mainnet
-rpc: https://free-rpc.nethermind.io/mainnet-juno
+rpc: https://starknet-rpc.publicnode.com
 database:
   backend: memory
 api:
@@ -192,7 +195,7 @@ You'll see startup output like this:
 ```
 Loaded config from ./ibis.config.yaml
   Network:  mainnet
-  RPC:      https://free-rpc.nethermind.io/mainnet-juno
+  RPC:      https://starknet-rpc.publicnode.com
   Backend:  memory
   API:      0.0.0.0:8080
   Contracts: 1
@@ -380,7 +383,7 @@ Now that you have a running indexer, explore these topics:
 
 - **[Configuration Reference](CONFIGURATION.md)** -- every field in `ibis.config.yaml` explained, with defaults, types, and examples
 - **[Table Types Guide](TABLE-TYPES.md)** -- when to use `log`, `unique`, and `aggregation` tables, with real-world examples
-- **[Factory Guide](FACTORY.md)** -- index factory-deployed contracts with automatic child discovery and shared tables
+- **[Advanced Features](ADVANCED-FEATURES.md)** -- index factory-deployed contracts with automatic child discovery and shared tables
 - **[Agent Skills Guide](AGENT-SKILLS.md)** -- use `ibis-config` and `ibis-query` skills to generate configs and query data using natural language
 
 ### Going to production
@@ -403,7 +406,12 @@ Error: creating provider: dial tcp: lookup free-rpc.nethermind.io: no such host
 
 **Cause**: The RPC endpoint is unreachable. The default public endpoint may be down or rate-limited.
 
-**Fix**: Try a different RPC provider. You can update the `rpc` field in `ibis.config.yaml` or pass `--rpc` to `ibis init`. See [chainlist.org](https://www.starknet.io/ecosystem/rpc-providers/) for Starknet RPC providers.
+**Fix**: Try a different RPC provider. Update the `rpc` field in `ibis.config.yaml` or pass `--rpc` to `ibis init`. Free alternatives:
+
+- `https://starknet.drpc.org` (dRPC)
+- `https://rpc.starknet.lava.build` (Lava)
+
+See [Starknet RPC providers](https://www.starknet.io/fullnodes-rpc-services/) for more options.
 
 ### ABI fetch errors
 
@@ -415,7 +423,7 @@ Error: engine setup: fetching ABI for STRK: ...
 
 **Fix**:
 - Verify the contract address is correct
-- Check that the RPC endpoint is accessible: `curl https://free-rpc.nethermind.io/mainnet-juno -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"starknet_chainId","id":1}'`
+- Check that the RPC endpoint is accessible: `curl https://starknet-rpc.publicnode.com -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"starknet_chainId","id":1}'`
 - If the contract ABI isn't available on-chain, provide a local ABI file: `abi: ./path/to/abi.json`
 
 ### Port conflicts
