@@ -163,7 +163,7 @@ contracts:
             type: log
 ```
 
-See [`configs/ibis.config.yaml`](configs/ibis.config.yaml) for a fully documented example.
+See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full configuration reference, or [`configs/ibis.config.yaml`](configs/ibis.config.yaml) for a documented example.
 
 ## CLI
 
