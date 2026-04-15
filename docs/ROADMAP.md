@@ -605,6 +605,26 @@
 - The response envelope adds a `total` field not present in `listResponse`. Either extend `listResponse` or use a custom struct for factory children. Prefer a custom struct to avoid breaking existing event endpoints.
 - Edge cases: `offset >= total` should return empty `data` with the correct `total`; `limit=0` or negative should use the default.
 
+### 3.24 Fix BadgerDB Range Filter Operators (gt, gte, lt, lte)
+
+**Description**: The BadgerDB store's `toFloat64` helper is missing a `case string` handler, causing all range filter operators (`gt`, `gte`, `lt`, `lte`) to silently return incorrect results. Filter values arrive as strings from HTTP query parameters (e.g., `"850000"`), but `toFloat64` falls through to `return 0` for strings. This makes `lt`/`lte` return zero results and `gt`/`gte` return all results, regardless of the filter value. The same broken function is used by `sortEvents`, so sorting on string-typed data fields is also affected. `eq` and `neq` are unaffected because they compare via `fmt.Sprint`. The Memory store already handles this correctly — the fix is to port the missing `case string` branch.
+
+**Requirements**:
+- [ ] Add `case string` to `toFloat64()` in `internal/store/badger/badger.go` to parse numeric strings via `strconv.ParseFloat`, matching the Memory store's implementation
+- [ ] Add `case string` to `toUint64()` in `internal/store/badger/badger.go` to parse numeric strings via `strconv.ParseUint`, for consistency
+- [ ] Verify `matchFilter` range operators (`gt`, `gte`, `lt`, `lte`) return correct results when filter values are strings (the API query param path)
+- [ ] Verify `sortEvents` correctly orders events when data fields are string-typed numerics (e.g., JSON-unmarshaled block numbers)
+- [ ] Add integration test that exercises range filters through a real HTTP request → API → BadgerDB round-trip (the existing `TestFilterOperators` unit test passes because it uses raw `int` values, not JSON-unmarshaled strings)
+- [ ] Ensure SSE replay filter (`sse.go` line 109, `Value: fmt.Sprintf("%d", block)`) works correctly with the fixed `toFloat64`
+- [ ] Run `make check` to confirm no regressions
+
+**Implementation Notes**:
+- **Root cause**: `internal/store/badger/badger.go` `toFloat64()` (line ~814) is missing the `case string` branch that exists in `internal/store/memory/memory.go` `toFloat64()` (line ~531). The fix is a 5-line addition.
+- **Filter value flow**: API query params (`?block_number=gt.850000`) are parsed in `internal/api/query.go:95-98` where `Value` is always a `string`. BadgerDB's `matchFilter` calls `toFloat64(expected)` on this string value, which returns 0 → all comparisons against 0 produce wrong results.
+- The existing unit test `TestFilterOperators` in `badger_test.go` inserts events with `"score": i * 10` (raw `int`), so it never triggers the string path. The integration test should use actual HTTP requests with query param filters to catch the real-world code path.
+- `sortEvents` at line ~792 also calls `toFloat64` on field values from `getFieldValue`, which returns `evt.Data[field]` — after JSON round-tripping through BadgerDB, these may be strings. The same fix resolves sorting.
+- Consider adding `strconv` to imports if not already present in `badger.go`.
+
 ---
 
 ## Phase 4: Future

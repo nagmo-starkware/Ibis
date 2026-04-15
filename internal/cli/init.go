@@ -226,23 +226,24 @@ func resolveContracts(p *prompter) ([]string, error) {
 
 // configureContract fetches the ABI for a contract and prompts for event configuration.
 // If nameOverride is non-empty, it is used as the contract name without prompting.
-func configureContract(ctx context.Context, p *prompter, resolver *config.ABIResolver, address string, nameOverride string) (config.ContractConfig, error) {
+func configureContract(ctx context.Context, p *prompter, resolver *config.ABIResolver, address, nameOverride string) (config.ContractConfig, error) {
 	cc := config.ContractConfig{
 		Address: address,
 		ABI:     "fetch",
 	}
 
 	// Prompt for contract name.
-	if nameOverride != "" {
+	switch {
+	case nameOverride != "":
 		cc.Name = nameOverride
-	} else if !initNonInteractive {
+	case !initNonInteractive:
 		defaultName := shortContractName(address)
 		name, err := p.input(fmt.Sprintf("\nName for contract %s", truncateAddress(address)), defaultName)
 		if err != nil {
 			return cc, err
 		}
 		cc.Name = name
-	} else {
+	default:
 		cc.Name = shortContractName(address)
 	}
 

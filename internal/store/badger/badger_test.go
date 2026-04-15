@@ -705,6 +705,165 @@ func TestSchemasPersistAcrossReopen(t *testing.T) {
 	}
 }
 
+// TestFilterOperatorsWithStringValues exercises range filters where the filter
+// value is a string, which is the real-world path: API query params like
+// ?score=gt.20 are parsed into store.Filter{Value: "20"} (a string).
+// The original TestFilterOperators uses raw int values, masking the bug.
+func TestFilterOperatorsWithStringValues(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	s.CreateTable(ctx, &types.TableSchema{Name: "data", TableType: types.TableTypeLog})
+
+	// Insert events with int scores (simulating what the indexer stores).
+	for i := 0; i < 5; i++ {
+		s.ApplyOperations(ctx, []store.Operation{{
+			Type: store.OpInsert, Table: "data", BlockNumber: uint64(i), LogIndex: 0,
+			Data: map[string]any{"score": i * 10, "block_number": uint64(i)},
+		}})
+	}
+
+	// Filter values are strings, simulating the API query param path.
+	tests := []struct {
+		name     string
+		filter   store.Filter
+		expected int
+	}{
+		{"gt_string", store.Filter{Field: "score", Operator: "gt", Value: "20"}, 2},
+		{"gte_string", store.Filter{Field: "score", Operator: "gte", Value: "20"}, 3},
+		{"lt_string", store.Filter{Field: "score", Operator: "lt", Value: "20"}, 2},
+		{"lte_string", store.Filter{Field: "score", Operator: "lte", Value: "20"}, 3},
+		{"eq_string", store.Filter{Field: "score", Operator: "eq", Value: "20"}, 1},
+		{"neq_string", store.Filter{Field: "score", Operator: "neq", Value: "20"}, 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events, err := s.GetEvents(ctx, "data", store.Query{
+				Limit:   10,
+				Filters: []store.Filter{tt.filter},
+			})
+			if err != nil {
+				t.Fatalf("get filtered events: %v", err)
+			}
+			if len(events) != tt.expected {
+				t.Errorf("operator %s: expected %d events, got %d", tt.name, tt.expected, len(events))
+			}
+		})
+	}
+}
+
+// TestSortEventsWithStringNumerics verifies that sortEvents works correctly
+// when data fields are string-typed numerics (e.g., after JSON round-tripping).
+func TestSortEventsWithStringNumerics(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	s.CreateTable(ctx, &types.TableSchema{
+		Name:      "scores",
+		TableType: types.TableTypeUnique,
+		UniqueKey: "player",
+	})
+
+	// Insert events with string-typed score values (simulating JSON round-trip).
+	players := []struct {
+		name  string
+		score string
+		block uint64
+	}{
+		{"alice", "300", 1},
+		{"bob", "100", 2},
+		{"charlie", "200", 3},
+	}
+
+	for _, p := range players {
+		s.ApplyOperations(ctx, []store.Operation{{
+			Type: store.OpInsert, Table: "scores", BlockNumber: p.block, LogIndex: 0,
+			Data: map[string]any{
+				"player":       p.name,
+				"score":        p.score,
+				"block_number": p.block,
+			},
+		}})
+	}
+
+	// Sort ascending by score.
+	events, err := s.GetUniqueEvents(ctx, "scores", store.Query{
+		Limit:    10,
+		OrderBy:  "score",
+		OrderDir: store.OrderAsc,
+	})
+	if err != nil {
+		t.Fatalf("get unique events: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Ascending: 100, 200, 300.
+	if events[0].Data["player"] != "bob" {
+		t.Errorf("expected first player bob (score 100), got %v", events[0].Data["player"])
+	}
+	if events[1].Data["player"] != "charlie" {
+		t.Errorf("expected second player charlie (score 200), got %v", events[1].Data["player"])
+	}
+	if events[2].Data["player"] != "alice" {
+		t.Errorf("expected third player alice (score 300), got %v", events[2].Data["player"])
+	}
+
+	// Sort descending by score.
+	events, err = s.GetUniqueEvents(ctx, "scores", store.Query{
+		Limit:    10,
+		OrderBy:  "score",
+		OrderDir: store.OrderDesc,
+	})
+	if err != nil {
+		t.Fatalf("get unique events desc: %v", err)
+	}
+
+	// Descending: 300, 200, 100.
+	if events[0].Data["player"] != "alice" {
+		t.Errorf("expected first player alice (score 300), got %v", events[0].Data["player"])
+	}
+	if events[2].Data["player"] != "bob" {
+		t.Errorf("expected last player bob (score 100), got %v", events[2].Data["player"])
+	}
+}
+
+// TestSSEReplayFilterSimulation verifies that the SSE replay filter path works
+// correctly. SSE replay uses fmt.Sprintf("%d", block) which produces a string
+// value for the block_number gte filter.
+func TestSSEReplayFilterSimulation(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	s.CreateTable(ctx, &types.TableSchema{Name: "events", TableType: types.TableTypeLog})
+
+	for i := uint64(850000); i < 850005; i++ {
+		s.ApplyOperations(ctx, []store.Operation{{
+			Type: store.OpInsert, Table: "events", BlockNumber: i, LogIndex: 0,
+			Data: map[string]any{"block_number": i, "value": "test"},
+		}})
+	}
+
+	// Simulate SSE replay filter: Value is fmt.Sprintf("%d", 850002) = "850002"
+	events, err := s.GetEvents(ctx, "events", store.Query{
+		Limit: 10,
+		Filters: []store.Filter{{
+			Field:    "block_number",
+			Operator: "gte",
+			Value:    "850002",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("get filtered events: %v", err)
+	}
+	// Blocks 850002, 850003, 850004 = 3 events.
+	if len(events) != 3 {
+		t.Errorf("expected 3 events with block_number >= 850002, got %d", len(events))
+	}
+}
+
 func TestCursorPersistsAcrossReopen(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()

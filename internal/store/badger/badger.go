@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -826,6 +827,12 @@ func toFloat64(v any) float64 {
 	case json.Number:
 		f, _ := n.Float64()
 		return f
+	case string:
+		f, err := strconv.ParseFloat(n, 64)
+		if err != nil {
+			return 0
+		}
+		return f
 	default:
 		return 0
 	}
@@ -846,6 +853,12 @@ func toUint64(v any) uint64 {
 	case json.Number:
 		i, _ := n.Int64()
 		return uint64(i)
+	case string:
+		u, err := strconv.ParseUint(n, 10, 64)
+		if err != nil {
+			return 0
+		}
+		return u
 	default:
 		return 0
 	}
