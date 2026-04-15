@@ -129,18 +129,17 @@ List events from a log table with pagination, ordering, and filtering.
 {
   "data": [
     {
-      "event_id": "850000:0",
       "contract_address": "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+      "contract_name": "MyToken",
       "event_name": "Transfer",
       "block_number": 850000,
-      "block_hash": "0x...",
       "transaction_hash": "0x...",
       "log_index": 0,
       "timestamp": 1700000000,
-      "status": "ACCEPTED_L2",
+      "status": "ACCEPTED_ON_L2",
       "from": "0x1234...",
       "to": "0x5678...",
-      "amount": "1000000000000000000"
+      "value": "1000000000000000000"
     }
   ],
   "count": 1,
@@ -186,18 +185,17 @@ Returns the single most recent event (highest block number, then highest log ind
 ```json
 {
   "data": {
-    "event_id": "850000:3",
     "contract_address": "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+    "contract_name": "MyToken",
     "event_name": "Transfer",
     "block_number": 850000,
-    "block_hash": "0x...",
     "transaction_hash": "0x...",
     "log_index": 3,
     "timestamp": 1700000000,
-    "status": "ACCEPTED_L2",
+    "status": "ACCEPTED_ON_L2",
     "from": "0x1234...",
     "to": "0x5678...",
-    "amount": "500000000000000000"
+    "value": "500000000000000000"
   }
 }
 ```
@@ -263,15 +261,14 @@ Returns the latest entry per unique key from a **unique** table type. Only avail
 {
   "data": [
     {
-      "event_id": "850000:1",
       "contract_address": "0x...",
+      "contract_name": "MyToken",
       "event_name": "Balance",
       "block_number": 850000,
-      "block_hash": "0x...",
       "transaction_hash": "0x...",
       "log_index": 1,
       "timestamp": 1700000000,
-      "status": "ACCEPTED_L2",
+      "status": "ACCEPTED_ON_L2",
       "account": "0x1234...",
       "balance": "5000000000000000000"
     }
@@ -446,6 +443,8 @@ curl "http://localhost:8080/v1/MyDEX/children/count?token0=eq.0xabc"
 
 Returns contracts discovered via class hash watching for a specific class hash. Used when the indexer is configured with [`discover`](CONFIGURATION.md#discover) blocks to watch for deployments of known class hashes.
 
+> **Note**: This endpoint returns a bare JSON array (not wrapped in a `data` field), unlike most other endpoints.
+
 **Response** `200 OK`:
 
 ```json
@@ -487,10 +486,10 @@ Server-Sent Events (SSE) endpoint that streams new indexed events in real-time.
 
 ```
 id: 850000:3
-data: {"event_id":"850000:3","contract_address":"0x...","event_name":"Transfer","block_number":850000,"from":"0x1234...","to":"0x5678...","amount":"1000000000000000000"}
+data: {"contract_address":"0x...","contract_name":"MyToken","event_name":"Transfer","block_number":850000,"from":"0x1234...","to":"0x5678...","value":"1000000000000000000","status":"ACCEPTED_ON_L2"}
 
 id: 850001:0
-data: {"event_id":"850001:0","contract_address":"0x...","event_name":"Transfer","block_number":850001,"from":"0x9999...","to":"0x1111...","amount":"500000000000000000"}
+data: {"contract_address":"0x...","contract_name":"MyToken","event_name":"Transfer","block_number":850001,"from":"0x9999...","to":"0x1111...","value":"500000000000000000","status":"ACCEPTED_ON_L2"}
 ```
 
 Each event has:
@@ -651,7 +650,7 @@ curl http://localhost:8080/v1/admin/contracts \
 
 Update the configuration of an existing contract. Internally, this deregisters the old contract and re-registers it with the new configuration — either step can fail independently.
 
-**Request Body** (`application/json`): Same structure as the register endpoint. Only provided fields are updated.
+**Request Body** (`application/json`): Same structure as the register endpoint. All required fields (`name`, `address`) must be provided since the update performs a full deregister/re-register cycle — partial updates with only the changed fields are not supported.
 
 **Response** `200 OK`:
 
@@ -700,7 +699,12 @@ Update the configuration of an existing contract. Internally, this deregisters t
 curl -X PUT http://localhost:8080/v1/admin/contracts/NewToken \
   -H "Content-Type: application/json" \
   -H "X-Admin-Key: your-secret-key" \
-  -d '{"start_block": 860000}'
+  -d '{
+    "name": "NewToken",
+    "address": "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+    "events": [{"name": "Transfer", "table": {"type": "log"}}],
+    "start_block": 860000
+  }'
 ```
 
 ---
@@ -725,6 +729,14 @@ Deregister a contract and stop indexing it.
 }
 ```
 
+**Response** `500 Internal Server Error` — contract not registered:
+
+```json
+{
+  "error": "deregistration failed: contract \"NewToken\" not found"
+}
+```
+
 **Examples**:
 
 ```bash
@@ -745,7 +757,7 @@ curl -X DELETE "http://localhost:8080/v1/admin/contracts/NewToken?drop_tables=tr
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `limit` | `integer` | `50` | Number of results per page. Min: `1`, Max: `500` |
+| `limit` | `integer` | `50` | Number of results per page. Min: `1`, Max: `500`. Values above 500 are silently capped to 500 |
 | `offset` | `integer` | `0` | Number of results to skip |
 | `order` | `string` | `block_number.desc` | Sort order in `{field}.{direction}` format. Direction is `asc` or `desc` |
 
@@ -756,7 +768,7 @@ Filters use the format `?{field}={operator}.{value}`. When no operator prefix is
 | Operator | Description | Example |
 |----------|-------------|---------|
 | `eq` | Equal to | `?from=eq.0x1234` or `?from=0x1234` |
-| `neq` | Not equal to | `?status=neq.ACCEPTED_L1` |
+| `neq` | Not equal to | `?status=neq.ACCEPTED_ON_L1` |
 | `gt` | Greater than | `?block_number=gt.800000` |
 | `gte` | Greater than or equal | `?block_number=gte.800000` |
 | `lt` | Less than | `?amount=lt.1000000` |
@@ -787,17 +799,16 @@ Every indexed event contains these system fields alongside decoded event-specifi
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `event_id` | `string` | Unique ID in `{block_number}:{log_index}` format |
 | `contract_address` | `string` | Starknet address of the emitting contract |
+| `contract_name` | `string` | Contract name from config |
 | `event_name` | `string` | Name of the event (e.g., `Transfer`) |
 | `block_number` | `number` | Block number where the event was emitted |
-| `block_hash` | `string` | Hash of the block |
 | `transaction_hash` | `string` | Hash of the transaction |
 | `log_index` | `number` | Position of the event within the block |
 | `timestamp` | `number` | Block timestamp (Unix seconds) |
-| `status` | `string` | Block status: `PRE_CONFIRMED`, `ACCEPTED_L2`, or `ACCEPTED_L1` |
+| `status` | `string` | Block finality status: `ACCEPTED_ON_L2`, `ACCEPTED_ON_L1`, or `PRE_CONFIRMED` |
 
-Additionally, each event has its **decoded fields** as defined by the contract ABI. For example, a `Transfer` event would include `from`, `to`, and `amount` fields.
+Additionally, each event has its **decoded fields** as defined by the contract ABI. For example, an ERC-20 `Transfer` event would include `from`, `to`, and `value` fields.
 
 ---
 
