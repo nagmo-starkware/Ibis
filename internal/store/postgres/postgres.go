@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -22,8 +23,7 @@ type PostgresStore struct {
 
 // New creates a new PostgresStore from the given config.
 func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error) {
-	connStr := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Name)
+	connStr := buildConnString(cfg)
 
 	pool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
@@ -46,6 +46,24 @@ func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error)
 	}
 
 	return s, nil
+}
+
+// buildConnString produces a pgx-compatible connection string for the given
+// config. When the host is an absolute path (e.g. a Unix socket such as
+// Cloud SQL's /cloudsql/PROJECT:REGION:INSTANCE), URL-form is unsafe — the
+// leading slash and colons mangle the host/database split — so we emit the
+// keyword DSN form. Otherwise we emit the URL form with user/password
+// URL-encoded to tolerate special characters.
+func buildConnString(cfg config.PostgresConfig) string {
+	if strings.HasPrefix(cfg.Host, "/") {
+		return fmt.Sprintf(
+			"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+			cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Name,
+		)
+	}
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		url.QueryEscape(cfg.User), url.QueryEscape(cfg.Password),
+		cfg.Host, cfg.Port, cfg.Name)
 }
 
 // NewFromPool creates a PostgresStore from an existing connection pool (for testing).
