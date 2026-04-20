@@ -87,6 +87,9 @@ type ReorgNotification struct {
 type SubscriberConfig struct {
 	// BlocksPerQuery is the max block range per polling request. Default: 100.
 	BlocksPerQuery uint64
+
+	// ForcePolling skips WSS and uses HTTP polling directly.
+	ForcePolling bool
 }
 
 // EventSubscriber manages per-contract event subscriptions with automatic
@@ -98,6 +101,7 @@ type EventSubscriber struct {
 	reorgs         chan<- ReorgNotification
 	logger         *slog.Logger
 	blocksPerQuery uint64
+	forcePolling   bool
 
 	// dialWSS creates a WSS session. Override in tests.
 	dialWSS wssDialer
@@ -115,12 +119,18 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		blocksPerQuery = cfg.BlocksPerQuery
 	}
 
+	forcePolling := false
+	if cfg != nil && cfg.ForcePolling {
+		forcePolling = true
+	}
+
 	return &EventSubscriber{
 		provider:       p,
 		contracts:      contracts,
 		events:         events,
 		logger:         p.logger.With("component", "subscriber"),
 		blocksPerQuery: blocksPerQuery,
+		forcePolling:   forcePolling,
 		dialWSS:        defaultWSSDialer,
 		cancels:        make(map[string]context.CancelFunc),
 	}
@@ -208,6 +218,10 @@ func (s *EventSubscriber) RemoveContract(addressHex string) {
 func (s *EventSubscriber) subscribeContract(ctx context.Context, contract ContractSubscription) error {
 	logger := s.logger.With("contract", contract.Address)
 	lastBlock := contract.StartBlock
+
+	if s.forcePolling {
+		return s.pollEvents(ctx, contract, &lastBlock, logger)
+	}
 
 	err := s.subscribeWSS(ctx, contract, &lastBlock, logger)
 	if err != nil && ctx.Err() == nil {
@@ -317,6 +331,7 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 // processed and the error that ended the session.
 func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSession, lastBlock *uint64, logger *slog.Logger) (int, error) {
 	eventsProcessed := 0
+	lastLogBlock := *lastBlock
 	for {
 		select {
 		case <-ctx.Done():
@@ -374,6 +389,10 @@ func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSess
 				eventsProcessed++
 				if evt.BlockNumber > *lastBlock {
 					*lastBlock = evt.BlockNumber
+				}
+				if evt.BlockNumber >= lastLogBlock+1000 {
+					logger.Info("WSS sync progress", "block", evt.BlockNumber, "events_total", eventsProcessed)
+					lastLogBlock = evt.BlockNumber
 				}
 			case <-ctx.Done():
 				return eventsProcessed, ctx.Err()
@@ -445,7 +464,7 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 			}
 		}
 
-		logger.Debug("polled block range", "from", *lastBlock, "to", endBlock, "events", len(events))
+		logger.Debug("polled block range", "from", *lastBlock, "to", endBlock, "events", len(events), "chain_tip", latestBlock)
 
 		// Enrich events with block timestamps.
 		s.resolveTimestamps(ctx, events, logger)

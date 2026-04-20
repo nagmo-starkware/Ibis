@@ -7,6 +7,11 @@ import (
 	"github.com/b-j-roberts/ibis/internal/types"
 )
 
+// qid quotes a PostgreSQL identifier to safely handle reserved words (e.g. "from", "to").
+func qid(name string) string {
+	return `"` + name + `"`
+}
+
 // columnTypeToPostgres maps Go column type strings to PostgreSQL column types.
 func columnTypeToPostgres(colType string) string {
 	switch colType {
@@ -39,7 +44,7 @@ func GenerateCreateTableSQL(schema *types.TableSchema) string {
 		if !col.Nullable && (col.Name == "block_number" || col.Name == "log_index") {
 			nullable = " NOT NULL"
 		}
-		b.WriteString(fmt.Sprintf("    %s %s%s", col.Name, pgType, nullable))
+		b.WriteString(fmt.Sprintf("    \"%s\" %s%s", col.Name, pgType, nullable))
 		if i < len(schema.Columns)-1 {
 			b.WriteString(",")
 		}
@@ -49,34 +54,34 @@ func GenerateCreateTableSQL(schema *types.TableSchema) string {
 	b.WriteString(");\n")
 
 	// Standard index on block_number for all tables.
-	b.WriteString(fmt.Sprintf("\nCREATE INDEX IF NOT EXISTS idx_%s_block ON %s (block_number);\n",
-		schema.Name, schema.Name))
+	b.WriteString(fmt.Sprintf("\nCREATE INDEX IF NOT EXISTS idx_%s_block ON %s (%s);\n",
+		schema.Name, schema.Name, qid("block_number")))
 
 	// Composite index for event ordering.
-	b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_block_log ON %s (block_number, log_index);\n",
-		schema.Name, schema.Name))
+	b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_block_log ON %s (%s, %s);\n",
+		schema.Name, schema.Name, qid("block_number"), qid("log_index")))
 
 	// Unique index for unique tables.
 	if schema.TableType == types.TableTypeUnique && schema.UniqueKey != "" {
 		if schema.SharedTable {
 			// Composite unique constraint: (contract_address, unique_key).
-			b.WriteString(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_%s ON %s (contract_address, %s);\n",
-				schema.Name, schema.UniqueKey, schema.Name, schema.UniqueKey))
+			b.WriteString(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_%s ON %s (%s, %s);\n",
+				schema.Name, schema.UniqueKey, schema.Name, qid("contract_address"), qid(schema.UniqueKey)))
 		} else {
 			b.WriteString(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_%s ON %s (%s);\n",
-				schema.Name, schema.UniqueKey, schema.Name, schema.UniqueKey))
+				schema.Name, schema.UniqueKey, schema.Name, qid(schema.UniqueKey)))
 		}
 	}
 
 	// Index on contract_address for efficient per-child filtering in shared tables.
 	if schema.SharedTable {
-		b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_contract ON %s (contract_address);\n",
-			schema.Name, schema.Name))
+		b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_contract ON %s (%s);\n",
+			schema.Name, schema.Name, qid("contract_address")))
 	}
 
 	// Status index for filtering by confirmation status.
-	b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_status ON %s (status);\n",
-		schema.Name, schema.Name))
+	b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_status ON %s (%s);\n",
+		schema.Name, schema.Name, qid("status")))
 
 	return b.String()
 }
@@ -99,7 +104,7 @@ func GenerateAggregationTableSQL(schema *types.TableSchema) string {
 		if agg.Operation == "count" {
 			pgType = "BIGINT"
 		}
-		b.WriteString(fmt.Sprintf("    %s %s DEFAULT 0", agg.Column, pgType))
+		b.WriteString(fmt.Sprintf("    %s %s DEFAULT 0", qid(agg.Column), pgType))
 		if i < len(schema.Aggregates)-1 {
 			b.WriteString(",")
 		}

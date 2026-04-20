@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/b-j-roberts/ibis/internal/abi"
@@ -178,9 +179,17 @@ func BuildViewSchema(contractName string, funcDef *abi.FunctionDef, viewCfg *con
 	}
 
 	// Add output columns from function definition.
-	for _, output := range funcDef.Outputs {
+	for i, output := range funcDef.Outputs {
+		name := output.Name
+		if name == "" {
+			if len(funcDef.Outputs) == 1 {
+				name = funcDef.Name
+			} else {
+				name = fmt.Sprintf("output_%d", i)
+			}
+		}
 		columns = append(columns, types.Column{
-			Name: output.Name,
+			Name: name,
 			Type: CairoTypeToColumnType(output.Type),
 		})
 	}
