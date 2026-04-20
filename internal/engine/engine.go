@@ -113,6 +113,10 @@ type Engine struct {
 
 	// poller handles periodic view function polling (3.20).
 	poller *ViewPoller
+
+	// lastLoggedBlock tracks the last block number logged at INFO level
+	// to avoid spamming logs with per-event messages.
+	lastLoggedBlock uint64
 }
 
 // New creates an Engine with the given dependencies.
@@ -126,7 +130,7 @@ func New(cfg *config.Config, st store.Store, prov *provider.StarknetProvider, lo
 		provider:     prov,
 		logger:       logger.With("component", "engine"),
 		pending:      NewPendingTracker(),
-		events:       make(chan provider.RawEvent, 256),
+		events:       make(chan provider.RawEvent, 4096),
 		reorgs:       make(chan provider.ReorgNotification, 16),
 		logIndices:   make(map[uint64]uint64),
 		confirmDepth: DefaultConfirmationDepth,
@@ -453,6 +457,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	subs := e.buildSubscriptions(startBlocks)
 	subscriber := e.provider.NewSubscriber(subs, e.events, &provider.SubscriberConfig{
 		BlocksPerQuery: uint64(e.cfg.Indexer.BatchSize) * 10,
+		ForcePolling:   e.cfg.Indexer.Transport == "http",
 	})
 	subscriber.SetReorgChan(e.reorgs)
 

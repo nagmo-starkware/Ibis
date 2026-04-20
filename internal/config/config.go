@@ -50,6 +50,7 @@ type IndexerConfig struct {
 	StartBlock    *uint64         `yaml:"start_block"`
 	PendingBlocks bool            `yaml:"pending_blocks"`
 	BatchSize     int             `yaml:"batch_size"`
+	Transport     string          `yaml:"transport,omitempty"`
 	UDCAddress    string          `yaml:"udc_address,omitempty"`
 	UDCEvent      *UDCEventFormat `yaml:"udc_event,omitempty"`
 }

@@ -181,13 +181,13 @@ func (s *PostgresStore) insertRow(ctx context.Context, tx pgx.Tx, op store.Opera
 			if !ok {
 				continue
 			}
-			cols = append(cols, col.Name)
+			cols = append(cols, qid(col.Name))
 			vals = append(vals, convertValue(v, col.Type))
 			placeholders = append(placeholders, fmt.Sprintf("$%d", len(vals)))
 		}
 	} else {
 		for k, v := range op.Data {
-			cols = append(cols, k)
+			cols = append(cols, qid(k))
 			vals = append(vals, v)
 			placeholders = append(placeholders, fmt.Sprintf("$%d", len(vals)))
 		}
@@ -203,17 +203,17 @@ func (s *PostgresStore) insertRow(ctx context.Context, tx pgx.Tx, op store.Opera
 	// For unique tables, use ON CONFLICT to upsert.
 	if hasSchema && sch.TableType == types.TableTypeUnique && sch.UniqueKey != "" {
 		// Shared tables use composite unique key: (contract_address, unique_key).
-		conflictCols := sch.UniqueKey
+		conflictCols := qid(sch.UniqueKey)
 		if sch.SharedTable {
-			conflictCols = "contract_address, " + sch.UniqueKey
+			conflictCols = qid("contract_address") + ", " + qid(sch.UniqueKey)
 		}
 
 		setClauses := make([]string, 0, len(cols))
 		for _, col := range cols {
-			if col == sch.UniqueKey {
+			if col == qid(sch.UniqueKey) {
 				continue
 			}
-			if sch.SharedTable && col == "contract_address" {
+			if sch.SharedTable && col == qid("contract_address") {
 				continue
 			}
 			setClauses = append(setClauses, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
@@ -249,7 +249,7 @@ func (s *PostgresStore) updateRow(ctx context.Context, tx pgx.Tx, op store.Opera
 			if col.Name == "block_number" || col.Name == "log_index" {
 				continue
 			}
-			setClauses = append(setClauses, fmt.Sprintf("%s = $%d", col.Name, idx))
+			setClauses = append(setClauses, fmt.Sprintf("%s = $%d", qid(col.Name), idx))
 			vals = append(vals, convertValue(v, col.Type))
 			idx++
 		}
@@ -258,7 +258,7 @@ func (s *PostgresStore) updateRow(ctx context.Context, tx pgx.Tx, op store.Opera
 			if k == "block_number" || k == "log_index" {
 				continue
 			}
-			setClauses = append(setClauses, fmt.Sprintf("%s = $%d", k, idx))
+			setClauses = append(setClauses, fmt.Sprintf("%s = $%d", qid(k), idx))
 			vals = append(vals, v)
 			idx++
 		}
@@ -269,15 +269,15 @@ func (s *PostgresStore) updateRow(ctx context.Context, tx pgx.Tx, op store.Opera
 	}
 
 	vals = append(vals, op.BlockNumber, op.LogIndex)
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE block_number = $%d AND log_index = $%d",
-		op.Table, strings.Join(setClauses, ", "), idx, idx+1)
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = $%d AND %s = $%d",
+		op.Table, strings.Join(setClauses, ", "), qid("block_number"), idx, qid("log_index"), idx+1)
 
 	_, err := tx.Exec(ctx, query, vals...)
 	return err
 }
 
 func (s *PostgresStore) deleteRow(ctx context.Context, tx pgx.Tx, op store.Operation) error {
-	query := fmt.Sprintf("DELETE FROM %s WHERE block_number = $1 AND log_index = $2", op.Table)
+	query := fmt.Sprintf("DELETE FROM %s WHERE %s = $1 AND %s = $2", op.Table, qid("block_number"), qid("log_index"))
 	_, err := tx.Exec(ctx, query, op.BlockNumber, op.LogIndex)
 	return err
 }
@@ -343,7 +343,7 @@ func (s *PostgresStore) applyAggDeltas(ctx context.Context, tx pgx.Tx, table str
 	var vals []any
 	idx := 1
 	for col, delta := range colUpdates {
-		setClauses = append(setClauses, fmt.Sprintf("%s = %s + $%d", col, col, idx))
+		setClauses = append(setClauses, fmt.Sprintf("%s = %s + $%d", qid(col), qid(col), idx))
 		vals = append(vals, delta)
 		idx++
 	}
@@ -363,7 +363,7 @@ func (s *PostgresStore) applyAggDeltas(ctx context.Context, tx pgx.Tx, table str
 				cntCol := spec.Column + "__count"
 				avgQuery := fmt.Sprintf(
 					"UPDATE %s SET %s = CASE WHEN %s > 0 THEN %s / %s ELSE 0 END WHERE id = 1",
-					aggTable, spec.Column, cntCol, sumCol, cntCol,
+					aggTable, qid(spec.Column), qid(cntCol), qid(sumCol), qid(cntCol),
 				)
 				if _, err := tx.Exec(ctx, avgQuery); err != nil {
 					return fmt.Errorf("computing avg for %s: %w", spec.Column, err)
@@ -424,8 +424,10 @@ func (s *PostgresStore) GetAggregation(ctx context.Context, table string, _ stor
 
 	// Build column list from aggregate specs, excluding internal __sum/__count.
 	var cols []string
+	var rawCols []string
 	for _, agg := range sch.Aggregates {
-		cols = append(cols, agg.Column)
+		cols = append(cols, qid(agg.Column))
+		rawCols = append(rawCols, agg.Column)
 	}
 
 	if len(cols) == 0 {
@@ -448,7 +450,7 @@ func (s *PostgresStore) GetAggregation(ctx context.Context, table string, _ stor
 		return result, fmt.Errorf("scanning aggregation: %w", err)
 	}
 
-	for i, col := range cols {
+	for i, col := range rawCols {
 		result.Values[col] = toFloat64(scanDest[i])
 	}
 
@@ -528,7 +530,7 @@ func (s *PostgresStore) generateCreateTableDDL(sch *types.TableSchema) string {
 		if !col.Nullable && (col.Name == "block_number" || col.Name == "log_index") {
 			nullable = " NOT NULL"
 		}
-		b.WriteString(fmt.Sprintf("    %s %s%s", col.Name, pgType, nullable))
+		b.WriteString(fmt.Sprintf("    %s %s%s", qid(col.Name), pgType, nullable))
 		if i < len(sch.Columns)-1 {
 			b.WriteString(",")
 		}
@@ -544,29 +546,29 @@ func (s *PostgresStore) generateCreateTableDDL(sch *types.TableSchema) string {
 	}
 
 	if colSet["block_number"] {
-		b.WriteString(fmt.Sprintf("\nCREATE INDEX IF NOT EXISTS idx_%s_block ON %s (block_number);\n",
-			sch.Name, sch.Name))
+		b.WriteString(fmt.Sprintf("\nCREATE INDEX IF NOT EXISTS idx_%s_block ON %s (%s);\n",
+			sch.Name, sch.Name, qid("block_number")))
 	}
 	if colSet["block_number"] && colSet["log_index"] {
-		b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_block_log ON %s (block_number, log_index);\n",
-			sch.Name, sch.Name))
+		b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_block_log ON %s (%s, %s);\n",
+			sch.Name, sch.Name, qid("block_number"), qid("log_index")))
 	}
 	if sch.TableType == types.TableTypeUnique && sch.UniqueKey != "" && colSet[sch.UniqueKey] {
 		if sch.SharedTable {
-			b.WriteString(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_%s ON %s (contract_address, %s);\n",
-				sch.Name, sch.UniqueKey, sch.Name, sch.UniqueKey))
+			b.WriteString(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_%s ON %s (%s, %s);\n",
+				sch.Name, sch.UniqueKey, sch.Name, qid("contract_address"), qid(sch.UniqueKey)))
 		} else {
 			b.WriteString(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_%s ON %s (%s);\n",
-				sch.Name, sch.UniqueKey, sch.Name, sch.UniqueKey))
+				sch.Name, sch.UniqueKey, sch.Name, qid(sch.UniqueKey)))
 		}
 	}
 	if sch.SharedTable && colSet["contract_address"] {
-		b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_contract ON %s (contract_address);\n",
-			sch.Name, sch.Name))
+		b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_contract ON %s (%s);\n",
+			sch.Name, sch.Name, qid("contract_address")))
 	}
 	if colSet["status"] {
-		b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_status ON %s (status);\n",
-			sch.Name, sch.Name))
+		b.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_status ON %s (%s);\n",
+			sch.Name, sch.Name, qid("status")))
 	}
 
 	return b.String()
@@ -585,12 +587,12 @@ func (s *PostgresStore) generateAggTableDDL(sch *types.TableSchema) string {
 		if agg.Operation == "count" {
 			pgType = "BIGINT"
 		}
-		b.WriteString(fmt.Sprintf(",\n    %s %s DEFAULT 0", agg.Column, pgType))
+		b.WriteString(fmt.Sprintf(",\n    %s %s DEFAULT 0", qid(agg.Column), pgType))
 
 		// For avg, add internal tracking columns.
 		if agg.Operation == "avg" {
-			b.WriteString(fmt.Sprintf(",\n    %s__sum DOUBLE PRECISION DEFAULT 0", agg.Column))
-			b.WriteString(fmt.Sprintf(",\n    %s__count DOUBLE PRECISION DEFAULT 0", agg.Column))
+			b.WriteString(fmt.Sprintf(",\n    %s DOUBLE PRECISION DEFAULT 0", qid(agg.Column+"__sum")))
+			b.WriteString(fmt.Sprintf(",\n    %s DOUBLE PRECISION DEFAULT 0", qid(agg.Column+"__count")))
 		}
 	}
 
@@ -614,7 +616,7 @@ func (s *PostgresStore) MigrateTable(ctx context.Context, sch *types.TableSchema
 		if !existingCols[col.Name] {
 			pgType := columnTypeToPostgres(col.Type)
 			query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
-				sch.Name, col.Name, pgType)
+				sch.Name, qid(col.Name), pgType)
 			if _, err := s.pool.Exec(ctx, query); err != nil {
 				return fmt.Errorf("adding column %s to %s: %w", col.Name, sch.Name, err)
 			}
@@ -712,7 +714,7 @@ func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query str
 	if hasSchema {
 		colNames := make([]string, len(sch.Columns))
 		for i, col := range sch.Columns {
-			colNames[i] = col.Name
+			colNames[i] = qid(col.Name)
 		}
 		cols = strings.Join(colNames, ", ")
 	} else {
@@ -723,16 +725,16 @@ func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query str
 
 	where := s.buildWhereClause(q.Filters, &args, &argIdx)
 
-	orderBy := "block_number"
+	orderBy := qid("block_number")
 	if q.OrderBy != "" {
-		orderBy = q.OrderBy
+		orderBy = qid(q.OrderBy)
 	}
 	dir := "ASC"
 	if q.OrderDir == store.OrderDesc {
 		dir = "DESC"
 	}
 	// Secondary sort by log_index for stable ordering.
-	orderClause := fmt.Sprintf("%s %s, log_index %s", orderBy, dir, dir)
+	orderClause := fmt.Sprintf("%s %s, %s %s", orderBy, dir, qid("log_index"), dir)
 
 	limit := q.Limit
 	if limit <= 0 {
@@ -753,7 +755,7 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 	if hasSchema {
 		colNames := make([]string, len(sch.Columns))
 		for i, col := range sch.Columns {
-			colNames[i] = col.Name
+			colNames[i] = qid(col.Name)
 		}
 		cols = strings.Join(colNames, ", ")
 	} else {
@@ -764,9 +766,9 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 
 	where := s.buildWhereClause(q.Filters, &args, &argIdx)
 
-	orderBy := "block_number"
+	orderBy := qid("block_number")
 	if q.OrderBy != "" {
-		orderBy = q.OrderBy
+		orderBy = qid(q.OrderBy)
 	}
 	dir := "ASC"
 	if q.OrderDir == store.OrderDesc {
@@ -779,9 +781,9 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 	}
 
 	// For shared tables, use composite DISTINCT ON so each contract keeps its own row.
-	distinctCols := uniqueKey
+	distinctCols := qid(uniqueKey)
 	if hasSchema && sch.SharedTable {
-		distinctCols = "contract_address, " + uniqueKey
+		distinctCols = qid("contract_address") + ", " + qid(uniqueKey)
 	}
 
 	// Use DISTINCT ON to get latest per unique key, then wrap for ordering/pagination.
@@ -789,11 +791,11 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 		`SELECT %s FROM (
 			SELECT DISTINCT ON (%s) %s
 			FROM %s%s
-			ORDER BY %s, block_number DESC, log_index DESC
-		) sub ORDER BY %s %s, log_index %s LIMIT $%d OFFSET $%d`,
+			ORDER BY %s, %s DESC, %s DESC
+		) sub ORDER BY %s %s, %s %s LIMIT $%d OFFSET $%d`,
 		cols, distinctCols, cols, table, where,
-		distinctCols,
-		orderBy, dir, dir, argIdx, argIdx+1)
+		distinctCols, qid("block_number"), qid("log_index"),
+		orderBy, dir, qid("log_index"), dir, argIdx, argIdx+1)
 	args = append(args, limit, q.Offset)
 
 	return query, args
@@ -807,7 +809,7 @@ func (s *PostgresStore) buildWhereClause(filters []store.Filter, args *[]any, ar
 	var conditions []string
 	for _, f := range filters {
 		op := filterOpToSQL(f.Operator)
-		conditions = append(conditions, fmt.Sprintf("%s %s $%d", f.Field, op, *argIdx))
+		conditions = append(conditions, fmt.Sprintf("%s %s $%d", qid(f.Field), op, *argIdx))
 		*args = append(*args, fmt.Sprint(f.Value))
 		(*argIdx)++
 	}
@@ -865,6 +867,11 @@ func (s *PostgresStore) scanEvents(rows pgx.Rows, table string) ([]types.Indexed
 }
 
 // ---- Helpers ----
+
+// qid quotes a PostgreSQL identifier to safely handle reserved words (e.g. "from", "to").
+func qid(name string) string {
+	return `"` + name + `"`
+}
 
 func columnType(sch *types.TableSchema, colName string) string {
 	for _, col := range sch.Columns {

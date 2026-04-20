@@ -95,12 +95,22 @@ func (e *Engine) processEvent(ctx context.Context, raw *provider.RawEvent) error
 		e.onEvent(cs.config.Name, eventDef.Name, schema.Name, raw.BlockNumber, logIndex, decoded)
 	}
 
-	e.logger.Debug("indexed event",
-		"event", eventDef.Name,
-		"contract", cs.config.Name,
-		"block", raw.BlockNumber,
-		"log_index", logIndex,
-	)
+	// Log block progress at INFO level when we advance to a new block.
+	if raw.BlockNumber > e.lastLoggedBlock {
+		e.logger.Info("indexed block",
+			"block", raw.BlockNumber,
+			"contract", cs.config.Name,
+			"event", eventDef.Name,
+		)
+		e.lastLoggedBlock = raw.BlockNumber
+	} else {
+		e.logger.Debug("indexed event",
+			"event", eventDef.Name,
+			"contract", cs.config.Name,
+			"block", raw.BlockNumber,
+			"log_index", logIndex,
+		)
+	}
 
 	// Check if this is a factory creation event that spawns a child contract.
 	if cs.config.Factory != nil && eventDef.Name == cs.config.Factory.Event {
