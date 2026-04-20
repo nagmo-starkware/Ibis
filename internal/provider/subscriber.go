@@ -90,18 +90,26 @@ type SubscriberConfig struct {
 
 	// ForcePolling skips WSS and uses HTTP polling directly.
 	ForcePolling bool
+
+	// CatchupWithPolling enables a hybrid mode: each contract first polls
+	// historical blocks from StartBlock until within catchupThreshold blocks
+	// of chain tip, then switches to WSS for real-time streaming. Useful when
+	// the WSS provider accepts a block_id but does not replay older events
+	// (observed on Alchemy Starknet Sepolia).
+	CatchupWithPolling bool
 }
 
 // EventSubscriber manages per-contract event subscriptions with automatic
 // WSS reconnection and HTTP polling fallback.
 type EventSubscriber struct {
-	provider       *StarknetProvider
-	contracts      []ContractSubscription
-	events         chan<- RawEvent
-	reorgs         chan<- ReorgNotification
-	logger         *slog.Logger
-	blocksPerQuery uint64
-	forcePolling   bool
+	provider           *StarknetProvider
+	contracts          []ContractSubscription
+	events             chan<- RawEvent
+	reorgs             chan<- ReorgNotification
+	logger             *slog.Logger
+	blocksPerQuery     uint64
+	forcePolling       bool
+	catchupWithPolling bool
 
 	// dialWSS creates a WSS session. Override in tests.
 	dialWSS wssDialer
@@ -120,19 +128,22 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 	}
 
 	forcePolling := false
-	if cfg != nil && cfg.ForcePolling {
-		forcePolling = true
+	catchupWithPolling := false
+	if cfg != nil {
+		forcePolling = cfg.ForcePolling
+		catchupWithPolling = cfg.CatchupWithPolling
 	}
 
 	return &EventSubscriber{
-		provider:       p,
-		contracts:      contracts,
-		events:         events,
-		logger:         p.logger.With("component", "subscriber"),
-		blocksPerQuery: blocksPerQuery,
-		forcePolling:   forcePolling,
-		dialWSS:        defaultWSSDialer,
-		cancels:        make(map[string]context.CancelFunc),
+		provider:           p,
+		contracts:          contracts,
+		events:             events,
+		logger:             p.logger.With("component", "subscriber"),
+		blocksPerQuery:     blocksPerQuery,
+		forcePolling:       forcePolling,
+		catchupWithPolling: catchupWithPolling,
+		dialWSS:            defaultWSSDialer,
+		cancels:            make(map[string]context.CancelFunc),
 	}
 }
 
@@ -223,6 +234,13 @@ func (s *EventSubscriber) subscribeContract(ctx context.Context, contract Contra
 		return s.pollEvents(ctx, contract, &lastBlock, logger)
 	}
 
+	if s.catchupWithPolling {
+		if err := s.pollUntilCaughtUp(ctx, contract, &lastBlock, logger); err != nil {
+			return err
+		}
+		logger.Info("catchup complete, switching to WSS", "last_block", lastBlock)
+	}
+
 	err := s.subscribeWSS(ctx, contract, &lastBlock, logger)
 	if err != nil && ctx.Err() == nil {
 		logger.Warn("WSS subscription failed, falling back to polling", "error", err)
@@ -230,6 +248,85 @@ func (s *EventSubscriber) subscribeContract(ctx context.Context, contract Contra
 	}
 
 	return err
+}
+
+// pollUntilCaughtUp polls events from *lastBlock forward using starknet_getEvents
+// and returns once *lastBlock is within catchupThreshold of the chain tip.
+// On return, *lastBlock points at the next unprocessed block so the caller can
+// hand off to subscribeWSS without gaps. Used by the "catchup" transport mode
+// to backfill history when the WSS provider does not replay old events.
+func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract ContractSubscription, lastBlock *uint64, logger *slog.Logger) error {
+	logger.Info("starting catchup poll", "from_block", *lastBlock)
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
+		latestBlock, err := s.provider.BlockNumber(rpcCtx)
+		cancel()
+		if err != nil {
+			logger.Warn("failed to get block number during catchup", "error", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(tipPollInterval):
+				continue
+			}
+		}
+
+		// Close enough to tip — hand off to WSS.
+		if latestBlock < catchupThreshold || *lastBlock+catchupThreshold >= latestBlock {
+			return nil
+		}
+
+		endBlock := *lastBlock + s.blocksPerQuery
+		if endBlock > latestBlock {
+			endBlock = latestBlock
+		}
+
+		rpcCtx, cancel = context.WithTimeout(ctx, rpcCallTimeout)
+		events, err := s.provider.GetEvents(rpcCtx, GetEventsOptions{
+			FromBlock: *lastBlock,
+			ToBlock:   endBlock,
+			Address:   contract.Address,
+			Keys:      contract.Keys,
+			ChunkSize: 1000,
+		})
+		cancel()
+		if err != nil {
+			logger.Warn("failed to get events during catchup",
+				"error", err, "from", *lastBlock, "to", endBlock)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(tipPollInterval):
+				continue
+			}
+		}
+
+		logger.Debug("catchup range polled",
+			"from", *lastBlock, "to", endBlock, "events", len(events), "chain_tip", latestBlock)
+
+		s.resolveTimestamps(ctx, events, logger)
+
+		for _, evt := range events {
+			select {
+			case s.events <- evt:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		*lastBlock = endBlock + 1
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(catchupPollInterval):
+		}
+	}
 }
 
 // subscribeWSS manages a WSS subscription with automatic reconnection using

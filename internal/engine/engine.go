@@ -456,8 +456,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Step 3: Build subscriptions and start the subscriber.
 	subs := e.buildSubscriptions(startBlocks)
 	subscriber := e.provider.NewSubscriber(subs, e.events, &provider.SubscriberConfig{
-		BlocksPerQuery: uint64(e.cfg.Indexer.BatchSize) * 10,
-		ForcePolling:   e.cfg.Indexer.Transport == "http",
+		BlocksPerQuery:     uint64(e.cfg.Indexer.BatchSize) * 10,
+		ForcePolling:       e.cfg.Indexer.Transport == "http",
+		CatchupWithPolling: e.cfg.Indexer.Transport == "catchup",
 	})
 	subscriber.SetReorgChan(e.reorgs)
 
