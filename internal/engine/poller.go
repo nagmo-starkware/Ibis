@@ -291,7 +291,7 @@ func (vp *ViewPoller) poll(ctx context.Context, entry *viewEntry) {
 	}
 
 	// Decode results using ABI.
-	decoded, err := abi.DecodeFunctionOutputs(entry.functionDef.Outputs, result)
+	decoded, err := abi.DecodeFunctionOutputs(entry.functionDef.Name, entry.functionDef.Outputs, result)
 	if err != nil {
 		vp.handlePollError(entry, fmt.Errorf("decoding %s output: %w", entry.functionDef.Name, err))
 		return

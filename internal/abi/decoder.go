@@ -41,15 +41,29 @@ func DecodeEvent(ev *EventDef, keys, data []*felt.Felt) (map[string]any, error) 
 
 // DecodeFunctionOutputs decodes the flat []*felt.Felt return value of a
 // starknet_call into a typed map using the function's output member definitions.
-func DecodeFunctionOutputs(outputs []FieldDef, felts []*felt.Felt) (map[string]any, error) {
+// funcName is used as a fallback column name when the output members are
+// unnamed in the ABI (common in Cairo, where `fn foo() -> u256` emits
+// outputs: [{type: u256}] with no name field). When unnamed and there are
+// multiple outputs we fall back to output_0, output_1, ... — matching the
+// naming scheme used by schema.BuildViewSchema so decoded values land in the
+// expected table columns.
+func DecodeFunctionOutputs(funcName string, outputs []FieldDef, felts []*felt.Felt) (map[string]any, error) {
 	result := make(map[string]any, len(outputs))
 	offset := 0
-	for _, member := range outputs {
+	for i, member := range outputs {
 		val, consumed, err := decodeType(member.Type, felts, offset)
 		if err != nil {
 			return nil, fmt.Errorf("decoding output member %q: %w", member.Name, err)
 		}
-		result[member.Name] = val
+		name := member.Name
+		if name == "" {
+			if len(outputs) == 1 {
+				name = funcName
+			} else {
+				name = fmt.Sprintf("output_%d", i)
+			}
+		}
+		result[name] = val
 		offset += consumed
 	}
 	return result, nil

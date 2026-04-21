@@ -970,7 +970,7 @@ func TestDecodeFunctionOutputs_SingleFelt(t *testing.T) {
 	}
 	felts := []*felt.Felt{feltFromHex("0xdeadbeef")}
 
-	result, err := DecodeFunctionOutputs(outputs, felts)
+	result, err := DecodeFunctionOutputs("fn", outputs, felts)
 	if err != nil {
 		t.Fatalf("DecodeFunctionOutputs failed: %v", err)
 	}
@@ -985,7 +985,7 @@ func TestDecodeFunctionOutputs_U256(t *testing.T) {
 	}
 	felts := []*felt.Felt{feltFromUint64(1000), feltFromUint64(0)}
 
-	result, err := DecodeFunctionOutputs(outputs, felts)
+	result, err := DecodeFunctionOutputs("fn", outputs, felts)
 	if err != nil {
 		t.Fatalf("DecodeFunctionOutputs failed: %v", err)
 	}
@@ -1001,7 +1001,7 @@ func TestDecodeFunctionOutputs_Multiple(t *testing.T) {
 	}
 	felts := []*felt.Felt{feltFromUint64(42000), feltFromUint64(0), feltFromUint64(1710072000)}
 
-	result, err := DecodeFunctionOutputs(outputs, felts)
+	result, err := DecodeFunctionOutputs("fn", outputs, felts)
 	if err != nil {
 		t.Fatalf("DecodeFunctionOutputs failed: %v", err)
 	}
@@ -1029,7 +1029,7 @@ func TestDecodeFunctionOutputs_InsufficientFelts(t *testing.T) {
 	}
 	felts := []*felt.Felt{feltFromUint64(100)} // Need 2 felts for u256
 
-	_, err := DecodeFunctionOutputs(outputs, felts)
+	_, err := DecodeFunctionOutputs("fn", outputs, felts)
 	if err == nil {
 		t.Fatal("expected error for insufficient felts")
 	}
@@ -1229,7 +1229,7 @@ func TestDecodeFunctionOutputs_ArrayOfTupleMultipleElements(t *testing.T) {
 		feltFromUint64(0),   // pos[1].second high
 	}
 
-	result, err := DecodeFunctionOutputs(outputs, felts)
+	result, err := DecodeFunctionOutputs("fn", outputs, felts)
 	if err != nil {
 		t.Fatalf("DecodeFunctionOutputs failed: %v", err)
 	}
