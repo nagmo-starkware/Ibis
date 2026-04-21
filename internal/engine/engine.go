@@ -609,8 +609,13 @@ func (e *Engine) setup(ctx context.Context) error {
 	for _, vs := range viewSchemas {
 		// Add view schemas to the contract's schema map so they're
 		// included in Schemas() and accessible by the API server.
+		// For shared-table contracts, the view schema's Contract field
+		// carries the factory/ABI name (e.g. "OrderBook") rather than
+		// the instance name, so fall back to a FactoryName match so the
+		// schema still gets attached and surfaces in the API.
 		for _, cs := range e.contracts {
-			if cs.config.Name == vs.Contract {
+			if cs.config.Name == vs.Contract ||
+				(cs.config.SharedTables && cs.config.FactoryName == vs.Contract) {
 				cs.schemas[vs.Event] = vs
 				break
 			}
