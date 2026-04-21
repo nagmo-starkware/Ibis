@@ -751,8 +751,12 @@ func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query str
 	if q.OrderDir == store.OrderDesc {
 		dir = "DESC"
 	}
-	// Secondary sort by log_index for stable ordering.
-	orderClause := fmt.Sprintf("%s %s, %s %s", orderBy, dir, qid("log_index"), dir)
+	// Secondary sort by log_index for stable ordering when available. View
+	// tables don't have a log_index column; skip the secondary sort there.
+	orderClause := fmt.Sprintf("%s %s", orderBy, dir)
+	if hasLogIndexColumn(s.schemas, table) {
+		orderClause = fmt.Sprintf("%s %s, %s %s", orderBy, dir, qid("log_index"), dir)
+	}
 
 	limit := q.Limit
 	if limit <= 0 {
@@ -764,6 +768,23 @@ func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query str
 	args = append(args, limit, q.Offset)
 
 	return query, args
+}
+
+// hasLogIndexColumn reports whether the table's schema includes a log_index
+// column. Event tables do; view-result tables don't. When no schema is
+// registered we conservatively assume log_index is present so the existing
+// behaviour is preserved.
+func hasLogIndexColumn(schemas map[string]types.TableSchema, table string) bool {
+	sch, ok := schemas[table]
+	if !ok {
+		return true
+	}
+	for _, col := range sch.Columns {
+		if col.Name == "log_index" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.Query) (query string, args []any) {
@@ -804,16 +825,28 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 		distinctCols = qid("contract_address") + ", " + qid(uniqueKey)
 	}
 
+	// For event tables we need log_index to deterministically pick the latest
+	// row per unique_key. For view-result tables (no log_index column) ordering
+	// by block_number alone is sufficient — each poll produces one row per
+	// unique_key per block, so the highest block_number is unambiguously the
+	// newest.
+	innerTieBreak := fmt.Sprintf("%s DESC", qid("block_number"))
+	outerTieBreak := ""
+	if hasLogIndexColumn(s.schemas, table) {
+		innerTieBreak = fmt.Sprintf("%s DESC, %s DESC", qid("block_number"), qid("log_index"))
+		outerTieBreak = fmt.Sprintf(", %s %s", qid("log_index"), dir)
+	}
+
 	// Use DISTINCT ON to get latest per unique key, then wrap for ordering/pagination.
 	query = fmt.Sprintf(
 		`SELECT %s FROM (
 			SELECT DISTINCT ON (%s) %s
 			FROM %s%s
-			ORDER BY %s, %s DESC, %s DESC
-		) sub ORDER BY %s %s, %s %s LIMIT $%d OFFSET $%d`,
+			ORDER BY %s, %s
+		) sub ORDER BY %s %s%s LIMIT $%d OFFSET $%d`,
 		cols, distinctCols, cols, table, where,
-		distinctCols, qid("block_number"), qid("log_index"),
-		orderBy, dir, qid("log_index"), dir, argIdx, argIdx+1)
+		distinctCols, innerTieBreak,
+		orderBy, dir, outerTieBreak, argIdx, argIdx+1)
 	args = append(args, limit, q.Offset)
 
 	return query, args
