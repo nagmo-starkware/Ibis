@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -957,6 +958,31 @@ func populateFromData(evt *types.IndexedEvent) {
 	}
 }
 
+// stringifyForTextColumn coerces a decoded Cairo value into a TEXT column.
+// Atomic values (already a Go string, bigint, number, bool, etc.) go through
+// fmt.Sprint — matching the original behaviour. Compound values (Cairo arrays,
+// tuples, structs, enums) are produced by the ABI decoder as []any /
+// map[string]any / nested combinations; fmt.Sprint renders those with Go's
+// "[map[k:v]]" default form which is not a parseable format for API consumers.
+// The schema generator deliberately labels those columns "JSON-encoded" — honour
+// that contract by encoding them as JSON here.
+func stringifyForTextColumn(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array, reflect.Map, reflect.Struct:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	}
+	return fmt.Sprint(v)
+}
+
 func convertValue(v any, colType string) any {
 	switch colType {
 	case "uint64", "int64":
@@ -969,7 +995,7 @@ func convertValue(v any, colType string) any {
 			return fmt.Sprint(v) == "true"
 		}
 	case "string":
-		return fmt.Sprint(v)
+		return stringifyForTextColumn(v)
 	case "[]byte":
 		switch b := v.(type) {
 		case []byte:
