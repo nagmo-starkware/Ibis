@@ -1049,6 +1049,312 @@ func TestFactoryChildConfig_JSONRoundTrip(t *testing.T) {
 	}
 }
 
+// --- child_views Tests ---
+
+// TestValidate_FactoryConfig_ChildViews checks validation rules for the child_views field.
+func TestValidate_FactoryConfig_ChildViews(t *testing.T) {
+	baseCfg := config.Config{
+		Network:  "mainnet",
+		RPC:      "wss://example.com",
+		Database: config.DatabaseConfig{Backend: "memory"},
+	}
+	makeContract := func(f *config.FactoryConfig) config.ContractConfig {
+		return config.ContractConfig{
+			Name:    "Factory",
+			Address: "0x123",
+			ABI:     "fetch",
+			Events:  []config.EventConfig{{Name: "*", Table: config.TableConfig{Type: "log"}}},
+			Factory: f,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		factory *config.FactoryConfig
+		wantErr bool
+	}{
+		{
+			name: "child_views alone is valid (no child_events required)",
+			factory: &config.FactoryConfig{
+				Event:             "DeploymentCreated",
+				ChildAddressField: "option_token",
+				ChildViews: []config.ViewConfig{
+					{Function: "get_strike", Interval: "5m", Table: config.TableConfig{Type: "unique", UniqueKey: "_view_key"}},
+				},
+			},
+		},
+		{
+			name: "child_events and child_views together is valid",
+			factory: &config.FactoryConfig{
+				Event:             "DeploymentCreated",
+				ChildAddressField: "option_token",
+				ChildEvents: []config.EventConfig{
+					{Name: "*", Table: config.TableConfig{Type: "log"}},
+				},
+				ChildViews: []config.ViewConfig{
+					{Function: "get_strike", Interval: "5m", Table: config.TableConfig{Type: "unique", UniqueKey: "_view_key"}},
+				},
+			},
+		},
+		{
+			name: "neither child_events nor child_views fails",
+			factory: &config.FactoryConfig{
+				Event:             "DeploymentCreated",
+				ChildAddressField: "option_token",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid child_views interval fails",
+			factory: &config.FactoryConfig{
+				Event:             "DeploymentCreated",
+				ChildAddressField: "option_token",
+				ChildViews: []config.ViewConfig{
+					{Function: "get_strike", Interval: "bad", Table: config.TableConfig{Type: "unique", UniqueKey: "_view_key"}},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "child_views unique table missing unique_key fails",
+			factory: &config.FactoryConfig{
+				Event:             "DeploymentCreated",
+				ChildAddressField: "option_token",
+				ChildViews: []config.ViewConfig{
+					{Function: "get_strike", Interval: "5m", Table: config.TableConfig{Type: "unique"}},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseCfg
+			cfg.Contracts = []config.ContractConfig{makeContract(tt.factory)}
+			err := config.Validate(&cfg)
+			if tt.wantErr && err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
+// TestHandleFactoryEvent_ChildViewsPropagated verifies that child_views from the factory
+// config are copied into the registered child's ContractConfig.Views field.
+func TestHandleFactoryEvent_ChildViewsPropagated(t *testing.T) {
+	st := memory.New()
+	ctx := context.Background()
+
+	factoryAddr := new(felt.Felt).SetUint64(0xF001)
+
+	childViews := []config.ViewConfig{
+		{Function: "get_strike", Interval: "5m", Table: config.TableConfig{Type: "unique", UniqueKey: "_view_key"}},
+		{Function: "get_expiry", Interval: "5m", Table: config.TableConfig{Type: "unique", UniqueKey: "_view_key"}},
+		{Function: "get_underlying_reserve", Interval: "30s", Table: config.TableConfig{Type: "log"}},
+	}
+
+	// Build a factory state with child_views (no child_events required).
+	pairCreated := testFactoryEventDef()
+	parsedABI := &abi.ABI{
+		Types:  make(map[string]*abi.TypeDef),
+		Events: []*abi.EventDef{pairCreated},
+	}
+	registry := abi.NewEventRegistry(parsedABI)
+	factoryCS := &contractState{
+		config: config.ContractConfig{
+			Name:    "OptionManager",
+			Address: factoryAddr.String(),
+			Events:  []config.EventConfig{{Name: "PairCreated", Table: config.TableConfig{Type: "log"}}},
+			Factory: &config.FactoryConfig{
+				Event:             "PairCreated",
+				ChildAddressField: "pair",
+				ChildABI:          "fetch",
+				ChildViews:        childViews,
+			},
+		},
+		address:  factoryAddr,
+		abi:      parsedABI,
+		registry: registry,
+		schemas: map[string]*types.TableSchema{
+			"PairCreated": {
+				Name:      "OptionManager_PairCreated",
+				Contract:  "OptionManager",
+				Event:     "PairCreated",
+				TableType: types.TableTypeLog,
+				Columns: []types.Column{
+					{Name: "block_number", Type: "uint64"},
+					{Name: "transaction_hash", Type: "string"},
+					{Name: "log_index", Type: "uint64"},
+					{Name: "timestamp", Type: "uint64"},
+					{Name: "contract_address", Type: "string"},
+					{Name: "event_name", Type: "string"},
+					{Name: "status", Type: "string"},
+					{Name: "token0", Type: "string"},
+					{Name: "token1", Type: "string"},
+					{Name: "pair", Type: "string"},
+				},
+			},
+		},
+		childABI: testChildABI(),
+	}
+
+	if err := st.CreateTable(ctx, factoryCS.schemas["PairCreated"]); err != nil {
+		t.Fatal(err)
+	}
+
+	e := newFactoryTestEngine(st, factoryCS)
+
+	token0 := new(felt.Felt).SetUint64(0xAAA)
+	token1 := new(felt.Felt).SetUint64(0xBBB)
+	childAddr := new(felt.Felt).SetUint64(0xC0DE)
+	raw := makeFactoryEvent(factoryAddr, 200, token0, token1, childAddr)
+
+	if err := e.processEvent(ctx, &raw); err != nil {
+		t.Fatalf("processEvent failed: %v", err)
+	}
+
+	// Find the registered child and assert its Views match child_views.
+	childName := buildChildName("OptionManager", factoryCS.config.Factory, map[string]any{
+		"token0": token0.String(),
+		"token1": token1.String(),
+		"pair":   childAddr.String(),
+	}, childAddr.String())
+
+	e.mu.RLock()
+	var found *contractState
+	for _, cs := range e.contracts {
+		if cs.config.Name == childName {
+			found = cs
+			break
+		}
+	}
+	e.mu.RUnlock()
+
+	if found == nil {
+		t.Fatalf("child %s not registered", childName)
+	}
+	if len(found.config.Views) != len(childViews) {
+		t.Fatalf("expected %d child views, got %d", len(childViews), len(found.config.Views))
+	}
+	for i, v := range childViews {
+		if found.config.Views[i].Function != v.Function {
+			t.Errorf("views[%d].Function: expected %s, got %s", i, v.Function, found.config.Views[i].Function)
+		}
+		if found.config.Views[i].Interval != v.Interval {
+			t.Errorf("views[%d].Interval: expected %s, got %s", i, v.Interval, found.config.Views[i].Interval)
+		}
+	}
+}
+
+// TestHandleFactoryEvent_SharedTables_WithChildViews verifies that child_views +
+// shared_tables: true also propagates views into the registered child config.
+func TestHandleFactoryEvent_SharedTables_WithChildViews(t *testing.T) {
+	st := memory.New()
+	ctx := context.Background()
+
+	factoryAddr := new(felt.Felt).SetUint64(0xF002)
+
+	childViews := []config.ViewConfig{
+		{Function: "get_strike", Interval: "5m", Table: config.TableConfig{Type: "unique", UniqueKey: "_view_key"}},
+	}
+
+	pairCreated := testFactoryEventDef()
+	parsedABI := &abi.ABI{
+		Types:  make(map[string]*abi.TypeDef),
+		Events: []*abi.EventDef{pairCreated},
+	}
+	registry := abi.NewEventRegistry(parsedABI)
+	factoryCS := &contractState{
+		config: config.ContractConfig{
+			Name:    "SharedFactory",
+			Address: factoryAddr.String(),
+			Events:  []config.EventConfig{{Name: "PairCreated", Table: config.TableConfig{Type: "log"}}},
+			Factory: &config.FactoryConfig{
+				Event:             "PairCreated",
+				ChildAddressField: "pair",
+				ChildABI:          "fetch",
+				SharedTables:      true,
+				ChildEvents: []config.EventConfig{
+					{Name: "*", Table: config.TableConfig{Type: "log"}},
+				},
+				ChildViews: childViews,
+			},
+		},
+		address:  factoryAddr,
+		abi:      parsedABI,
+		registry: registry,
+		schemas: map[string]*types.TableSchema{
+			"PairCreated": {
+				Name:      "SharedFactory_PairCreated",
+				Contract:  "SharedFactory",
+				Event:     "PairCreated",
+				TableType: types.TableTypeLog,
+				Columns: []types.Column{
+					{Name: "block_number", Type: "uint64"},
+					{Name: "transaction_hash", Type: "string"},
+					{Name: "log_index", Type: "uint64"},
+					{Name: "timestamp", Type: "uint64"},
+					{Name: "contract_address", Type: "string"},
+					{Name: "event_name", Type: "string"},
+					{Name: "status", Type: "string"},
+					{Name: "token0", Type: "string"},
+					{Name: "token1", Type: "string"},
+					{Name: "pair", Type: "string"},
+				},
+			},
+		},
+		childABI: testChildABI(),
+	}
+
+	if err := st.CreateTable(ctx, factoryCS.schemas["PairCreated"]); err != nil {
+		t.Fatal(err)
+	}
+
+	e := newFactoryTestEngine(st, factoryCS)
+
+	token0 := new(felt.Felt).SetUint64(0xA11)
+	token1 := new(felt.Felt).SetUint64(0xB11)
+	childAddr := new(felt.Felt).SetUint64(0xC11)
+	raw := makeFactoryEvent(factoryAddr, 300, token0, token1, childAddr)
+
+	if err := e.processEvent(ctx, &raw); err != nil {
+		t.Fatalf("processEvent failed: %v", err)
+	}
+
+	childName := buildChildName("SharedFactory", factoryCS.config.Factory, map[string]any{
+		"token0": token0.String(),
+		"token1": token1.String(),
+		"pair":   childAddr.String(),
+	}, childAddr.String())
+
+	e.mu.RLock()
+	var found *contractState
+	for _, cs := range e.contracts {
+		if cs.config.Name == childName {
+			found = cs
+			break
+		}
+	}
+	e.mu.RUnlock()
+
+	if found == nil {
+		t.Fatalf("shared child %s not registered", childName)
+	}
+	if !found.config.SharedTables {
+		t.Fatal("expected SharedTables=true on registered child")
+	}
+	if len(found.config.Views) != 1 {
+		t.Fatalf("expected 1 child view, got %d", len(found.config.Views))
+	}
+	if found.config.Views[0].Function != "get_strike" {
+		t.Fatalf("expected get_strike view, got %s", found.config.Views[0].Function)
+	}
+}
+
 // TestFactoryChildConfig_YAMLOmitsRuntimeFields verifies that FactoryName and
 // FactoryMeta are NOT written to YAML (yaml:"-" tag), since they're runtime-only
 // fields set by the engine, not user config.

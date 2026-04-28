@@ -68,6 +68,7 @@ func (e *Engine) handleFactoryEvent(ctx context.Context, cs *contractState, deco
 		Address:      childAddr,
 		ABI:          childABI,
 		Events:       factory.ChildEvents,
+		Views:        factory.ChildViews,
 		StartBlock:   config.Uint64Ptr(raw.BlockNumber),
 		FactoryName:  cs.config.Name,
 		FactoryMeta:  meta,
@@ -212,6 +213,17 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 		}
 
 		e.subscriber.AddContract(e.runCtx, sub)
+	}
+
+	// Start view polling for this shared child if it has views configured.
+	if e.runCtx != nil {
+		viewSchemas, err := e.startViewsForContract(e.runCtx, cs)
+		if err != nil {
+			e.logger.Error("failed to start views for shared factory child",
+				"contract", cc.Name, "error", err)
+		} else {
+			schemaList = append(schemaList, viewSchemas...)
+		}
 	}
 
 	// Notify API server (schemas only for first child when tables were created).

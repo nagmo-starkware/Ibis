@@ -183,10 +183,13 @@ func validateFactory(f *FactoryConfig, prefix string) error {
 	if f.ChildAddressField == "" {
 		return fieldError(fPrefix+".child_address_field", "required")
 	}
-	if len(f.ChildEvents) == 0 {
-		return fieldError(fPrefix+".child_events", "at least one child event is required")
+	if len(f.ChildEvents) == 0 && len(f.ChildViews) == 0 {
+		return fieldError(fPrefix, "at least one of child_events or child_views is required")
 	}
 	if err := validateEvents(f.ChildEvents, fPrefix); err != nil {
+		return err
+	}
+	if err := validateViews(f.ChildViews, fPrefix); err != nil {
 		return err
 	}
 	return nil

@@ -111,6 +111,10 @@ type FactoryConfig struct {
 	// ChildEvents defines the event/table config template applied to each child contract.
 	ChildEvents []EventConfig `yaml:"child_events" json:"child_events"`
 
+	// ChildViews defines view functions to poll on each auto-discovered child contract.
+	// Mirrors the semantics of the static contracts:.views field.
+	ChildViews []ViewConfig `yaml:"child_views,omitempty" json:"child_views,omitempty"`
+
 	// SharedTables enables shared tables for all factory children (see task 3.11).
 	SharedTables bool `yaml:"shared_tables" json:"shared_tables"`
 
