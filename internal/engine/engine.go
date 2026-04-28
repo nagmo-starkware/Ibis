@@ -28,12 +28,13 @@ type contractState struct {
 	registry *abi.EventRegistry
 	schemas  map[string]*types.TableSchema // event name -> schema
 
-	// childABI caches the resolved ABI for factory children. Set on first child registration.
-	childABI *abi.ABI
+	// childABIs caches resolved ABIs for factory children keyed by factory.ChildABI string.
+	// Each factory entry may specify a different ChildABI, so the cache is per-type.
+	childABIs map[string]*abi.ABI
 
-	// sharedSchemas caches shared table schemas for factory children with shared_tables: true.
-	// Set on first child registration; reused by all subsequent children.
-	sharedSchemas map[string]*types.TableSchema
+	// sharedSchemas caches shared table schemas keyed by factory.ChildABI string.
+	// Outer key = ChildABI name; inner map = event name -> schema.
+	sharedSchemas map[string]map[string]*types.TableSchema
 }
 
 // ContractStatus represents the current state of an indexed contract.
@@ -203,7 +204,7 @@ func (e *Engine) Contracts(ctx context.Context) []ContractInfo {
 			Dynamic:      cs.config.Dynamic,
 			FactoryName:  cs.config.FactoryName,
 			FactoryMeta:  cs.config.FactoryMeta,
-			IsFactory:    cs.config.Factory != nil,
+			IsFactory:    len(cs.config.Factories) > 0,
 		})
 	}
 	return infos
@@ -825,7 +826,7 @@ func (e *Engine) IsFactory(name string) bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	for _, cs := range e.contracts {
-		if cs.config.Name == name && cs.config.Factory != nil {
+		if cs.config.Name == name && len(cs.config.Factories) > 0 {
 			return true
 		}
 	}

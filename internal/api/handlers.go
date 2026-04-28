@@ -226,7 +226,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		factories := make(map[string]any)
 		for i := range contractsCopy {
 			c := &contractsCopy[i]
-			if c.Factory != nil {
+			if len(c.Factories) > 0 {
 				children := s.engine.FactoryChildren(c.Name)
 				synced := 0
 				backfilling := 0

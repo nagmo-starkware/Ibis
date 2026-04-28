@@ -88,11 +88,11 @@ func setupFactoryTestServer(t *testing.T) (*httptest.Server, *api.EventBus) {
 	eng.InjectContractForTest(&config.ContractConfig{
 		Name:    "JediSwap",
 		Address: "0xF001",
-		Factory: &config.FactoryConfig{
+		Factories: []config.FactoryConfig{{
 			Event:             "PairCreated",
 			ChildAddressField: "pair",
 			SharedTables:      true,
-		},
+		}},
 		Events: []config.EventConfig{
 			{Name: "PairCreated", Table: config.TableConfig{Type: "log"}},
 		},

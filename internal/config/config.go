@@ -81,8 +81,10 @@ type ContractConfig struct {
 	StartBlock *uint64       `yaml:"start_block,omitempty" json:"start_block,omitempty"`
 	Dynamic    bool          `yaml:"-" json:"dynamic,omitempty"`
 
-	// Factory configuration for contracts that deploy child contracts.
-	Factory *FactoryConfig `yaml:"factory,omitempty" json:"factory,omitempty"`
+	// Factories lists factory configurations for contracts that deploy child contracts.
+	// Multiple entries allow a single parent event to register different child types
+	// (e.g., one DeploymentCreated event that carries option_token, order_book, exerciser).
+	Factories []FactoryConfig `yaml:"factories,omitempty" json:"factories,omitempty"`
 
 	// FactoryName is set on factory-spawned child contracts to track their parent.
 	FactoryName string `yaml:"-" json:"factory_name,omitempty"`

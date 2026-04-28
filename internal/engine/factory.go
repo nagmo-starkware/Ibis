@@ -14,12 +14,10 @@ import (
 	"github.com/b-j-roberts/ibis/internal/types"
 )
 
-// handleFactoryEvent processes a factory creation event by extracting the child
-// contract address, building a child config from the factory template, and
-// registering the child for indexing.
-func (e *Engine) handleFactoryEvent(ctx context.Context, cs *contractState, decoded map[string]any, raw *provider.RawEvent) {
-	factory := cs.config.Factory
-
+// handleFactoryEvent processes a factory creation event for a specific factory entry.
+// Each factory entry specifies which field in the event carries the child address.
+// Called once per matching factory entry, so a single event can register multiple children.
+func (e *Engine) handleFactoryEvent(ctx context.Context, cs *contractState, factory *config.FactoryConfig, decoded map[string]any, raw *provider.RawEvent) {
 	// Extract child address from the decoded event.
 	childAddrRaw, ok := decoded[factory.ChildAddressField]
 	if !ok {
@@ -76,7 +74,7 @@ func (e *Engine) handleFactoryEvent(ctx context.Context, cs *contractState, deco
 	}
 
 	// Register the child using the fast path with cached ABI if available.
-	if err := e.registerFactoryChild(ctx, cs, cc); err != nil {
+	if err := e.registerFactoryChild(ctx, cs, factory, cc); err != nil {
 		e.logger.Error("failed to register factory child",
 			"factory", cs.config.Name,
 			"child", childName,
@@ -93,20 +91,25 @@ func (e *Engine) handleFactoryEvent(ctx context.Context, cs *contractState, deco
 	)
 }
 
-// registerFactoryChild registers a factory child contract. It uses a cached
-// child ABI when available (all children share the same class hash / ABI) to
-// avoid repeated network calls. Falls back to full ABI resolution on first child.
-func (e *Engine) registerFactoryChild(ctx context.Context, factoryCS *contractState, cc *config.ContractConfig) error {
-	// Try to use cached child ABI.
-	childABI := factoryCS.childABI
+// registerFactoryChild registers a factory child contract. It uses a per-ChildABI
+// cache so different factory entries (with different ChildABI values) each get their
+// own resolved ABI without unnecessary network calls.
+func (e *Engine) registerFactoryChild(ctx context.Context, factoryCS *contractState, factory *config.FactoryConfig, cc *config.ContractConfig) error {
+	// Ensure the ABI cache map is initialized.
+	if factoryCS.childABIs == nil {
+		factoryCS.childABIs = make(map[string]*abi.ABI)
+	}
+
+	// Try to use cached child ABI for this factory's ChildABI type.
+	childABI := factoryCS.childABIs[factory.ChildABI]
 	if childABI != nil {
-		if factoryCS.config.Factory.SharedTables {
-			return e.registerSharedChild(ctx, factoryCS, cc, childABI)
+		if factory.SharedTables {
+			return e.registerSharedChild(ctx, factoryCS, factory, cc, childABI)
 		}
 		return e.registerWithABI(ctx, cc, childABI)
 	}
 
-	// First child: resolve ABI and cache it for subsequent children.
+	// First child of this type: resolve ABI and cache it for subsequent children.
 	resolver := config.NewABIResolver(e.provider)
 	abis, err := resolver.ResolveAll(ctx, []config.ContractConfig{*cc})
 	if err != nil {
@@ -118,19 +121,19 @@ func (e *Engine) registerFactoryChild(ctx context.Context, factoryCS *contractSt
 		return fmt.Errorf("no ABI resolved for factory child %s (%s)", cc.Name, cc.Address)
 	}
 
-	// Cache for future children.
-	factoryCS.childABI = childABI
+	// Cache for future children of the same type.
+	factoryCS.childABIs[factory.ChildABI] = childABI
 
-	if factoryCS.config.Factory.SharedTables {
-		return e.registerSharedChild(ctx, factoryCS, cc, childABI)
+	if factory.SharedTables {
+		return e.registerSharedChild(ctx, factoryCS, factory, cc, childABI)
 	}
 	return e.registerWithABI(ctx, cc, childABI)
 }
 
 // registerSharedChild registers a factory child that writes to shared tables.
-// On the first child, shared schemas are built and tables created. Subsequent
-// children reuse the cached schemas (same table names, no new tables).
-func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractState, cc *config.ContractConfig, childABI *abi.ABI) error {
+// On the first child of a given factory type (keyed by factory.ChildABI), shared
+// schemas are built and tables created. Subsequent children reuse cached schemas.
+func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractState, factory *config.FactoryConfig, cc *config.ContractConfig, childABI *abi.ABI) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -145,8 +148,13 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 
 	registry := abi.NewEventRegistry(childABI)
 
-	// Build shared schemas on first child, reuse for subsequent children.
-	schemas := factoryCS.sharedSchemas
+	// Ensure the sharedSchemas cache map is initialized.
+	if factoryCS.sharedSchemas == nil {
+		factoryCS.sharedSchemas = make(map[string]map[string]*types.TableSchema)
+	}
+
+	// Build shared schemas on first child of this type; reuse for subsequent children.
+	schemas := factoryCS.sharedSchemas[factory.ChildABI]
 	var schemaList []*types.TableSchema
 
 	if schemas == nil {
@@ -170,7 +178,7 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 			schemaList = append(schemaList, sch)
 		}
 
-		factoryCS.sharedSchemas = schemas
+		factoryCS.sharedSchemas[factory.ChildABI] = schemas
 	}
 
 	// Parse contract address.

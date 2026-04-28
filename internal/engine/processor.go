@@ -112,9 +112,12 @@ func (e *Engine) processEvent(ctx context.Context, raw *provider.RawEvent) error
 		)
 	}
 
-	// Check if this is a factory creation event that spawns a child contract.
-	if cs.config.Factory != nil && eventDef.Name == cs.config.Factory.Event {
-		e.handleFactoryEvent(ctx, cs, decoded, raw)
+	// For each factory entry on this contract, check if the event triggers child registration.
+	for i := range cs.config.Factories {
+		factory := &cs.config.Factories[i]
+		if eventDef.Name == factory.Event {
+			e.handleFactoryEvent(ctx, cs, factory, decoded, raw)
+		}
 	}
 
 	return nil

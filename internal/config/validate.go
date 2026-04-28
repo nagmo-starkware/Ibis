@@ -104,9 +104,10 @@ func Validate(cfg *Config) error {
 			return err
 		}
 
-		// Validate factory config if present.
-		if c.Factory != nil {
-			if err := validateFactory(c.Factory, prefix); err != nil {
+		// Validate each factory config if present.
+		for j := range c.Factories {
+			fPrefix := fmt.Sprintf("%s.factories[%d]", prefix, j)
+			if err := validateFactory(&c.Factories[j], fPrefix); err != nil {
 				return err
 			}
 		}
@@ -176,20 +177,19 @@ func validateEvents(events []EventConfig, prefix string) error {
 }
 
 func validateFactory(f *FactoryConfig, prefix string) error {
-	fPrefix := prefix + ".factory"
 	if f.Event == "" {
-		return fieldError(fPrefix+".event", "required")
+		return fieldError(prefix+".event", "required")
 	}
 	if f.ChildAddressField == "" {
-		return fieldError(fPrefix+".child_address_field", "required")
+		return fieldError(prefix+".child_address_field", "required")
 	}
 	if len(f.ChildEvents) == 0 && len(f.ChildViews) == 0 {
-		return fieldError(fPrefix, "at least one of child_events or child_views is required")
+		return fieldError(prefix, "at least one of child_events or child_views is required")
 	}
-	if err := validateEvents(f.ChildEvents, fPrefix); err != nil {
+	if err := validateEvents(f.ChildEvents, prefix); err != nil {
 		return err
 	}
-	if err := validateViews(f.ChildViews, fPrefix); err != nil {
+	if err := validateViews(f.ChildViews, prefix); err != nil {
 		return err
 	}
 	return nil
