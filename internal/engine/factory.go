@@ -133,38 +133,69 @@ func (e *Engine) registerFactoryChild(ctx context.Context, factoryCS *contractSt
 // registerSharedChild registers a factory child that writes to shared tables.
 // On the first child of a given factory type (keyed by factory.ChildABI), shared
 // schemas are built and tables created. Subsequent children reuse cached schemas.
+//
+// Critical-section discipline: e.mu is held only for in-memory mutations
+// (duplicate check, schema caching, e.contracts append). All store I/O,
+// subscriber setup, and view poller startup run outside the lock so the
+// event loop is not stalled behind a write-lock during slow DDL or DB inserts.
 func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractState, factory *config.FactoryConfig, cc *config.ContractConfig, childABI *abi.ABI) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Check for duplicate name.
-	for _, cs := range e.contracts {
-		if cs.config.Name == cc.Name {
-			return fmt.Errorf("contract %q already registered", cc.Name)
-		}
-	}
-
 	cc.Dynamic = true
 
 	registry := abi.NewEventRegistry(childABI)
 
-	// Ensure the sharedSchemas cache map is initialized.
+	// ── Critical section: in-memory mutations only ──────────────────────────
+	var schemas map[string]*types.TableSchema
+	var needsTableCreation bool
+
+	e.mu.Lock()
+
+	for _, cs := range e.contracts {
+		if cs.config.Name == cc.Name {
+			e.mu.Unlock()
+			return fmt.Errorf("contract %q already registered", cc.Name)
+		}
+	}
+
 	if factoryCS.sharedSchemas == nil {
 		factoryCS.sharedSchemas = make(map[string]map[string]*types.TableSchema)
 	}
 
-	// Build shared schemas on first child of this type; reuse for subsequent children.
-	schemas := factoryCS.sharedSchemas[factory.ChildABI]
-	var schemaList []*types.TableSchema
-
+	schemas = factoryCS.sharedSchemas[factory.ChildABI]
 	if schemas == nil {
+		// First child of this ABI type: build and cache schemas under lock so
+		// a concurrent registration of the same type cannot race-build.
 		opts := &schema.BuildOptions{
 			SharedTable: true,
 			FactoryName: factoryCS.config.Name,
 		}
 		schemas = schema.BuildSchemas(cc, childABI, registry, opts)
+		factoryCS.sharedSchemas[factory.ChildABI] = schemas
+		needsTableCreation = true
+	}
 
-		// Create shared tables in store.
+	address, err := new(felt.Felt).SetString(cc.Address)
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("parsing address for %s: %w", cc.Name, err)
+	}
+
+	cs := &contractState{
+		config:   *cc,
+		address:  address,
+		abi:      childABI,
+		registry: registry,
+		schemas:  schemas, // All children of this type share the same schema references.
+	}
+	e.contracts = append(e.contracts, cs)
+
+	e.mu.Unlock()
+	// ── End critical section ─────────────────────────────────────────────────
+
+	// ── I/O outside the lock ─────────────────────────────────────────────────
+
+	var schemaList []*types.TableSchema
+
+	if needsTableCreation {
 		for _, sch := range schemas {
 			if err := e.store.CreateTable(ctx, sch); err != nil {
 				return fmt.Errorf("create shared table %s: %w", sch.Name, err)
@@ -177,31 +208,14 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 			)
 			schemaList = append(schemaList, sch)
 		}
-
-		factoryCS.sharedSchemas[factory.ChildABI] = schemas
 	}
 
-	// Parse contract address.
-	address, err := new(felt.Felt).SetString(cc.Address)
-	if err != nil {
-		return fmt.Errorf("parsing address for %s: %w", cc.Name, err)
-	}
-
-	// Persist dynamic contract config.
+	// Best-effort: if persistence fails the engine will rediscover the child on
+	// restart because its deploy event is still in the durable event log.
 	if err := e.store.SaveDynamicContract(ctx, cc); err != nil {
-		return fmt.Errorf("persisting factory child %s: %w", cc.Name, err)
+		e.logger.Error("failed to persist factory child", "name", cc.Name, "error", err)
 	}
 
-	cs := &contractState{
-		config:   *cc,
-		address:  address,
-		abi:      childABI,
-		registry: registry,
-		schemas:  schemas, // All children share the same schema references.
-	}
-	e.contracts = append(e.contracts, cs)
-
-	// Spawn subscription if the engine is running.
 	if e.subscriber != nil && e.runCtx != nil {
 		sub := provider.ContractSubscription{
 			Address:    address,
@@ -223,7 +237,6 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 		e.subscriber.AddContract(e.runCtx, sub)
 	}
 
-	// Start view polling for this shared child if it has views configured.
 	if e.runCtx != nil {
 		viewSchemas, err := e.startViewsForContract(e.runCtx, cs)
 		if err != nil {
@@ -243,41 +256,30 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 }
 
 // registerWithABI registers a contract using a pre-resolved ABI, skipping the
-// ABI resolution step. This is the fast path for factory children.
+// ABI resolution step. This is the fast path for factory children (non-shared path).
+//
+// Same critical-section discipline as registerSharedChild: e.mu covers only
+// in-memory mutations; all store I/O runs outside the lock.
 func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig, contractABI *abi.ABI) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Check for duplicate name.
-	for _, cs := range e.contracts {
-		if cs.config.Name == cc.Name {
-			return fmt.Errorf("contract %q already registered", cc.Name)
-		}
-	}
-
 	cc.Dynamic = true
 
 	registry := abi.NewEventRegistry(contractABI)
 	schemas := schema.BuildSchemas(cc, contractABI, registry, nil)
 
-	// Parse contract address.
+	// ── Critical section: in-memory mutations only ──────────────────────────
+	e.mu.Lock()
+
+	for _, cs := range e.contracts {
+		if cs.config.Name == cc.Name {
+			e.mu.Unlock()
+			return fmt.Errorf("contract %q already registered", cc.Name)
+		}
+	}
+
 	address, err := new(felt.Felt).SetString(cc.Address)
 	if err != nil {
+		e.mu.Unlock()
 		return fmt.Errorf("parsing address for %s: %w", cc.Name, err)
-	}
-
-	// Create tables in store.
-	var schemaList []*types.TableSchema
-	for _, sch := range schemas {
-		if err := e.store.CreateTable(ctx, sch); err != nil {
-			return fmt.Errorf("create table %s: %w", sch.Name, err)
-		}
-		schemaList = append(schemaList, sch)
-	}
-
-	// Persist dynamic contract config.
-	if err := e.store.SaveDynamicContract(ctx, cc); err != nil {
-		return fmt.Errorf("persisting factory child %s: %w", cc.Name, err)
 	}
 
 	cs := &contractState{
@@ -289,14 +291,30 @@ func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig,
 	}
 	e.contracts = append(e.contracts, cs)
 
-	// Spawn subscription if the engine is running.
+	e.mu.Unlock()
+	// ── End critical section ─────────────────────────────────────────────────
+
+	// ── I/O outside the lock ─────────────────────────────────────────────────
+
+	var schemaList []*types.TableSchema
+	for _, sch := range schemas {
+		if err := e.store.CreateTable(ctx, sch); err != nil {
+			return fmt.Errorf("create table %s: %w", sch.Name, err)
+		}
+		schemaList = append(schemaList, sch)
+	}
+
+	// Best-effort persistence; engine rediscovers children on restart.
+	if err := e.store.SaveDynamicContract(ctx, cc); err != nil {
+		e.logger.Error("failed to persist factory child", "name", cc.Name, "error", err)
+	}
+
 	if e.subscriber != nil && e.runCtx != nil {
 		sub := provider.ContractSubscription{
 			Address:    address,
 			StartBlock: derefUint64(cc.StartBlock),
 		}
 
-		// Build key filters if no wildcard.
 		if !hasWildcardEvent(cc) {
 			var selectors []*felt.Felt
 			for _, ec := range cc.Events {
@@ -312,7 +330,6 @@ func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig,
 		e.subscriber.AddContract(e.runCtx, sub)
 	}
 
-	// Start view polling for this contract if it has views configured.
 	if e.runCtx != nil {
 		viewSchemas, err := e.startViewsForContract(e.runCtx, cs)
 		if err != nil {
@@ -323,7 +340,6 @@ func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig,
 		}
 	}
 
-	// Notify API server.
 	if e.onContractRegistered != nil {
 		e.onContractRegistered(cc, schemaList)
 	}
