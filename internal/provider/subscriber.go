@@ -312,6 +312,8 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 		s.resolveTimestamps(ctx, events, logger)
 
 		for _, evt := range events {
+			// These are historical events replayed before reaching the tip.
+			evt.IsCatchup = true
 			select {
 			case s.events <- evt:
 			case <-ctx.Done():
@@ -566,7 +568,13 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 		// Enrich events with block timestamps.
 		s.resolveTimestamps(ctx, events, logger)
 
+		// Events are still "catchup" while the polled range trails the chain
+		// tip by more than the catchup threshold; once within threshold we
+		// treat them as live (same boundary as the catchup->WSS handoff).
+		isCatchup := endBlock+catchupThreshold < latestBlock
+
 		for _, evt := range events {
+			evt.IsCatchup = isCatchup
 			select {
 			case s.events <- evt:
 			case <-ctx.Done():
@@ -655,6 +663,8 @@ func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscri
 		s.resolveTimestamps(ctx, events, logger)
 
 		for _, evt := range events {
+			// Backfill is historical by definition.
+			evt.IsCatchup = true
 			select {
 			case s.events <- evt:
 			case <-ctx.Done():

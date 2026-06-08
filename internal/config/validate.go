@@ -259,15 +259,8 @@ func validateViews(views []ViewConfig, prefix string) error {
 			return fieldError(vPrefix+".function", "required")
 		}
 
-		if v.Interval == "" {
-			return fieldError(vPrefix+".interval", "required")
-		}
-		d, err := time.ParseDuration(v.Interval)
-		if err != nil {
-			return fieldError(vPrefix+".interval", fmt.Sprintf("invalid duration: %v", err))
-		}
-		if d < time.Second {
-			return fieldError(vPrefix+".interval", "minimum interval is 1s")
+		if err := validateViewRefresh(&v, vPrefix); err != nil {
+			return err
 		}
 
 		if !validViewTableTypes[v.Table.Type] {
@@ -284,6 +277,77 @@ func validateViews(views []ViewConfig, prefix string) error {
 			}
 		}
 	}
+	return nil
+}
+
+// validateViewRefresh validates the interval/constant/reactive refresh policy
+// of a single view. Exactly one mode applies; the rules enforce that the
+// fields belonging to other modes are absent.
+func validateViewRefresh(v *ViewConfig, vPrefix string) error {
+	mode := RefreshModeInterval
+	if v.Refresh != nil {
+		mode = v.Refresh.ResolvedMode()
+	}
+
+	switch mode {
+	case RefreshModeInterval:
+		// Default mode: Interval is required and must be >= 1s.
+		if v.Interval == "" {
+			return fieldError(vPrefix+".interval", "required (or set refresh.mode to constant/reactive)")
+		}
+		d, err := time.ParseDuration(v.Interval)
+		if err != nil {
+			return fieldError(vPrefix+".interval", fmt.Sprintf("invalid duration: %v", err))
+		}
+		if d < time.Second {
+			return fieldError(vPrefix+".interval", "minimum interval is 1s")
+		}
+
+	case RefreshModeConstant:
+		if v.Interval != "" {
+			return fieldError(vPrefix+".interval", "must be empty when refresh.mode is constant")
+		}
+		if len(v.Refresh.On) > 0 || len(v.Refresh.OnForeign) > 0 {
+			return fieldError(vPrefix+".refresh.on", "must be empty when refresh.mode is constant")
+		}
+
+	case RefreshModeReactive:
+		if len(v.Refresh.On) == 0 && len(v.Refresh.OnForeign) == 0 {
+			return fieldError(vPrefix+".refresh.on", "at least one event is required for reactive refresh")
+		}
+		for i, ev := range v.Refresh.On {
+			if ev == "" {
+				return fieldError(fmt.Sprintf("%s.refresh.on[%d]", vPrefix, i), "event name must not be empty")
+			}
+		}
+		for i, f := range v.Refresh.OnForeign {
+			fp := fmt.Sprintf("%s.refresh.on_foreign[%d]", vPrefix, i)
+			if f.Contract == "" {
+				return fieldError(fp+".contract", "required")
+			}
+			if f.Event == "" {
+				return fieldError(fp+".event", "required")
+			}
+		}
+		if v.Refresh.Debounce != "" {
+			if _, err := time.ParseDuration(v.Refresh.Debounce); err != nil {
+				return fieldError(vPrefix+".refresh.debounce", fmt.Sprintf("invalid duration: %v", err))
+			}
+		}
+		if v.Refresh.MaxInterval != "" {
+			d, err := time.ParseDuration(v.Refresh.MaxInterval)
+			if err != nil {
+				return fieldError(vPrefix+".refresh.max_interval", fmt.Sprintf("invalid duration: %v", err))
+			}
+			if d < time.Second {
+				return fieldError(vPrefix+".refresh.max_interval", "minimum max_interval is 1s")
+			}
+		}
+
+	default:
+		return fieldError(vPrefix+".refresh.mode", fmt.Sprintf("must be one of: constant, reactive (got %q)", mode))
+	}
+
 	return nil
 }
 
