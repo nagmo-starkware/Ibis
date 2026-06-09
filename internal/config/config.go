@@ -208,13 +208,89 @@ type AggregateConfig struct {
 	Field     string `yaml:"field" json:"field"`
 }
 
-// ViewConfig defines a view function to poll at a configurable interval.
+// ViewConfig defines a view function and how often to read it.
+//
+// Refresh modes (mutually exclusive):
+//   - interval (default): set Interval, the view is polled every Interval.
+//   - constant: set Refresh: {mode: constant}, the view is read exactly once
+//     when the contract is registered and never again (deploy-time immutables).
+//   - reactive: set Refresh: {on: [Event, ...]}, the view is re-read only when
+//     one of the named events is observed on this contract (or on a foreign
+//     contract via OnForeign). Idle contracts emit no events and cost no RPC.
 type ViewConfig struct {
-	Function string            `yaml:"function" json:"function"`
-	Calldata []string          `yaml:"calldata,omitempty" json:"calldata,omitempty"`
-	Interval string            `yaml:"interval" json:"interval"`
-	Table    TableConfig       `yaml:"table" json:"table"`
-	Headers  map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Function string             `yaml:"function" json:"function"`
+	Calldata []string           `yaml:"calldata,omitempty" json:"calldata,omitempty"`
+	Interval string             `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Refresh  *ViewRefreshConfig `yaml:"refresh,omitempty" json:"refresh,omitempty"`
+	Table    TableConfig        `yaml:"table" json:"table"`
+	Headers  map[string]string  `yaml:"headers,omitempty" json:"headers,omitempty"`
+}
+
+// Refresh mode constants.
+const (
+	RefreshModeInterval = "interval"
+	RefreshModeConstant = "constant"
+	RefreshModeReactive = "reactive"
+)
+
+// ViewRefreshConfig declares a non-interval refresh policy for a view.
+//
+// Accepts two YAML forms:
+//
+//	refresh: constant                       # scalar shorthand
+//	refresh: { on: [OrderFilled], debounce: 1s, max_interval: 6h }
+type ViewRefreshConfig struct {
+	// Mode is "constant" or "reactive". May be left empty when On is set
+	// (inferred as reactive) or when the scalar shorthand "constant" is used.
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+	// On lists event names on THIS contract that invalidate the view.
+	On []string `yaml:"on,omitempty" json:"on,omitempty"`
+	// OnForeign lists (contract, event) pairs on OTHER contracts that
+	// invalidate the view (e.g. a view that reads an oracle in another
+	// contract). Reserved for future use; matched by foreign contract name.
+	OnForeign []ForeignTrigger `yaml:"on_foreign,omitempty" json:"on_foreign,omitempty"`
+	// Debounce throttles reactive reads to at most one per window, collapsing
+	// bursts (e.g. several fills in one block) into a single read. Empty => a
+	// small default is applied; "0" disables throttling (read on every event).
+	Debounce string `yaml:"debounce,omitempty" json:"debounce,omitempty"`
+	// MaxInterval is an optional staleness ceiling: force a read at least this
+	// often even with no events. Empty => no ceiling (pure event-driven).
+	MaxInterval string `yaml:"max_interval,omitempty" json:"max_interval,omitempty"`
+}
+
+// ForeignTrigger names an event on another contract that invalidates a view.
+type ForeignTrigger struct {
+	Contract string `yaml:"contract" json:"contract"`
+	Event    string `yaml:"event" json:"event"`
+}
+
+// UnmarshalYAML accepts either a scalar string (e.g. `refresh: constant`) or a
+// full mapping (`refresh: { on: [...] }`).
+func (r *ViewRefreshConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		r.Mode = value.Value
+		return nil
+	}
+	// Decode the mapping without recursing back into this method.
+	type rawRefresh ViewRefreshConfig
+	var raw rawRefresh
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*r = ViewRefreshConfig(raw)
+	return nil
+}
+
+// ResolvedMode returns the effective refresh mode, inferring "reactive" when
+// On/OnForeign are set but Mode was omitted.
+func (r *ViewRefreshConfig) ResolvedMode() string {
+	if r.Mode != "" {
+		return r.Mode
+	}
+	if len(r.On) > 0 || len(r.OnForeign) > 0 {
+		return RefreshModeReactive
+	}
+	return ""
 }
 
 // envVarPattern matches ${VAR_NAME} for environment variable expansion.

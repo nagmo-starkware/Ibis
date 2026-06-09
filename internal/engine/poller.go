@@ -33,11 +33,17 @@ var _ viewPollerProvider = (*provider.StarknetProvider)(nil)
 type ViewStatus struct {
 	FunctionName      string    `json:"function_name"`
 	Contract          string    `json:"contract"`
+	RefreshMode       string    `json:"refresh_mode"`
 	Interval          string    `json:"interval"`
 	LastPollBlock     uint64    `json:"last_poll_block"`
 	LastPollTime      time.Time `json:"last_poll_time,omitempty"`
 	ConsecutiveErrors int       `json:"consecutive_errors"`
 }
+
+// defaultReactiveDebounce throttles reactive reads when no debounce is set in
+// config, collapsing multiple events in quick succession (e.g. several fills
+// in one block) into a single view read.
+const defaultReactiveDebounce = time.Second
 
 // viewEntry holds the resolved state for a single view function to poll.
 type viewEntry struct {
@@ -48,6 +54,14 @@ type viewEntry struct {
 	interval        time.Duration
 	schema          *types.TableSchema
 	uniqueKey       string
+
+	// Refresh policy. refreshMode is one of config.RefreshMode{Interval,Constant,Reactive}.
+	refreshMode     string
+	onEvents        map[string]bool // reactive: event names on THIS contract
+	foreignTriggers map[string]bool // reactive: "contract/event" keys on OTHER contracts
+	debounce        time.Duration   // reactive: throttle window (0 = read on every event)
+	maxInterval     time.Duration   // reactive: optional staleness ceiling (0 = none)
+	trigger         chan struct{}   // reactive: buffered(1) re-read signal
 
 	// Skip-if-busy: prevents overlapping polls for the same function.
 	busy sync.Mutex
@@ -137,10 +151,58 @@ func (vp *ViewPoller) buildEntry(cs *contractState, viewCfg *config.ViewConfig) 
 		}
 	}
 
-	// Parse interval.
-	interval, err := time.ParseDuration(viewCfg.Interval)
-	if err != nil {
-		return nil, nil, fmt.Errorf("contract %s, function %s: parsing interval: %w", cs.config.Name, viewCfg.Function, err)
+	// Resolve refresh policy (interval | constant | reactive).
+	refreshMode := config.RefreshModeInterval
+	if viewCfg.Refresh != nil {
+		refreshMode = viewCfg.Refresh.ResolvedMode()
+	}
+
+	var (
+		interval        time.Duration
+		debounce        time.Duration
+		maxInterval     time.Duration
+		onEvents        map[string]bool
+		foreignTriggers map[string]bool
+		trigger         chan struct{}
+	)
+
+	switch refreshMode {
+	case config.RefreshModeConstant:
+		// No interval, no trigger: read once at registration.
+
+	case config.RefreshModeReactive:
+		onEvents = make(map[string]bool, len(viewCfg.Refresh.On))
+		for _, ev := range viewCfg.Refresh.On {
+			onEvents[ev] = true
+		}
+		foreignTriggers = make(map[string]bool, len(viewCfg.Refresh.OnForeign))
+		for _, f := range viewCfg.Refresh.OnForeign {
+			foreignTriggers[foreignKey(f.Contract, f.Event)] = true
+		}
+		debounce = defaultReactiveDebounce
+		if viewCfg.Refresh.Debounce != "" {
+			d, err := time.ParseDuration(viewCfg.Refresh.Debounce)
+			if err != nil {
+				return nil, nil, fmt.Errorf("contract %s, function %s: parsing refresh.debounce: %w", cs.config.Name, viewCfg.Function, err)
+			}
+			debounce = d
+		}
+		if viewCfg.Refresh.MaxInterval != "" {
+			d, err := time.ParseDuration(viewCfg.Refresh.MaxInterval)
+			if err != nil {
+				return nil, nil, fmt.Errorf("contract %s, function %s: parsing refresh.max_interval: %w", cs.config.Name, viewCfg.Function, err)
+			}
+			maxInterval = d
+		}
+		trigger = make(chan struct{}, 1)
+
+	default:
+		refreshMode = config.RefreshModeInterval
+		d, err := time.ParseDuration(viewCfg.Interval)
+		if err != nil {
+			return nil, nil, fmt.Errorf("contract %s, function %s: parsing interval: %w", cs.config.Name, viewCfg.Function, err)
+		}
+		interval = d
 	}
 
 	// Build table schema, using shared naming when the contract has shared tables.
@@ -161,9 +223,20 @@ func (vp *ViewPoller) buildEntry(cs *contractState, viewCfg *config.ViewConfig) 
 		interval:        interval,
 		schema:          viewSchema,
 		uniqueKey:       viewCfg.Table.UniqueKey,
+		refreshMode:     refreshMode,
+		onEvents:        onEvents,
+		foreignTriggers: foreignTriggers,
+		debounce:        debounce,
+		maxInterval:     maxInterval,
+		trigger:         trigger,
 	}
 
 	return entry, viewSchema, nil
+}
+
+// foreignKey builds the lookup key for a foreign (cross-contract) trigger.
+func foreignKey(contract, event string) string {
+	return contract + "/" + event
 }
 
 // Status returns the current status of all view function pollers.
@@ -179,6 +252,7 @@ func (vp *ViewPoller) Status() []ViewStatus {
 		statuses[i] = ViewStatus{
 			FunctionName:      entry.functionDef.Name,
 			Contract:          entry.contractName,
+			RefreshMode:       entry.refreshMode,
 			Interval:          entry.interval.String(),
 			LastPollBlock:     entry.lastPollBlock,
 			LastPollTime:      entry.lastPollTime,
@@ -224,8 +298,20 @@ func (vp *ViewPoller) reorgChan() <-chan struct{} {
 	return vp.reorgCh
 }
 
-// runView is the per-function polling loop.
+// runView dispatches a view entry to the loop matching its refresh mode.
 func (vp *ViewPoller) runView(ctx context.Context, entry *viewEntry) {
+	switch entry.refreshMode {
+	case config.RefreshModeConstant:
+		vp.runConstant(ctx, entry)
+	case config.RefreshModeReactive:
+		vp.runReactive(ctx, entry)
+	default:
+		vp.runInterval(ctx, entry)
+	}
+}
+
+// runInterval is the classic fixed-interval polling loop.
+func (vp *ViewPoller) runInterval(ctx context.Context, entry *viewEntry) {
 	// Add startup jitter: up to min(10s, interval) to spread RPC load.
 	maxJitter := 10 * time.Second
 	if entry.interval < maxJitter {
@@ -254,6 +340,138 @@ func (vp *ViewPoller) runView(ctx context.Context, entry *viewEntry) {
 		case <-reorgCh:
 			vp.poll(ctx, entry)
 			ticker.Reset(entry.interval)
+		}
+	}
+}
+
+// runConstant reads a deploy-time-immutable view exactly once, at registration.
+// It retries with capped exponential backoff until the first successful read,
+// then exits — the value can never change on-chain, so no further polling is
+// scheduled and the contract costs zero ongoing RPC.
+func (vp *ViewPoller) runConstant(ctx context.Context, entry *viewEntry) {
+	backoff := time.Second
+	for {
+		vp.poll(ctx, entry)
+
+		entry.statusMu.Lock()
+		ok := entry.consecutiveErrs == 0 && !entry.lastPollTime.IsZero()
+		entry.statusMu.Unlock()
+		if ok {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// runReactive reads a view once at registration (capturing current chain state
+// regardless of catchup progress), then re-reads only when a trigger fires —
+// an event in entry.onEvents/foreignTriggers, a reorg, or the optional
+// max-interval ceiling. Triggers within entry.debounce of the last read are
+// throttled into a single trailing read so a burst of events in one block
+// produces at most one extra RPC call.
+func (vp *ViewPoller) runReactive(ctx context.Context, entry *viewEntry) {
+	// Initial read at registration: current state via BlockTagLatest, so the
+	// view is populated immediately without waiting for any event.
+	vp.poll(ctx, entry)
+	lastPoll := time.Now()
+
+	var (
+		throttle  *time.Timer
+		throttleC <-chan time.Time
+		pending   bool
+	)
+	stopThrottle := func() {
+		if throttle != nil {
+			throttle.Stop()
+			throttle = nil
+			throttleC = nil
+		}
+	}
+	defer stopThrottle()
+
+	doPoll := func() {
+		stopThrottle()
+		vp.poll(ctx, entry)
+		lastPoll = time.Now()
+		pending = false
+	}
+
+	// Optional staleness ceiling.
+	var maxC <-chan time.Time
+	if entry.maxInterval > 0 {
+		ticker := time.NewTicker(entry.maxInterval)
+		defer ticker.Stop()
+		maxC = ticker.C
+	}
+
+	for {
+		reorgCh := vp.reorgChan()
+		select {
+		case <-ctx.Done():
+			return
+		case <-entry.trigger:
+			if entry.debounce <= 0 {
+				doPoll()
+				continue
+			}
+			if elapsed := time.Since(lastPoll); elapsed >= entry.debounce {
+				doPoll()
+			} else if throttle == nil {
+				// Schedule a trailing read at the end of the throttle window.
+				pending = true
+				throttle = time.NewTimer(entry.debounce - elapsed)
+				throttleC = throttle.C
+			} else {
+				pending = true
+			}
+		case <-throttleC:
+			stopThrottle()
+			if pending {
+				doPoll()
+			}
+		case <-maxC:
+			doPoll()
+		case <-reorgCh:
+			doPoll()
+		}
+	}
+}
+
+// TriggerView signals reactive view entries to re-read after an event was
+// indexed. emitterName/emitterAddr identify the contract that emitted the
+// event. An entry matches when either (a) the event fired on its own contract
+// and is in its onEvents set, or (b) a foreign (contract/event) trigger
+// matches. Sends are non-blocking: the trigger channel is buffered(1) so a
+// pending signal coalesces repeated triggers between reads.
+func (vp *ViewPoller) TriggerView(emitterName string, emitterAddr *felt.Felt, eventName string) {
+	fk := foreignKey(emitterName, eventName)
+
+	vp.mu.Lock()
+	entries := make([]*viewEntry, len(vp.entries))
+	copy(entries, vp.entries)
+	vp.mu.Unlock()
+
+	for _, entry := range entries {
+		if entry.refreshMode != config.RefreshModeReactive {
+			continue
+		}
+		local := entry.onEvents[eventName] &&
+			entry.contractAddress != nil && emitterAddr != nil &&
+			entry.contractAddress.Equal(emitterAddr)
+		if !local && !entry.foreignTriggers[fk] {
+			continue
+		}
+		select {
+		case entry.trigger <- struct{}{}:
+		default: // already pending — coalesce
 		}
 	}
 }

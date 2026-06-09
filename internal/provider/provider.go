@@ -24,6 +24,12 @@ type RawEvent struct {
 	Data            []*felt.Felt
 	FinalityStatus  string
 	Timestamp       uint64
+	// IsCatchup is true for events replayed during historical backfill/catchup
+	// (before the subscriber reaches the chain tip). Downstream consumers use
+	// it to suppress per-event side effects that only make sense for live
+	// events — e.g. reactive view re-reads, which would otherwise fire once per
+	// replayed historical event. Live (at-tip / WSS) events have it false.
+	IsCatchup bool
 }
 
 // ContractSubscription defines event subscription parameters for a contract.

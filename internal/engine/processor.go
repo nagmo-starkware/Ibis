@@ -95,6 +95,14 @@ func (e *Engine) processEvent(ctx context.Context, raw *provider.RawEvent) error
 		e.onEvent(cs.config.Name, eventDef.Name, schema.Name, raw.BlockNumber, logIndex, decoded)
 	}
 
+	// Drive reactive view re-reads. Skipped during catchup: historical events
+	// are replayed in bulk, and reactive views already read current chain state
+	// once at registration, so triggering per replayed event would be pure
+	// wasted RPC. Live events re-read so the view tracks on-chain state.
+	if e.poller != nil && !raw.IsCatchup {
+		e.poller.TriggerView(cs.config.Name, raw.ContractAddress, eventDef.Name)
+	}
+
 	// Log block progress at INFO level when we advance to a new block.
 	if raw.BlockNumber > e.lastLoggedBlock {
 		e.logger.Info("indexed block",
