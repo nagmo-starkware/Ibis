@@ -80,6 +80,52 @@ func TestResyncDynamicChildConfig_ReappliesFactoryViews(t *testing.T) {
 	}
 }
 
+// A child whose recorded FactoryName no longer carries a matching factory entry
+// (factory config relocated to a shared OptionFactory contract during migration)
+// must still resync via the child-ABI fallback.
+func TestResyncDynamicChildConfig_FallbackByChildABI(t *testing.T) {
+	newViews := []config.ViewConfig{
+		{Function: "get_strike", Refresh: &config.ViewRefreshConfig{Mode: config.RefreshModeConstant}, Table: uniqueTbl()},
+	}
+	childEvents := []config.EventConfig{{Name: "*", Table: config.TableConfig{Type: "log"}}}
+
+	e := &Engine{
+		logger: noopLogger(),
+		cfg: &config.Config{
+			Contracts: []config.ContractConfig{
+				// The migrated manager is now a bare entry (no factories block).
+				{Name: "OptionManagerETH48B", Address: "0x1", Events: childEvents},
+				// Factory config lives on the shared OptionFactory contract.
+				{Name: "OptionFactoryETH", Address: "0x2", Events: childEvents, Factories: []config.FactoryConfig{
+					{Event: "DeploymentCreated", ChildAddressField: "option_token", ChildABI: "OptionToken",
+						ChildViews: newViews, ChildEvents: childEvents, SharedTables: true},
+				}},
+			},
+		},
+	}
+
+	// Pre-migration child: name/FactoryName point at the manager, which no longer
+	// has a factory entry.
+	child := &config.ContractConfig{
+		Name:        "OptionManagerETH48B_abc",
+		Address:     "0xabc",
+		ABI:         "OptionToken",
+		FactoryName: "OptionManagerETH48B",
+		Views: []config.ViewConfig{
+			{Function: "get_underlying_reserve", Interval: "30s", Table: config.TableConfig{Type: "log"}},
+		},
+	}
+
+	e.resyncDynamicChildConfig(child)
+
+	if len(child.Views) != 1 || child.Views[0].Function != "get_strike" {
+		t.Fatalf("fallback did not re-key child to OptionFactoryETH views: %+v", child.Views)
+	}
+	if child.Views[0].Refresh == nil || child.Views[0].Refresh.ResolvedMode() != config.RefreshModeConstant {
+		t.Fatal("fallback view not constant")
+	}
+}
+
 // No matching parent factory → keep the persisted config (don't break a child
 // whose parent was removed from the YAML).
 func TestResyncDynamicChildConfig_NoParentMatchKeepsConfig(t *testing.T) {

@@ -644,41 +644,75 @@ func (e *Engine) setup(ctx context.Context) error {
 }
 
 // resyncDynamicChildConfig refreshes a reloaded factory child's Views/Events
-// from the CURRENT parent factory config in the YAML, matched by FactoryName +
-// child ABI. The child's identity (name, address, factory metadata, shared-table
-// flag) is preserved — only the polling/indexing config is re-applied, so config
-// edits (pruned views, reactive refresh, added/removed events) take effect on the
-// next restart instead of being pinned to the snapshot persisted when the child
-// was first registered. No match (e.g. parent factory entry removed) leaves the
-// persisted config untouched, so previously-indexed children keep working.
+// from the CURRENT factory config in the YAML. The child's identity (name,
+// address, factory metadata, shared-table flag) is preserved — only the
+// polling/indexing config is re-applied, so config edits (pruned views, reactive
+// refresh, added/removed events) take effect on the next restart instead of
+// being pinned to the snapshot persisted when the child was first registered.
+//
+// Matching is two-tier:
+//  1. Primary: the child's recorded FactoryName resolves to a parent contract
+//     whose factory entry has the child's ABI.
+//  2. Fallback: if that lookup fails — e.g. the factory config was relocated to
+//     a shared OptionFactory contract during a migration, so the child's stored
+//     FactoryName no longer carries a matching entry — match by child ABI across
+//     ALL factory entries. Children of a given ABI share identical view config,
+//     so the first ABI match is correct.
+//
+// No match at all leaves the persisted config untouched (back-compat).
 func (e *Engine) resyncDynamicChildConfig(dc *config.ContractConfig) {
 	if dc.FactoryName == "" {
 		return
 	}
+
+	// Primary: match by FactoryName, then child ABI.
 	for i := range e.cfg.Contracts {
-		parent := &e.cfg.Contracts[i]
-		if parent.Name != dc.FactoryName {
+		if e.cfg.Contracts[i].Name != dc.FactoryName {
 			continue
 		}
-		for j := range parent.Factories {
-			f := &parent.Factories[j]
-			if f.ChildABI != dc.ABI {
-				continue
-			}
-			dc.Views = f.ChildViews
-			dc.Events = f.ChildEvents
-			e.logger.Info("resynced dynamic child config from factory",
-				"name", dc.Name,
-				"factory", dc.FactoryName,
-				"child_abi", dc.ABI,
-				"views", len(f.ChildViews),
-				"events", len(f.ChildEvents),
-			)
+		if f := factoryEntryForABI(&e.cfg.Contracts[i], dc.ABI); f != nil {
+			e.applyChildConfig(dc, f, dc.FactoryName)
 			return
 		}
-		// Parent matched but no factory entry for this ABI — nothing to re-apply.
-		return
+		// Named parent found but no entry for this ABI — fall through to the ABI
+		// fallback rather than giving up.
+		break
 	}
+
+	// Fallback: match by child ABI across all factory entries.
+	for i := range e.cfg.Contracts {
+		if f := factoryEntryForABI(&e.cfg.Contracts[i], dc.ABI); f != nil {
+			e.applyChildConfig(dc, f, e.cfg.Contracts[i].Name+" (abi fallback)")
+			return
+		}
+	}
+	e.logger.Debug("no factory config found to resync dynamic child",
+		"name", dc.Name, "factory", dc.FactoryName, "child_abi", dc.ABI)
+}
+
+// factoryEntryForABI returns the contract's factory entry whose ChildABI matches,
+// or nil.
+func factoryEntryForABI(c *config.ContractConfig, childABI string) *config.FactoryConfig {
+	for j := range c.Factories {
+		if c.Factories[j].ChildABI == childABI {
+			return &c.Factories[j]
+		}
+	}
+	return nil
+}
+
+// applyChildConfig copies a factory entry's view/event config onto a dynamic child.
+func (e *Engine) applyChildConfig(dc *config.ContractConfig, f *config.FactoryConfig, via string) {
+	dc.Views = f.ChildViews
+	dc.Events = f.ChildEvents
+	e.logger.Info("resynced dynamic child config from factory",
+		"name", dc.Name,
+		"factory", dc.FactoryName,
+		"child_abi", dc.ABI,
+		"matched_via", via,
+		"views", len(f.ChildViews),
+		"events", len(f.ChildEvents),
+	)
 }
 
 // AllContracts returns a copy of all registered contract configs (for use by API server).
