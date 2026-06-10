@@ -540,6 +540,13 @@ func (e *Engine) setup(ctx context.Context) error {
 			dc := &dynamicContracts[i]
 			if !staticNames[dc.Name] {
 				dc.Dynamic = true
+				// Re-sync the child's view/event config from the CURRENT parent
+				// factory config in the YAML. The store holds the config snapshot
+				// captured at first registration; without this, config edits
+				// (e.g. pruned or reactive views) never reach already-registered
+				// children — they keep polling the view set from when they were
+				// first seen, forever.
+				e.resyncDynamicChildConfig(dc)
 				allContracts = append(allContracts, *dc)
 				e.logger.Info("loaded dynamic contract from store", "name", dc.Name, "address", dc.Address)
 			} else {
@@ -634,6 +641,44 @@ func (e *Engine) setup(ctx context.Context) error {
 	e.poller = vp
 
 	return nil
+}
+
+// resyncDynamicChildConfig refreshes a reloaded factory child's Views/Events
+// from the CURRENT parent factory config in the YAML, matched by FactoryName +
+// child ABI. The child's identity (name, address, factory metadata, shared-table
+// flag) is preserved — only the polling/indexing config is re-applied, so config
+// edits (pruned views, reactive refresh, added/removed events) take effect on the
+// next restart instead of being pinned to the snapshot persisted when the child
+// was first registered. No match (e.g. parent factory entry removed) leaves the
+// persisted config untouched, so previously-indexed children keep working.
+func (e *Engine) resyncDynamicChildConfig(dc *config.ContractConfig) {
+	if dc.FactoryName == "" {
+		return
+	}
+	for i := range e.cfg.Contracts {
+		parent := &e.cfg.Contracts[i]
+		if parent.Name != dc.FactoryName {
+			continue
+		}
+		for j := range parent.Factories {
+			f := &parent.Factories[j]
+			if f.ChildABI != dc.ABI {
+				continue
+			}
+			dc.Views = f.ChildViews
+			dc.Events = f.ChildEvents
+			e.logger.Info("resynced dynamic child config from factory",
+				"name", dc.Name,
+				"factory", dc.FactoryName,
+				"child_abi", dc.ABI,
+				"views", len(f.ChildViews),
+				"events", len(f.ChildEvents),
+			)
+			return
+		}
+		// Parent matched but no factory entry for this ABI — nothing to re-apply.
+		return
+	}
 }
 
 // AllContracts returns a copy of all registered contract configs (for use by API server).
