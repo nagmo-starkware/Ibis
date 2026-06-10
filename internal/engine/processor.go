@@ -103,6 +103,12 @@ func (e *Engine) processEvent(ctx context.Context, raw *provider.RawEvent) error
 		e.poller.TriggerView(cs.config.Name, raw.ContractAddress, eventDef.Name)
 	}
 
+	// Lifecycle freeze: a configured terminal event tears down this (or a
+	// foreign) contract's subscription and view polling while keeping its data.
+	// Evaluated on catchup too, so a terminal event replayed after downtime
+	// still freezes the contract instead of leaving it polling forever.
+	e.evaluateFreeze(cs.config.Name, raw.ContractAddress, eventDef.Name)
+
 	// Log block progress at INFO level when we advance to a new block.
 	if raw.BlockNumber > e.lastLoggedBlock {
 		e.logger.Info("indexed block",

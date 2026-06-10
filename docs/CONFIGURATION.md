@@ -44,8 +44,12 @@ Complete reference for `ibis.config.yaml`. This document covers every field, its
   - [factory.child_address_field](#factorychild_address_field)
   - [factory.child_abi](#factorychild_abi)
   - [factory.child_events](#factorychild_events)
+  - [factory.child_freeze](#factorychild_freeze)
   - [factory.shared_tables](#factoryshared_tables)
   - [factory.child_name_template](#factorychild_name_template)
+- [Lifecycle Freeze](#lifecycle-freeze)
+  - [freeze.on](#freezeon)
+  - [freeze.on_foreign](#freezeon_foreign)
 - [Views](#views)
   - [views[].function](#viewsfunction)
   - [views[].calldata](#viewscalldata)
@@ -416,6 +420,20 @@ Event indexing configuration. See [Events](#events) for field details.
 
 View function polling configuration. See [Views](#views) for field details.
 
+### `contracts[].freeze`
+
+| Property | Value |
+|----------|-------|
+| Type | `FreezeConfig` (pointer) |
+| Required | No |
+
+Event-driven lifecycle freeze. When a configured trigger event is observed, the
+contract is **frozen**: its event subscription (WSS/polling) and view polling are
+torn down so it consumes no further RPC, while all previously indexed data is
+retained and stays queryable. For dynamic contracts (factory children, discovered
+contracts) the frozen state is persisted, so a frozen contract is not re-subscribed
+after a restart. See [Lifecycle Freeze](#lifecycle-freeze) for fields and semantics.
+
 ### `contracts[].factory`
 
 | Property | Value |
@@ -559,6 +577,18 @@ ABI source for child contracts. Same resolution modes as `contracts[].abi`: `fet
 
 Event/table configuration template applied to each child contract. Uses the same format as `contracts[].events`.
 
+### `factory.child_freeze`
+
+| Property | Value |
+|----------|-------|
+| Type | `FreezeConfig` (pointer) |
+| Required | No |
+
+Lifecycle freeze policy applied to **each** child contract. Mirrors
+`contracts[].freeze`. Typical use: freeze an option child once it emits its
+terminal `Settled`/`Expired` event, so long-expired children stop consuming RPC
+forever while their indexed data stays queryable. See [Lifecycle Freeze](#lifecycle-freeze).
+
 ### `factory.shared_tables`
 
 | Property | Value |
@@ -600,6 +630,95 @@ factory:
       table:
         type: unique
         unique_key: contract_address
+```
+
+---
+
+## Lifecycle Freeze
+
+A **freeze** stops all ongoing RPC for a contract once it reaches a terminal
+lifecycle state, while keeping its indexed data. This matters for factory
+patterns that mint short-lived children (e.g. one option deployment per
+rotation): without a freeze, every historical child keeps a live event
+subscription and view pollers forever, so RPC cost grows without bound and is
+dominated by long-dead contracts.
+
+When a configured trigger event is observed, ibis:
+
+1. removes the contract's event subscription (closes its WSS session / stops its
+   polling loop),
+2. cancels its view-poller goroutines, and
+3. for dynamic contracts (factory children, discovered contracts), persists a
+   `frozen` flag so the contract is **not re-subscribed** on the next restart.
+
+The contract's tables and rows are left untouched and remain queryable. Freezing
+is evaluated on both live and catch-up events, so a terminal event that fired
+while the indexer was down still freezes the contract on the next start.
+
+**Startup reconciliation.** On boot, ibis also scans already-indexed event data
+and freezes any contract whose local trigger event (`on`) was recorded in a
+previous run — i.e. it fired below the contract's resume cursor and would never
+be replayed. This drains the existing backlog the first time the feature is
+enabled (e.g. options that expired before `freeze` was configured). Only local
+`on` triggers are reconciled; `on_foreign` is evaluated on live/catch-up events
+only, since a foreign event isn't tied to a single instance's lifecycle.
+
+> The trigger event should be **terminal** — no further events of interest
+> should occur after it — because freezing stops fetching the contract's
+> subsequent events.
+
+### `freeze.on`
+
+| Property | Value |
+|----------|-------|
+| Type | `[]string` |
+| Required | No |
+
+Event names on **this** contract that trigger the freeze (e.g. `[Settled]`). The
+freeze applies to the specific instance that emitted the event — the natural
+choice for per-instance lifecycles like option settlement.
+
+### `freeze.on_foreign`
+
+| Property | Value |
+|----------|-------|
+| Type | `[]ForeignTrigger` (`{contract, event}`) |
+| Required | No |
+
+Events on **other** tracked contracts that trigger the freeze. A foreign trigger
+freezes every contract that declares it, so it is best for 1:1 relationships or
+static targets; for per-instance freezing prefer a local `on` event the instance
+emits.
+
+```yaml
+# Static contract: freeze when it emits its own terminal event.
+contracts:
+  - name: OptionToken
+    address: "0x…"
+    abi: OptionToken
+    events:
+      - name: "*"
+        table: { type: log }
+    freeze:
+      on: [Settled]
+
+# Factory children: freeze each child once it settles.
+  - name: OptionFactory
+    address: "0x…"
+    abi: OptionFactory
+    events:
+      - name: "*"
+        table: { type: log }
+    factories:
+      - event: DeploymentCreated
+        child_address_field: option_token
+        child_abi: OptionToken
+        shared_tables: true
+        child_events:
+          - name: "*"
+            table: { type: log }
+        child_freeze:
+          on: [Settled]
 ```
 
 ---
