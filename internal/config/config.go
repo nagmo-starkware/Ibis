@@ -97,6 +97,59 @@ type ContractConfig struct {
 
 	// DiscoverClassHash is set on contracts discovered via class hash watching (3.9).
 	DiscoverClassHash string `yaml:"-" json:"discover_class_hash,omitempty"`
+
+	// Freeze declares an event-driven lifecycle freeze for this contract. When a
+	// configured trigger event is observed, the contract is frozen: its event
+	// subscription and view polling are torn down, but all indexed data is
+	// retained and stays queryable. See FreezeConfig.
+	Freeze *FreezeConfig `yaml:"freeze,omitempty" json:"freeze,omitempty"`
+
+	// Frozen is runtime state (not user-authored): true once a freeze trigger
+	// has fired. Persisted with the dynamic-contract record so a frozen contract
+	// stays frozen across restarts and is never re-subscribed on rehydration.
+	Frozen bool `yaml:"-" json:"frozen,omitempty"`
+}
+
+// FreezeConfig declares an event-driven lifecycle "freeze". When one of the
+// named trigger events is observed, the owning contract is frozen: its event
+// subscription (WSS or polling) and its view polling are torn down, but all
+// previously indexed data is retained and remains queryable. The frozen state
+// is persisted, so a frozen dynamic contract (e.g. a factory child) stays
+// frozen across restarts and is never re-subscribed during rehydration.
+//
+// The trigger event must be terminal for the contract — no further events of
+// interest should occur after it — because freezing stops fetching the
+// contract's subsequent events.
+type FreezeConfig struct {
+	// On lists event names on THIS contract that trigger the freeze
+	// (e.g. an option token's Settled/Expired event).
+	On []string `yaml:"on,omitempty" json:"on,omitempty"`
+
+	// OnForeign lists (contract, event) pairs on OTHER tracked contracts that
+	// trigger the freeze. A foreign trigger freezes every contract that declares
+	// it, so it is best used for 1:1 relationships or static targets; for
+	// per-instance freezing prefer a local event the instance itself emits.
+	OnForeign []ForeignTrigger `yaml:"on_foreign,omitempty" json:"on_foreign,omitempty"`
+
+	// OnSibling triggers a PER-INSTANCE freeze off an event emitted by a sibling
+	// contract identified through this contract's factory_meta. Unlike OnForeign
+	// (which matches by contract name and so fires for every instance), a sibling
+	// trigger freezes only the contract whose factory_meta[MetaField] equals the
+	// emitting address — so e.g. an OptionToken's Settled freezes exactly the
+	// OrderBook/Exerciser deployed alongside it (they each carry the option
+	// token's address in factory_meta), not every order book.
+	OnSibling []SiblingTrigger `yaml:"on_sibling,omitempty" json:"on_sibling,omitempty"`
+}
+
+// SiblingTrigger freezes a contract when Event fires on the contract whose
+// address is stored in this contract's factory_meta[MetaField]. Used for
+// per-deployment cross-child freezes (the children of one DeploymentCreated
+// each hold their siblings' addresses in factory_meta).
+type SiblingTrigger struct {
+	// Event is the event name on the sibling that triggers the freeze.
+	Event string `yaml:"event" json:"event"`
+	// MetaField is the factory_meta key holding the sibling's address.
+	MetaField string `yaml:"meta_field" json:"meta_field"`
 }
 
 // FactoryConfig defines factory contract indexing settings.
@@ -116,6 +169,11 @@ type FactoryConfig struct {
 	// ChildViews defines view functions to poll on each auto-discovered child contract.
 	// Mirrors the semantics of the static contracts:.views field.
 	ChildViews []ViewConfig `yaml:"child_views,omitempty" json:"child_views,omitempty"`
+
+	// ChildFreeze is the freeze policy applied to each factory child. Mirrors
+	// ContractConfig.Freeze — e.g. freeze an option child once it emits Settled,
+	// so expired options stop consuming RPC while their data stays queryable.
+	ChildFreeze *FreezeConfig `yaml:"child_freeze,omitempty" json:"child_freeze,omitempty"`
 
 	// SharedTables enables shared tables for all factory children (see task 3.11).
 	SharedTables bool `yaml:"shared_tables" json:"shared_tables"`

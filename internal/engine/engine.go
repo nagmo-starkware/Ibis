@@ -373,6 +373,11 @@ func (e *Engine) DeregisterContract(ctx context.Context, name string, dropTables
 		e.subscriber.RemoveContract(found.address.String())
 	}
 
+	// Stop view polling for this contract.
+	if e.poller != nil {
+		e.poller.RemoveContract(name)
+	}
+
 	// Drop tables if requested (skip shared tables — other children still use them).
 	if dropTables {
 		for _, sch := range found.schemas {
@@ -405,6 +410,258 @@ func (e *Engine) DeregisterContract(ctx context.Context, name string, dropTables
 
 	e.logger.Info("deregistered contract", "name", name, "drop_tables", dropTables)
 	return nil
+}
+
+// FreezeContract tears down a contract's event subscription and view polling
+// while retaining all indexed data: the contract stays in e.contracts so its
+// tables remain queryable. For dynamic (factory/discovered) contracts the
+// frozen flag is persisted, so the contract is not re-subscribed on the next
+// restart. Idempotent — a no-op if the contract is already frozen or unknown.
+func (e *Engine) FreezeContract(ctx context.Context, name string) error {
+	e.mu.Lock()
+	var found *contractState
+	for _, cs := range e.contracts {
+		if cs.config.Name == name {
+			found = cs
+			break
+		}
+	}
+	if found == nil {
+		e.mu.Unlock()
+		return fmt.Errorf("contract %q not found", name)
+	}
+	if found.config.Frozen {
+		e.mu.Unlock()
+		return nil
+	}
+	found.config.Frozen = true
+	addr := found.address.String()
+	dynamic := found.config.Dynamic
+	ccCopy := found.config
+	e.mu.Unlock()
+
+	// Stop the event subscription (closes WSS / stops the polling goroutine).
+	if e.subscriber != nil {
+		e.subscriber.RemoveContract(addr)
+	}
+	// Stop view polling for this contract.
+	if e.poller != nil {
+		e.poller.RemoveContract(name)
+	}
+
+	// Persist the frozen flag so rehydration skips re-subscribing. Only dynamic
+	// contracts live in the store; a frozen static contract reverts to its
+	// (unfrozen) config on restart.
+	if dynamic {
+		if err := e.store.SaveDynamicContract(ctx, &ccCopy); err != nil {
+			e.logger.Error("failed to persist frozen state", "contract", name, "error", err)
+		}
+	} else {
+		e.logger.Warn("froze a static (config) contract; freeze will not persist across restart", "contract", name)
+	}
+
+	e.logger.Info("froze contract (lifecycle)", "contract", name, "address", addr)
+	return nil
+}
+
+// evaluateFreeze checks whether an observed event triggers a lifecycle freeze
+// on any tracked contract, and freezes every match. A freeze fires when either
+// (a) the event is in the emitting contract's own Freeze.On set (per-instance),
+// or (b) another contract declares this (emitter, event) pair in
+// Freeze.OnForeign. Safe to call on both catchup and live events: freezing a
+// contract whose terminal event is replayed during catchup (e.g. an option that
+// settled while the indexer was down) stops it from re-subscribing.
+func (e *Engine) evaluateFreeze(emitterName string, emitterAddr *felt.Felt, eventName string) {
+	// fk is computed lazily — only when a contract actually declares a foreign
+	// trigger — so the common (no freeze configured) path stays allocation-free
+	// even on the high-volume catchup hot path.
+	var fk string
+	var fkComputed bool
+
+	var targets []string
+	e.mu.RLock()
+	for _, cs := range e.contracts {
+		if cs.config.Frozen || cs.config.Freeze == nil {
+			continue
+		}
+		local := emitterAddr != nil && cs.address != nil &&
+			cs.address.Equal(emitterAddr) && containsString(cs.config.Freeze.On, eventName)
+		foreign := false
+		if len(cs.config.Freeze.OnForeign) > 0 {
+			if !fkComputed {
+				fk = foreignKey(emitterName, eventName)
+				fkComputed = true
+			}
+			for _, f := range cs.config.Freeze.OnForeign {
+				if foreignKey(f.Contract, f.Event) == fk {
+					foreign = true
+					break
+				}
+			}
+		}
+		// Sibling: per-instance trigger off a deployment sibling. Freeze only if
+		// the emitter is the address this contract records in factory_meta — so
+		// e.g. an OptionToken's Settled freezes just its own OrderBook/Exerciser.
+		sibling := false
+		for _, st := range cs.config.Freeze.OnSibling {
+			if st.Event == eventName && metaAddrEquals(cs.config.FactoryMeta[st.MetaField], emitterAddr) {
+				sibling = true
+				break
+			}
+		}
+		if local || foreign || sibling {
+			targets = append(targets, cs.config.Name)
+		}
+	}
+	e.mu.RUnlock()
+
+	for _, name := range targets {
+		if err := e.FreezeContract(e.runCtx, name); err != nil {
+			e.logger.Error("failed to freeze contract", "contract", name, "error", err)
+		}
+	}
+}
+
+// reconcileFrozenContracts freezes, at startup, any contract whose local freeze
+// trigger event was already indexed in a previous run. Those events sit below
+// the contract's resume cursor and would never be replayed, so the live/catchup
+// freeze path can't catch them — this one-time scan over the already-indexed
+// event tables drains the existing backlog (e.g. options that expired before the
+// freeze feature existed).
+//
+// Only local triggers (Freeze.On) are reconciled: a local terminal event is an
+// unambiguous per-instance lifecycle signal. Foreign triggers (Freeze.OnForeign)
+// are deliberately skipped — a foreign event isn't tied to one instance's
+// lifecycle, so "it already happened" can't be interpreted per-contract here.
+// Must be called from setup() before the subscriber and view poller start, so it
+// only sets the persisted Frozen flag (no live teardown is needed).
+func (e *Engine) reconcileFrozenContracts(ctx context.Context) {
+	frozen := 0
+	for _, cs := range e.contracts {
+		if cs.config.Frozen || cs.config.Freeze == nil {
+			continue
+		}
+		if len(cs.config.Freeze.On) == 0 && len(cs.config.Freeze.OnSibling) == 0 {
+			continue
+		}
+
+		triggered := false
+		for _, evName := range cs.config.Freeze.On {
+			sch, ok := cs.schemas[evName]
+			if !ok || sch == nil {
+				// Event not in this contract's ABI / not indexed — can't reconcile it.
+				continue
+			}
+
+			var filters []store.Filter
+			if sch.SharedTable {
+				// Shared event table holds rows for many children; scope to this one.
+				filters = []store.Filter{{Field: "contract_address", Operator: "eq", Value: cs.address.String()}}
+			}
+
+			count, err := e.store.CountEvents(ctx, sch.Name, filters)
+			if err != nil {
+				e.logger.Warn("freeze reconcile: count failed",
+					"contract", cs.config.Name, "event", evName, "table", sch.Name, "error", err)
+				continue
+			}
+			if count > 0 {
+				triggered = true
+				break
+			}
+		}
+		// Sibling triggers: freeze if the deployment sibling identified via
+		// factory_meta already emitted its terminal event in a prior run (e.g.
+		// an OrderBook/Exerciser whose OptionToken settled before this restart).
+		if !triggered {
+			for _, st := range cs.config.Freeze.OnSibling {
+				if e.siblingEventAlreadyIndexed(ctx, cs, st) {
+					triggered = true
+					break
+				}
+			}
+		}
+		if !triggered {
+			continue
+		}
+
+		cs.config.Frozen = true
+		frozen++
+		if cs.config.Dynamic {
+			if err := e.store.SaveDynamicContract(ctx, &cs.config); err != nil {
+				e.logger.Error("freeze reconcile: persist failed", "contract", cs.config.Name, "error", err)
+			}
+		}
+		e.logger.Info("froze contract on startup reconcile (terminal event already indexed)",
+			"contract", cs.config.Name, "address", cs.config.Address)
+	}
+	if frozen > 0 {
+		e.logger.Info("freeze reconcile complete", "frozen", frozen, "contracts", len(e.contracts))
+	}
+}
+
+// siblingEventAlreadyIndexed reports whether the deployment sibling that cs
+// references via factory_meta[st.MetaField] has already emitted st.Event in the
+// indexed data. Used by startup reconcile to freeze a child (e.g. OrderBook /
+// Exerciser) whose sibling OptionToken settled in a prior run.
+func (e *Engine) siblingEventAlreadyIndexed(ctx context.Context, cs *contractState, st config.SiblingTrigger) bool {
+	metaVal := cs.config.FactoryMeta[st.MetaField]
+	if metaVal == nil {
+		return false
+	}
+	siblingAddr, err := new(felt.Felt).SetString(fmt.Sprintf("%v", metaVal))
+	if err != nil {
+		return false
+	}
+	var sib *contractState
+	for _, c := range e.contracts {
+		if c.address != nil && c.address.Equal(siblingAddr) {
+			sib = c
+			break
+		}
+	}
+	if sib == nil {
+		return false
+	}
+	sch, ok := sib.schemas[st.Event]
+	if !ok || sch == nil {
+		return false
+	}
+	var filters []store.Filter
+	if sch.SharedTable {
+		filters = []store.Filter{{Field: "contract_address", Operator: "eq", Value: sib.address.String()}}
+	}
+	count, err := e.store.CountEvents(ctx, sch.Name, filters)
+	if err != nil {
+		e.logger.Warn("freeze reconcile: sibling count failed",
+			"contract", cs.config.Name, "sibling_event", st.Event, "table", sch.Name, "error", err)
+		return false
+	}
+	return count > 0
+}
+
+// containsString reports whether v is present in s.
+func containsString(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// metaAddrEquals reports whether a factory_meta value (a decoded address, held
+// as a string or *felt.Felt) equals addr. Used to match a sibling-freeze
+// trigger's recorded address against an emitting contract's address.
+func metaAddrEquals(metaVal any, addr *felt.Felt) bool {
+	if metaVal == nil || addr == nil {
+		return false
+	}
+	f, err := new(felt.Felt).SetString(fmt.Sprintf("%v", metaVal))
+	if err != nil {
+		return false
+	}
+	return f.Equal(addr)
 }
 
 // UpdateContract updates a registered contract's config (e.g., add new events).
@@ -540,6 +797,13 @@ func (e *Engine) setup(ctx context.Context) error {
 			dc := &dynamicContracts[i]
 			if !staticNames[dc.Name] {
 				dc.Dynamic = true
+				// Re-sync the child's view/event config from the CURRENT parent
+				// factory config in the YAML. The store holds the config snapshot
+				// captured at first registration; without this, config edits
+				// (e.g. pruned or reactive views) never reach already-registered
+				// children — they keep polling the view set from when they were
+				// first seen, forever.
+				e.resyncDynamicChildConfig(dc)
 				allContracts = append(allContracts, *dc)
 				e.logger.Info("loaded dynamic contract from store", "name", dc.Name, "address", dc.Address)
 			} else {
@@ -601,6 +865,12 @@ func (e *Engine) setup(ctx context.Context) error {
 		}
 	}
 
+	// Reconcile contracts whose terminal freeze event was already indexed in a
+	// previous run (cursor now past it, so it will never be replayed). Must run
+	// before the view poller and subscriptions are built so frozen contracts are
+	// skipped by both. Event tables exist by now (created in the loop above).
+	e.reconcileFrozenContracts(ctx)
+
 	// Set up view function poller for contracts with views configured.
 	vp := NewViewPoller(e.provider, e.store, e.logger)
 	viewSchemas, err := vp.Setup(e.contracts)
@@ -634,6 +904,84 @@ func (e *Engine) setup(ctx context.Context) error {
 	e.poller = vp
 
 	return nil
+}
+
+// resyncDynamicChildConfig refreshes a reloaded factory child's Views/Events
+// from the CURRENT factory config in the YAML. The child's identity (name,
+// address, factory metadata, shared-table flag) is preserved — only the
+// polling/indexing config is re-applied, so config edits (pruned views, reactive
+// refresh, added/removed events) take effect on the next restart instead of
+// being pinned to the snapshot persisted when the child was first registered.
+//
+// Matching is two-tier:
+//  1. Primary: the child's recorded FactoryName resolves to a parent contract
+//     whose factory entry has the child's ABI.
+//  2. Fallback: if that lookup fails — e.g. the factory config was relocated to
+//     a shared OptionFactory contract during a migration, so the child's stored
+//     FactoryName no longer carries a matching entry — match by child ABI across
+//     ALL factory entries. Children of a given ABI share identical view config,
+//     so the first ABI match is correct.
+//
+// No match at all leaves the persisted config untouched (back-compat).
+func (e *Engine) resyncDynamicChildConfig(dc *config.ContractConfig) {
+	if dc.FactoryName == "" {
+		return
+	}
+
+	// Primary: match by FactoryName, then child ABI.
+	for i := range e.cfg.Contracts {
+		if e.cfg.Contracts[i].Name != dc.FactoryName {
+			continue
+		}
+		if f := factoryEntryForABI(&e.cfg.Contracts[i], dc.ABI); f != nil {
+			e.applyChildConfig(dc, f, dc.FactoryName)
+			return
+		}
+		// Named parent found but no entry for this ABI — fall through to the ABI
+		// fallback rather than giving up.
+		break
+	}
+
+	// Fallback: match by child ABI across all factory entries.
+	for i := range e.cfg.Contracts {
+		if f := factoryEntryForABI(&e.cfg.Contracts[i], dc.ABI); f != nil {
+			e.applyChildConfig(dc, f, e.cfg.Contracts[i].Name+" (abi fallback)")
+			return
+		}
+	}
+	e.logger.Debug("no factory config found to resync dynamic child",
+		"name", dc.Name, "factory", dc.FactoryName, "child_abi", dc.ABI)
+}
+
+// factoryEntryForABI returns the contract's factory entry whose ChildABI matches,
+// or nil.
+func factoryEntryForABI(c *config.ContractConfig, childABI string) *config.FactoryConfig {
+	for j := range c.Factories {
+		if c.Factories[j].ChildABI == childABI {
+			return &c.Factories[j]
+		}
+	}
+	return nil
+}
+
+// applyChildConfig copies a factory entry's view/event config onto a dynamic child.
+func (e *Engine) applyChildConfig(dc *config.ContractConfig, f *config.FactoryConfig, via string) {
+	dc.Views = f.ChildViews
+	dc.Events = f.ChildEvents
+	// Propagate the current freeze policy too, so freeze config added after a
+	// child was first registered takes effect on the next restart (the live
+	// freeze path and startup reconcile both key off dc.Freeze). A child already
+	// Frozen stays frozen regardless.
+	dc.Freeze = f.ChildFreeze
+	e.logger.Info("resynced dynamic child config from factory",
+		"name", dc.Name,
+		"factory", dc.FactoryName,
+		"child_abi", dc.ABI,
+		"matched_via", via,
+		"views", len(f.ChildViews),
+		"events", len(f.ChildEvents),
+		"freeze", f.ChildFreeze != nil,
+	)
 }
 
 // AllContracts returns a copy of all registered contract configs (for use by API server).
@@ -728,6 +1076,13 @@ func derefUint64(p *uint64) uint64 {
 func (e *Engine) buildSubscriptions(startBlocks map[string]uint64) []provider.ContractSubscription {
 	subs := make([]provider.ContractSubscription, 0, len(e.contracts))
 	for _, cs := range e.contracts {
+		// Frozen contracts keep their indexed data but are never re-subscribed:
+		// no event subscription, no view polling. This is what makes a freeze
+		// survive restarts (the Frozen flag is persisted with the contract).
+		if cs.config.Frozen {
+			e.logger.Info("skipping subscription for frozen contract", "contract", cs.config.Name)
+			continue
+		}
 		sub := provider.ContractSubscription{
 			Address:    cs.address,
 			StartBlock: startBlocks[cs.config.Name],

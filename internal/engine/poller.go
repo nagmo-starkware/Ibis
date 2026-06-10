@@ -63,6 +63,11 @@ type viewEntry struct {
 	maxInterval     time.Duration   // reactive: optional staleness ceiling (0 = none)
 	trigger         chan struct{}   // reactive: buffered(1) re-read signal
 
+	// cancel stops this entry's polling goroutine. Assigned when the goroutine
+	// is spawned (Run/AddContract) and invoked by RemoveContract when the
+	// contract is frozen or deregistered. Guarded by ViewPoller.mu.
+	cancel context.CancelFunc
+
 	// Skip-if-busy: prevents overlapping polls for the same function.
 	busy sync.Mutex
 
@@ -74,6 +79,20 @@ type viewEntry struct {
 	pollIndex       uint64
 }
 
+// maxConcurrentPolls bounds how many view starknet_calls run at once across ALL
+// view goroutines. On a large deployment (thousands of factory children) every
+// view fires an initial poll at startup; without a cap they hit the RPC provider
+// simultaneously and trip its concurrent-request limit (HTTP 429). The semaphore
+// turns that thundering herd into a steady, bounded stream.
+const maxConcurrentPolls = 16
+
+// maxInitialPollAttempts bounds the retry of a view's FIRST read. Reactive/constant
+// views are read once (then event-driven / never again), so a transient RPC failure
+// on that one read would otherwise leave the view empty until the next restart. We
+// retry with capped backoff up to this many attempts, then give up (NOT an infinite
+// loop) — the next event or restart re-attempts.
+const maxInitialPollAttempts = 12
+
 // ViewPoller manages periodic starknet_call polling for view functions.
 type ViewPoller struct {
 	mu       sync.Mutex // protects entries for concurrent AddContract calls
@@ -82,6 +101,9 @@ type ViewPoller struct {
 	store    store.Store
 	logger   *slog.Logger
 	onEvent  func(contract, event, table string, blockNumber, logIndex uint64, data map[string]any)
+
+	// sem bounds concurrent starknet_calls across all view goroutines.
+	sem chan struct{}
 
 	// Reorg notification: close-and-recreate pattern to broadcast to all goroutines.
 	reorgMu sync.Mutex
@@ -95,6 +117,7 @@ func NewViewPoller(prov viewPollerProvider, st store.Store, logger *slog.Logger)
 		store:    st,
 		logger:   logger.With("component", "view_poller"),
 		reorgCh:  make(chan struct{}),
+		sem:      make(chan struct{}, maxConcurrentPolls),
 	}
 }
 
@@ -109,6 +132,10 @@ func (vp *ViewPoller) Setup(contracts []*contractState) ([]*types.TableSchema, e
 	var schemas []*types.TableSchema
 
 	for _, cs := range contracts {
+		// Frozen contracts retain their data but do no further polling.
+		if cs.config.Frozen {
+			continue
+		}
 		if len(cs.config.Views) == 0 {
 			continue
 		}
@@ -266,19 +293,28 @@ func (vp *ViewPoller) Status() []ViewStatus {
 // Run starts polling goroutines for all registered view functions.
 // Blocks until ctx is canceled.
 func (vp *ViewPoller) Run(ctx context.Context) {
+	vp.mu.Lock()
 	if len(vp.entries) == 0 {
+		vp.mu.Unlock()
 		return
 	}
 
 	var wg sync.WaitGroup
 	for _, entry := range vp.entries {
+		// Per-entry context so RemoveContract can stop one contract's views
+		// (on freeze/deregister) without tearing down the whole poller.
+		entryCtx, entryCancel := context.WithCancel(ctx)
+		entry.cancel = entryCancel
 		wg.Add(1)
-		go func(e *viewEntry) {
+		go func(e *viewEntry, c context.Context) {
 			defer wg.Done()
-			vp.runView(ctx, e)
-		}(entry)
+			vp.runView(c, e)
+		}(entry, entryCtx)
 	}
-	vp.logger.Info("view poller started", "views", len(vp.entries))
+	n := len(vp.entries)
+	vp.mu.Unlock()
+
+	vp.logger.Info("view poller started", "views", n)
 	wg.Wait()
 	vp.logger.Info("view poller stopped")
 }
@@ -344,31 +380,50 @@ func (vp *ViewPoller) runInterval(ctx context.Context, entry *viewEntry) {
 	}
 }
 
-// runConstant reads a deploy-time-immutable view exactly once, at registration.
-// It retries with capped exponential backoff until the first successful read,
-// then exits — the value can never change on-chain, so no further polling is
-// scheduled and the contract costs zero ongoing RPC.
-func (vp *ViewPoller) runConstant(ctx context.Context, entry *viewEntry) {
+// pollUntilSuccess performs a view's initial read, retrying with capped
+// exponential backoff up to maxInitialPollAttempts. Returns true once a poll
+// succeeds. This is BOUNDED — it never loops forever: on exhaustion it logs and
+// returns false, leaving the view to be (re)populated by a later event or the
+// next restart. Used for the one-shot initial read of constant/reactive views,
+// so a transient RPC failure (e.g. a 429 during the startup wave) doesn't leave
+// the view empty with no recovery path.
+func (vp *ViewPoller) pollUntilSuccess(ctx context.Context, entry *viewEntry) bool {
 	backoff := time.Second
-	for {
+	for attempt := 1; attempt <= maxInitialPollAttempts; attempt++ {
 		vp.poll(ctx, entry)
 
 		entry.statusMu.Lock()
 		ok := entry.consecutiveErrs == 0 && !entry.lastPollTime.IsZero()
 		entry.statusMu.Unlock()
 		if ok {
-			return
+			return true
+		}
+		if attempt == maxInitialPollAttempts {
+			break
 		}
 
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < 60*time.Second {
 			backoff *= 2
 		}
 	}
+	vp.logger.Warn("initial view poll did not succeed after retries; relying on events / next restart",
+		"function", entry.functionDef.Name,
+		"contract", entry.contractName,
+		"attempts", maxInitialPollAttempts,
+	)
+	return false
+}
+
+// runConstant reads a deploy-time-immutable view exactly once, at registration
+// (with bounded retry), then exits — the value can never change on-chain, so no
+// further polling is scheduled and the contract costs zero ongoing RPC.
+func (vp *ViewPoller) runConstant(ctx context.Context, entry *viewEntry) {
+	vp.pollUntilSuccess(ctx, entry)
 }
 
 // runReactive reads a view once at registration (capturing current chain state
@@ -379,8 +434,11 @@ func (vp *ViewPoller) runConstant(ctx context.Context, entry *viewEntry) {
 // produces at most one extra RPC call.
 func (vp *ViewPoller) runReactive(ctx context.Context, entry *viewEntry) {
 	// Initial read at registration: current state via BlockTagLatest, so the
-	// view is populated immediately without waiting for any event.
-	vp.poll(ctx, entry)
+	// view is populated immediately without waiting for any event. Bounded retry
+	// so a transient RPC failure (e.g. a 429 in the startup wave) doesn't leave
+	// the view empty until the next matching event — important for views like
+	// get_active_deployment that drive market discovery and rarely re-fire.
+	vp.pollUntilSuccess(ctx, entry)
 	lastPoll := time.Now()
 
 	var (
@@ -487,6 +545,17 @@ func (vp *ViewPoller) poll(ctx context.Context, entry *viewEntry) {
 		return
 	}
 	defer entry.busy.Unlock()
+
+	// Bound global concurrency: at most maxConcurrentPolls starknet_calls run at
+	// once across all view goroutines, so a startup wave of initial polls doesn't
+	// trip the RPC provider's concurrent-request limit (429). Respect ctx so a
+	// shutdown doesn't block on a full semaphore.
+	select {
+	case vp.sem <- struct{}{}:
+		defer func() { <-vp.sem }()
+	case <-ctx.Done():
+		return
+	}
 
 	// Get current block number to anchor the poll.
 	blockNumber, err := vp.provider.BlockNumber(ctx)
@@ -616,6 +685,35 @@ func (vp *ViewPoller) HasEntries() bool {
 	return len(vp.entries) > 0
 }
 
+// RemoveContract stops all view polling for the named contract and drops its
+// entries. Used when a contract is frozen (lifecycle) or deregistered (reorg).
+// Each removed entry's goroutine is canceled via its per-entry context; the
+// underlying tables and data are left untouched. Returns the number of view
+// entries removed.
+func (vp *ViewPoller) RemoveContract(contractName string) int {
+	vp.mu.Lock()
+	defer vp.mu.Unlock()
+
+	kept := vp.entries[:0]
+	removed := 0
+	for _, e := range vp.entries {
+		if e.contractName == contractName {
+			if e.cancel != nil {
+				e.cancel()
+			}
+			removed++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	vp.entries = kept
+
+	if removed > 0 {
+		vp.logger.Info("removed view entries", "contract", contractName, "count", removed)
+	}
+	return removed
+}
+
 // AddContract dynamically adds view functions for a contract that was registered
 // after engine startup (e.g., via discovery or admin API). It builds view entries,
 // creates tables in the store, spawns per-function polling goroutines, and returns
@@ -644,16 +742,23 @@ func (vp *ViewPoller) AddContract(ctx context.Context, cs *contractState) ([]*ty
 		)
 	}
 
-	// Append entries under lock.
+	// Append entries and assign per-entry cancel contexts under lock so a later
+	// RemoveContract (freeze/deregister) can stop them individually.
+	entryCtxs := make([]context.Context, len(newEntries))
 	vp.mu.Lock()
+	for i, entry := range newEntries {
+		entryCtx, entryCancel := context.WithCancel(ctx)
+		entry.cancel = entryCancel
+		entryCtxs[i] = entryCtx
+	}
 	vp.entries = append(vp.entries, newEntries...)
 	vp.mu.Unlock()
 
-	// Spawn per-function polling goroutines using the provided context.
-	for _, entry := range newEntries {
-		go func(e *viewEntry) {
-			vp.runView(ctx, e)
-		}(entry)
+	// Spawn per-function polling goroutines using each entry's context.
+	for i, entry := range newEntries {
+		go func(e *viewEntry, c context.Context) {
+			vp.runView(c, e)
+		}(entry, entryCtxs[i])
 	}
 
 	return schemas, nil
