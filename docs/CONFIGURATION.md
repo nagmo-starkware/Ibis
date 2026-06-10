@@ -655,6 +655,14 @@ The contract's tables and rows are left untouched and remain queryable. Freezing
 is evaluated on both live and catch-up events, so a terminal event that fired
 while the indexer was down still freezes the contract on the next start.
 
+**Startup reconciliation.** On boot, ibis also scans already-indexed event data
+and freezes any contract whose local trigger event (`on`) was recorded in a
+previous run — i.e. it fired below the contract's resume cursor and would never
+be replayed. This drains the existing backlog the first time the feature is
+enabled (e.g. options that expired before `freeze` was configured). Only local
+`on` triggers are reconciled; `on_foreign` is evaluated on live/catch-up events
+only, since a foreign event isn't tied to a single instance's lifecycle.
+
 > The trigger event should be **terminal** — no further events of interest
 > should occur after it — because freezing stops fetching the contract's
 > subsequent events.

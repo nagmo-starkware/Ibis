@@ -11,6 +11,7 @@ import (
 	"github.com/b-j-roberts/ibis/internal/config"
 	"github.com/b-j-roberts/ibis/internal/store"
 	"github.com/b-j-roberts/ibis/internal/store/memory"
+	"github.com/b-j-roberts/ibis/internal/types"
 )
 
 // TestViewPoller_RemoveContract_StopsPolling verifies that RemoveContract
@@ -190,6 +191,103 @@ func TestEngine_EvaluateFreeze_ForeignEvent(t *testing.T) {
 
 	if !cs.config.Frozen {
 		t.Fatal("contract did not freeze on its declared foreign trigger")
+	}
+}
+
+// TestEngine_ReconcileFrozenContracts_SharedTable verifies the startup
+// reconciliation: a child whose terminal event was already indexed (in a
+// previous run, now below its cursor) is frozen on boot, scoped per-instance via
+// contract_address; a sibling without that event stays active.
+func TestEngine_ReconcileFrozenContracts_SharedTable(t *testing.T) {
+	st := memory.New()
+	ctx := context.Background()
+
+	settled := testEventDef("Settled")
+	const sharedTable = "optionfactory_Settled"
+	mkSchema := func() *types.TableSchema {
+		return &types.TableSchema{
+			Name:        sharedTable,
+			Contract:    "OptionFactory",
+			Event:       "Settled",
+			TableType:   types.TableTypeLog,
+			SharedTable: true,
+			Columns: []types.Column{
+				{Name: "block_number", Type: "uint64"},
+				{Name: "log_index", Type: "uint64"},
+				{Name: "timestamp", Type: "uint64"},
+				{Name: "contract_address", Type: "string"},
+				{Name: "contract_name", Type: "string"},
+				{Name: "event_name", Type: "string"},
+			},
+		}
+	}
+	if err := st.CreateTable(ctx, mkSchema()); err != nil {
+		t.Fatal(err)
+	}
+
+	addrA := new(felt.Felt).SetUint64(0xA11CE)
+	addrB := new(felt.Felt).SetUint64(0xB0B)
+
+	// Only child A has an already-indexed Settled row.
+	op := store.Operation{
+		Type:  store.OpInsert,
+		Table: sharedTable,
+		Key:   "50:0",
+		Data: map[string]any{
+			"block_number":     uint64(50),
+			"log_index":        uint64(0),
+			"contract_address": addrA.String(),
+			"contract_name":    "child_a",
+			"event_name":       "Settled",
+		},
+		BlockNumber: 50,
+	}
+	if err := st.ApplyOperations(ctx, []store.Operation{op}); err != nil {
+		t.Fatal(err)
+	}
+
+	mkCS := func(name string, addr *felt.Felt) *contractState {
+		return &contractState{
+			config: config.ContractConfig{
+				Name:    name,
+				Address: addr.String(),
+				Dynamic: true,
+				Freeze:  &config.FreezeConfig{On: []string{"Settled"}},
+			},
+			address: addr,
+			abi:     &abi.ABI{Types: map[string]*abi.TypeDef{}, Events: []*abi.EventDef{settled}},
+			schemas: map[string]*types.TableSchema{"Settled": mkSchema()},
+		}
+	}
+	csA := mkCS("child_a", addrA)
+	csB := mkCS("child_b", addrB)
+
+	e := &Engine{store: st, logger: noopLogger(), contracts: []*contractState{csA, csB}}
+	e.reconcileFrozenContracts(ctx)
+
+	if !csA.config.Frozen {
+		t.Error("child_a should be frozen — its Settled event is already indexed")
+	}
+	if csB.config.Frozen {
+		t.Error("child_b should NOT be frozen — no Settled event indexed for it")
+	}
+
+	// The frozen child is persisted so the next restart keeps it frozen.
+	saved, err := st.GetDynamicContracts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozenPersisted bool
+	for i := range saved {
+		if saved[i].Name == "child_a" && saved[i].Frozen {
+			frozenPersisted = true
+		}
+		if saved[i].Name == "child_b" {
+			t.Error("child_b should not have been persisted as frozen")
+		}
+	}
+	if !frozenPersisted {
+		t.Error("child_a frozen state was not persisted")
 	}
 }
 

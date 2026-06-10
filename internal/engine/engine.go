@@ -512,6 +512,70 @@ func (e *Engine) evaluateFreeze(emitterName string, emitterAddr *felt.Felt, even
 	}
 }
 
+// reconcileFrozenContracts freezes, at startup, any contract whose local freeze
+// trigger event was already indexed in a previous run. Those events sit below
+// the contract's resume cursor and would never be replayed, so the live/catchup
+// freeze path can't catch them — this one-time scan over the already-indexed
+// event tables drains the existing backlog (e.g. options that expired before the
+// freeze feature existed).
+//
+// Only local triggers (Freeze.On) are reconciled: a local terminal event is an
+// unambiguous per-instance lifecycle signal. Foreign triggers (Freeze.OnForeign)
+// are deliberately skipped — a foreign event isn't tied to one instance's
+// lifecycle, so "it already happened" can't be interpreted per-contract here.
+// Must be called from setup() before the subscriber and view poller start, so it
+// only sets the persisted Frozen flag (no live teardown is needed).
+func (e *Engine) reconcileFrozenContracts(ctx context.Context) {
+	frozen := 0
+	for _, cs := range e.contracts {
+		if cs.config.Frozen || cs.config.Freeze == nil || len(cs.config.Freeze.On) == 0 {
+			continue
+		}
+
+		triggered := false
+		for _, evName := range cs.config.Freeze.On {
+			sch, ok := cs.schemas[evName]
+			if !ok || sch == nil {
+				// Event not in this contract's ABI / not indexed — can't reconcile it.
+				continue
+			}
+
+			var filters []store.Filter
+			if sch.SharedTable {
+				// Shared event table holds rows for many children; scope to this one.
+				filters = []store.Filter{{Field: "contract_address", Operator: "eq", Value: cs.address.String()}}
+			}
+
+			count, err := e.store.CountEvents(ctx, sch.Name, filters)
+			if err != nil {
+				e.logger.Warn("freeze reconcile: count failed",
+					"contract", cs.config.Name, "event", evName, "table", sch.Name, "error", err)
+				continue
+			}
+			if count > 0 {
+				triggered = true
+				break
+			}
+		}
+		if !triggered {
+			continue
+		}
+
+		cs.config.Frozen = true
+		frozen++
+		if cs.config.Dynamic {
+			if err := e.store.SaveDynamicContract(ctx, &cs.config); err != nil {
+				e.logger.Error("freeze reconcile: persist failed", "contract", cs.config.Name, "error", err)
+			}
+		}
+		e.logger.Info("froze contract on startup reconcile (terminal event already indexed)",
+			"contract", cs.config.Name, "address", cs.config.Address)
+	}
+	if frozen > 0 {
+		e.logger.Info("freeze reconcile complete", "frozen", frozen, "contracts", len(e.contracts))
+	}
+}
+
 // containsString reports whether v is present in s.
 func containsString(s []string, v string) bool {
 	for _, x := range s {
@@ -715,6 +779,12 @@ func (e *Engine) setup(ctx context.Context) error {
 			)
 		}
 	}
+
+	// Reconcile contracts whose terminal freeze event was already indexed in a
+	// previous run (cursor now past it, so it will never be replayed). Must run
+	// before the view poller and subscriptions are built so frozen contracts are
+	// skipped by both. Event tables exist by now (created in the loop above).
+	e.reconcileFrozenContracts(ctx)
 
 	// Set up view function poller for contracts with views configured.
 	vp := NewViewPoller(e.provider, e.store, e.logger)
