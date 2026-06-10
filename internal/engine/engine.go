@@ -499,7 +499,17 @@ func (e *Engine) evaluateFreeze(emitterName string, emitterAddr *felt.Felt, even
 				}
 			}
 		}
-		if local || foreign {
+		// Sibling: per-instance trigger off a deployment sibling. Freeze only if
+		// the emitter is the address this contract records in factory_meta — so
+		// e.g. an OptionToken's Settled freezes just its own OrderBook/Exerciser.
+		sibling := false
+		for _, st := range cs.config.Freeze.OnSibling {
+			if st.Event == eventName && metaAddrEquals(cs.config.FactoryMeta[st.MetaField], emitterAddr) {
+				sibling = true
+				break
+			}
+		}
+		if local || foreign || sibling {
 			targets = append(targets, cs.config.Name)
 		}
 	}
@@ -528,7 +538,10 @@ func (e *Engine) evaluateFreeze(emitterName string, emitterAddr *felt.Felt, even
 func (e *Engine) reconcileFrozenContracts(ctx context.Context) {
 	frozen := 0
 	for _, cs := range e.contracts {
-		if cs.config.Frozen || cs.config.Freeze == nil || len(cs.config.Freeze.On) == 0 {
+		if cs.config.Frozen || cs.config.Freeze == nil {
+			continue
+		}
+		if len(cs.config.Freeze.On) == 0 && len(cs.config.Freeze.OnSibling) == 0 {
 			continue
 		}
 
@@ -557,6 +570,17 @@ func (e *Engine) reconcileFrozenContracts(ctx context.Context) {
 				break
 			}
 		}
+		// Sibling triggers: freeze if the deployment sibling identified via
+		// factory_meta already emitted its terminal event in a prior run (e.g.
+		// an OrderBook/Exerciser whose OptionToken settled before this restart).
+		if !triggered {
+			for _, st := range cs.config.Freeze.OnSibling {
+				if e.siblingEventAlreadyIndexed(ctx, cs, st) {
+					triggered = true
+					break
+				}
+			}
+		}
 		if !triggered {
 			continue
 		}
@@ -576,6 +600,46 @@ func (e *Engine) reconcileFrozenContracts(ctx context.Context) {
 	}
 }
 
+// siblingEventAlreadyIndexed reports whether the deployment sibling that cs
+// references via factory_meta[st.MetaField] has already emitted st.Event in the
+// indexed data. Used by startup reconcile to freeze a child (e.g. OrderBook /
+// Exerciser) whose sibling OptionToken settled in a prior run.
+func (e *Engine) siblingEventAlreadyIndexed(ctx context.Context, cs *contractState, st config.SiblingTrigger) bool {
+	metaVal := cs.config.FactoryMeta[st.MetaField]
+	if metaVal == nil {
+		return false
+	}
+	siblingAddr, err := new(felt.Felt).SetString(fmt.Sprintf("%v", metaVal))
+	if err != nil {
+		return false
+	}
+	var sib *contractState
+	for _, c := range e.contracts {
+		if c.address != nil && c.address.Equal(siblingAddr) {
+			sib = c
+			break
+		}
+	}
+	if sib == nil {
+		return false
+	}
+	sch, ok := sib.schemas[st.Event]
+	if !ok || sch == nil {
+		return false
+	}
+	var filters []store.Filter
+	if sch.SharedTable {
+		filters = []store.Filter{{Field: "contract_address", Operator: "eq", Value: sib.address.String()}}
+	}
+	count, err := e.store.CountEvents(ctx, sch.Name, filters)
+	if err != nil {
+		e.logger.Warn("freeze reconcile: sibling count failed",
+			"contract", cs.config.Name, "sibling_event", st.Event, "table", sch.Name, "error", err)
+		return false
+	}
+	return count > 0
+}
+
 // containsString reports whether v is present in s.
 func containsString(s []string, v string) bool {
 	for _, x := range s {
@@ -584,6 +648,20 @@ func containsString(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// metaAddrEquals reports whether a factory_meta value (a decoded address, held
+// as a string or *felt.Felt) equals addr. Used to match a sibling-freeze
+// trigger's recorded address against an emitting contract's address.
+func metaAddrEquals(metaVal any, addr *felt.Felt) bool {
+	if metaVal == nil || addr == nil {
+		return false
+	}
+	f, err := new(felt.Felt).SetString(fmt.Sprintf("%v", metaVal))
+	if err != nil {
+		return false
+	}
+	return f.Equal(addr)
 }
 
 // UpdateContract updates a registered contract's config (e.g., add new events).
@@ -890,6 +968,11 @@ func factoryEntryForABI(c *config.ContractConfig, childABI string) *config.Facto
 func (e *Engine) applyChildConfig(dc *config.ContractConfig, f *config.FactoryConfig, via string) {
 	dc.Views = f.ChildViews
 	dc.Events = f.ChildEvents
+	// Propagate the current freeze policy too, so freeze config added after a
+	// child was first registered takes effect on the next restart (the live
+	// freeze path and startup reconcile both key off dc.Freeze). A child already
+	// Frozen stays frozen regardless.
+	dc.Freeze = f.ChildFreeze
 	e.logger.Info("resynced dynamic child config from factory",
 		"name", dc.Name,
 		"factory", dc.FactoryName,
@@ -897,6 +980,7 @@ func (e *Engine) applyChildConfig(dc *config.ContractConfig, f *config.FactoryCo
 		"matched_via", via,
 		"views", len(f.ChildViews),
 		"events", len(f.ChildEvents),
+		"freeze", f.ChildFreeze != nil,
 	)
 }
 

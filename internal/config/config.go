@@ -130,6 +130,26 @@ type FreezeConfig struct {
 	// it, so it is best used for 1:1 relationships or static targets; for
 	// per-instance freezing prefer a local event the instance itself emits.
 	OnForeign []ForeignTrigger `yaml:"on_foreign,omitempty" json:"on_foreign,omitempty"`
+
+	// OnSibling triggers a PER-INSTANCE freeze off an event emitted by a sibling
+	// contract identified through this contract's factory_meta. Unlike OnForeign
+	// (which matches by contract name and so fires for every instance), a sibling
+	// trigger freezes only the contract whose factory_meta[MetaField] equals the
+	// emitting address — so e.g. an OptionToken's Settled freezes exactly the
+	// OrderBook/Exerciser deployed alongside it (they each carry the option
+	// token's address in factory_meta), not every order book.
+	OnSibling []SiblingTrigger `yaml:"on_sibling,omitempty" json:"on_sibling,omitempty"`
+}
+
+// SiblingTrigger freezes a contract when Event fires on the contract whose
+// address is stored in this contract's factory_meta[MetaField]. Used for
+// per-deployment cross-child freezes (the children of one DeploymentCreated
+// each hold their siblings' addresses in factory_meta).
+type SiblingTrigger struct {
+	// Event is the event name on the sibling that triggers the freeze.
+	Event string `yaml:"event" json:"event"`
+	// MetaField is the factory_meta key holding the sibling's address.
+	MetaField string `yaml:"meta_field" json:"meta_field"`
 }
 
 // FactoryConfig defines factory contract indexing settings.
