@@ -63,6 +63,11 @@ type viewEntry struct {
 	maxInterval     time.Duration   // reactive: optional staleness ceiling (0 = none)
 	trigger         chan struct{}   // reactive: buffered(1) re-read signal
 
+	// cancel stops this entry's polling goroutine. Assigned when the goroutine
+	// is spawned (Run/AddContract) and invoked by RemoveContract when the
+	// contract is frozen or deregistered. Guarded by ViewPoller.mu.
+	cancel context.CancelFunc
+
 	// Skip-if-busy: prevents overlapping polls for the same function.
 	busy sync.Mutex
 
@@ -109,6 +114,10 @@ func (vp *ViewPoller) Setup(contracts []*contractState) ([]*types.TableSchema, e
 	var schemas []*types.TableSchema
 
 	for _, cs := range contracts {
+		// Frozen contracts retain their data but do no further polling.
+		if cs.config.Frozen {
+			continue
+		}
 		if len(cs.config.Views) == 0 {
 			continue
 		}
@@ -266,19 +275,28 @@ func (vp *ViewPoller) Status() []ViewStatus {
 // Run starts polling goroutines for all registered view functions.
 // Blocks until ctx is canceled.
 func (vp *ViewPoller) Run(ctx context.Context) {
+	vp.mu.Lock()
 	if len(vp.entries) == 0 {
+		vp.mu.Unlock()
 		return
 	}
 
 	var wg sync.WaitGroup
 	for _, entry := range vp.entries {
+		// Per-entry context so RemoveContract can stop one contract's views
+		// (on freeze/deregister) without tearing down the whole poller.
+		entryCtx, entryCancel := context.WithCancel(ctx)
+		entry.cancel = entryCancel
 		wg.Add(1)
-		go func(e *viewEntry) {
+		go func(e *viewEntry, c context.Context) {
 			defer wg.Done()
-			vp.runView(ctx, e)
-		}(entry)
+			vp.runView(c, e)
+		}(entry, entryCtx)
 	}
-	vp.logger.Info("view poller started", "views", len(vp.entries))
+	n := len(vp.entries)
+	vp.mu.Unlock()
+
+	vp.logger.Info("view poller started", "views", n)
 	wg.Wait()
 	vp.logger.Info("view poller stopped")
 }
@@ -616,6 +634,35 @@ func (vp *ViewPoller) HasEntries() bool {
 	return len(vp.entries) > 0
 }
 
+// RemoveContract stops all view polling for the named contract and drops its
+// entries. Used when a contract is frozen (lifecycle) or deregistered (reorg).
+// Each removed entry's goroutine is canceled via its per-entry context; the
+// underlying tables and data are left untouched. Returns the number of view
+// entries removed.
+func (vp *ViewPoller) RemoveContract(contractName string) int {
+	vp.mu.Lock()
+	defer vp.mu.Unlock()
+
+	kept := vp.entries[:0]
+	removed := 0
+	for _, e := range vp.entries {
+		if e.contractName == contractName {
+			if e.cancel != nil {
+				e.cancel()
+			}
+			removed++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	vp.entries = kept
+
+	if removed > 0 {
+		vp.logger.Info("removed view entries", "contract", contractName, "count", removed)
+	}
+	return removed
+}
+
 // AddContract dynamically adds view functions for a contract that was registered
 // after engine startup (e.g., via discovery or admin API). It builds view entries,
 // creates tables in the store, spawns per-function polling goroutines, and returns
@@ -644,16 +691,23 @@ func (vp *ViewPoller) AddContract(ctx context.Context, cs *contractState) ([]*ty
 		)
 	}
 
-	// Append entries under lock.
+	// Append entries and assign per-entry cancel contexts under lock so a later
+	// RemoveContract (freeze/deregister) can stop them individually.
+	entryCtxs := make([]context.Context, len(newEntries))
 	vp.mu.Lock()
+	for i, entry := range newEntries {
+		entryCtx, entryCancel := context.WithCancel(ctx)
+		entry.cancel = entryCancel
+		entryCtxs[i] = entryCtx
+	}
 	vp.entries = append(vp.entries, newEntries...)
 	vp.mu.Unlock()
 
-	// Spawn per-function polling goroutines using the provided context.
-	for _, entry := range newEntries {
-		go func(e *viewEntry) {
-			vp.runView(ctx, e)
-		}(entry)
+	// Spawn per-function polling goroutines using each entry's context.
+	for i, entry := range newEntries {
+		go func(e *viewEntry, c context.Context) {
+			vp.runView(c, e)
+		}(entry, entryCtxs[i])
 	}
 
 	return schemas, nil

@@ -373,6 +373,11 @@ func (e *Engine) DeregisterContract(ctx context.Context, name string, dropTables
 		e.subscriber.RemoveContract(found.address.String())
 	}
 
+	// Stop view polling for this contract.
+	if e.poller != nil {
+		e.poller.RemoveContract(name)
+	}
+
 	// Drop tables if requested (skip shared tables — other children still use them).
 	if dropTables {
 		for _, sch := range found.schemas {
@@ -405,6 +410,116 @@ func (e *Engine) DeregisterContract(ctx context.Context, name string, dropTables
 
 	e.logger.Info("deregistered contract", "name", name, "drop_tables", dropTables)
 	return nil
+}
+
+// FreezeContract tears down a contract's event subscription and view polling
+// while retaining all indexed data: the contract stays in e.contracts so its
+// tables remain queryable. For dynamic (factory/discovered) contracts the
+// frozen flag is persisted, so the contract is not re-subscribed on the next
+// restart. Idempotent — a no-op if the contract is already frozen or unknown.
+func (e *Engine) FreezeContract(ctx context.Context, name string) error {
+	e.mu.Lock()
+	var found *contractState
+	for _, cs := range e.contracts {
+		if cs.config.Name == name {
+			found = cs
+			break
+		}
+	}
+	if found == nil {
+		e.mu.Unlock()
+		return fmt.Errorf("contract %q not found", name)
+	}
+	if found.config.Frozen {
+		e.mu.Unlock()
+		return nil
+	}
+	found.config.Frozen = true
+	addr := found.address.String()
+	dynamic := found.config.Dynamic
+	ccCopy := found.config
+	e.mu.Unlock()
+
+	// Stop the event subscription (closes WSS / stops the polling goroutine).
+	if e.subscriber != nil {
+		e.subscriber.RemoveContract(addr)
+	}
+	// Stop view polling for this contract.
+	if e.poller != nil {
+		e.poller.RemoveContract(name)
+	}
+
+	// Persist the frozen flag so rehydration skips re-subscribing. Only dynamic
+	// contracts live in the store; a frozen static contract reverts to its
+	// (unfrozen) config on restart.
+	if dynamic {
+		if err := e.store.SaveDynamicContract(ctx, &ccCopy); err != nil {
+			e.logger.Error("failed to persist frozen state", "contract", name, "error", err)
+		}
+	} else {
+		e.logger.Warn("froze a static (config) contract; freeze will not persist across restart", "contract", name)
+	}
+
+	e.logger.Info("froze contract (lifecycle)", "contract", name, "address", addr)
+	return nil
+}
+
+// evaluateFreeze checks whether an observed event triggers a lifecycle freeze
+// on any tracked contract, and freezes every match. A freeze fires when either
+// (a) the event is in the emitting contract's own Freeze.On set (per-instance),
+// or (b) another contract declares this (emitter, event) pair in
+// Freeze.OnForeign. Safe to call on both catchup and live events: freezing a
+// contract whose terminal event is replayed during catchup (e.g. an option that
+// settled while the indexer was down) stops it from re-subscribing.
+func (e *Engine) evaluateFreeze(emitterName string, emitterAddr *felt.Felt, eventName string) {
+	// fk is computed lazily — only when a contract actually declares a foreign
+	// trigger — so the common (no freeze configured) path stays allocation-free
+	// even on the high-volume catchup hot path.
+	var fk string
+	var fkComputed bool
+
+	var targets []string
+	e.mu.RLock()
+	for _, cs := range e.contracts {
+		if cs.config.Frozen || cs.config.Freeze == nil {
+			continue
+		}
+		local := emitterAddr != nil && cs.address != nil &&
+			cs.address.Equal(emitterAddr) && containsString(cs.config.Freeze.On, eventName)
+		foreign := false
+		if len(cs.config.Freeze.OnForeign) > 0 {
+			if !fkComputed {
+				fk = foreignKey(emitterName, eventName)
+				fkComputed = true
+			}
+			for _, f := range cs.config.Freeze.OnForeign {
+				if foreignKey(f.Contract, f.Event) == fk {
+					foreign = true
+					break
+				}
+			}
+		}
+		if local || foreign {
+			targets = append(targets, cs.config.Name)
+		}
+	}
+	e.mu.RUnlock()
+
+	for _, name := range targets {
+		if err := e.FreezeContract(e.runCtx, name); err != nil {
+			e.logger.Error("failed to freeze contract", "contract", name, "error", err)
+		}
+	}
+}
+
+// containsString reports whether v is present in s.
+func containsString(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateContract updates a registered contract's config (e.g., add new events).
@@ -728,6 +843,13 @@ func derefUint64(p *uint64) uint64 {
 func (e *Engine) buildSubscriptions(startBlocks map[string]uint64) []provider.ContractSubscription {
 	subs := make([]provider.ContractSubscription, 0, len(e.contracts))
 	for _, cs := range e.contracts {
+		// Frozen contracts keep their indexed data but are never re-subscribed:
+		// no event subscription, no view polling. This is what makes a freeze
+		// survive restarts (the Frozen flag is persisted with the contract).
+		if cs.config.Frozen {
+			e.logger.Info("skipping subscription for frozen contract", "contract", cs.config.Name)
+			continue
+		}
 		sub := provider.ContractSubscription{
 			Address:    cs.address,
 			StartBlock: startBlocks[cs.config.Name],

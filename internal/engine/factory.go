@@ -67,6 +67,7 @@ func (e *Engine) handleFactoryEvent(ctx context.Context, cs *contractState, fact
 		ABI:          childABI,
 		Events:       factory.ChildEvents,
 		Views:        factory.ChildViews,
+		Freeze:       factory.ChildFreeze,
 		StartBlock:   config.Uint64Ptr(raw.BlockNumber),
 		FactoryName:  cs.config.Name,
 		FactoryMeta:  meta,
