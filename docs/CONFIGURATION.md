@@ -50,6 +50,7 @@ Complete reference for `ibis.config.yaml`. This document covers every field, its
 - [Lifecycle Freeze](#lifecycle-freeze)
   - [freeze.on](#freezeon)
   - [freeze.on_foreign](#freezeon_foreign)
+  - [freeze.on_sibling](#freezeon_sibling)
 - [Views](#views)
   - [views[].function](#viewsfunction)
   - [views[].calldata](#viewscalldata)
@@ -719,6 +720,37 @@ contracts:
             table: { type: log }
         child_freeze:
           on: [Settled]
+```
+
+### `freeze.on_sibling`
+
+| Property | Value |
+|----------|-------|
+| Type | `[]SiblingTrigger` (`{event, meta_field}`) |
+| Required | No |
+
+Per-**instance** cross-contract freeze. Freezes this contract when `event` fires
+on the contract whose address is stored in this contract's
+`factory_meta[meta_field]`. Unlike `on_foreign` (which matches by contract name
+and so fires for *every* instance), `on_sibling` freezes only the instance whose
+`factory_meta` points at the emitter — so the children of a single deployment can
+freeze together when their shared sibling emits a terminal event.
+
+It is reconciled on startup like `on`: if the sibling's terminal event is already
+indexed (below the cursor and so never replayed), the contract is frozen on boot.
+
+```yaml
+# Freeze an OrderBook/Exerciser together with the OptionToken they were deployed
+# alongside — each child stores the option token's address in factory_meta.
+    factories:
+      - event: DeploymentCreated
+        child_address_field: order_book
+        child_abi: OrderBook
+        # … child_events / child_views …
+        child_freeze:
+          on_sibling:
+            - event: Settled            # event emitted by the sibling
+              meta_field: option_token  # factory_meta key holding the sibling's address
 ```
 
 ---
