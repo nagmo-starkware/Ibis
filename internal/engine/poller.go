@@ -74,6 +74,20 @@ type viewEntry struct {
 	pollIndex       uint64
 }
 
+// maxConcurrentPolls bounds how many view starknet_calls run at once across ALL
+// view goroutines. On a large deployment (thousands of factory children) every
+// view fires an initial poll at startup; without a cap they hit the RPC provider
+// simultaneously and trip its concurrent-request limit (HTTP 429). The semaphore
+// turns that thundering herd into a steady, bounded stream.
+const maxConcurrentPolls = 16
+
+// maxInitialPollAttempts bounds the retry of a view's FIRST read. Reactive/constant
+// views are read once (then event-driven / never again), so a transient RPC failure
+// on that one read would otherwise leave the view empty until the next restart. We
+// retry with capped backoff up to this many attempts, then give up (NOT an infinite
+// loop) — the next event or restart re-attempts.
+const maxInitialPollAttempts = 12
+
 // ViewPoller manages periodic starknet_call polling for view functions.
 type ViewPoller struct {
 	mu       sync.Mutex // protects entries for concurrent AddContract calls
@@ -82,6 +96,9 @@ type ViewPoller struct {
 	store    store.Store
 	logger   *slog.Logger
 	onEvent  func(contract, event, table string, blockNumber, logIndex uint64, data map[string]any)
+
+	// sem bounds concurrent starknet_calls across all view goroutines.
+	sem chan struct{}
 
 	// Reorg notification: close-and-recreate pattern to broadcast to all goroutines.
 	reorgMu sync.Mutex
@@ -95,6 +112,7 @@ func NewViewPoller(prov viewPollerProvider, st store.Store, logger *slog.Logger)
 		store:    st,
 		logger:   logger.With("component", "view_poller"),
 		reorgCh:  make(chan struct{}),
+		sem:      make(chan struct{}, maxConcurrentPolls),
 	}
 }
 
@@ -344,31 +362,50 @@ func (vp *ViewPoller) runInterval(ctx context.Context, entry *viewEntry) {
 	}
 }
 
-// runConstant reads a deploy-time-immutable view exactly once, at registration.
-// It retries with capped exponential backoff until the first successful read,
-// then exits — the value can never change on-chain, so no further polling is
-// scheduled and the contract costs zero ongoing RPC.
-func (vp *ViewPoller) runConstant(ctx context.Context, entry *viewEntry) {
+// pollUntilSuccess performs a view's initial read, retrying with capped
+// exponential backoff up to maxInitialPollAttempts. Returns true once a poll
+// succeeds. This is BOUNDED — it never loops forever: on exhaustion it logs and
+// returns false, leaving the view to be (re)populated by a later event or the
+// next restart. Used for the one-shot initial read of constant/reactive views,
+// so a transient RPC failure (e.g. a 429 during the startup wave) doesn't leave
+// the view empty with no recovery path.
+func (vp *ViewPoller) pollUntilSuccess(ctx context.Context, entry *viewEntry) bool {
 	backoff := time.Second
-	for {
+	for attempt := 1; attempt <= maxInitialPollAttempts; attempt++ {
 		vp.poll(ctx, entry)
 
 		entry.statusMu.Lock()
 		ok := entry.consecutiveErrs == 0 && !entry.lastPollTime.IsZero()
 		entry.statusMu.Unlock()
 		if ok {
-			return
+			return true
+		}
+		if attempt == maxInitialPollAttempts {
+			break
 		}
 
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < 60*time.Second {
 			backoff *= 2
 		}
 	}
+	vp.logger.Warn("initial view poll did not succeed after retries; relying on events / next restart",
+		"function", entry.functionDef.Name,
+		"contract", entry.contractName,
+		"attempts", maxInitialPollAttempts,
+	)
+	return false
+}
+
+// runConstant reads a deploy-time-immutable view exactly once, at registration
+// (with bounded retry), then exits — the value can never change on-chain, so no
+// further polling is scheduled and the contract costs zero ongoing RPC.
+func (vp *ViewPoller) runConstant(ctx context.Context, entry *viewEntry) {
+	vp.pollUntilSuccess(ctx, entry)
 }
 
 // runReactive reads a view once at registration (capturing current chain state
@@ -379,8 +416,11 @@ func (vp *ViewPoller) runConstant(ctx context.Context, entry *viewEntry) {
 // produces at most one extra RPC call.
 func (vp *ViewPoller) runReactive(ctx context.Context, entry *viewEntry) {
 	// Initial read at registration: current state via BlockTagLatest, so the
-	// view is populated immediately without waiting for any event.
-	vp.poll(ctx, entry)
+	// view is populated immediately without waiting for any event. Bounded retry
+	// so a transient RPC failure (e.g. a 429 in the startup wave) doesn't leave
+	// the view empty until the next matching event — important for views like
+	// get_active_deployment that drive market discovery and rarely re-fire.
+	vp.pollUntilSuccess(ctx, entry)
 	lastPoll := time.Now()
 
 	var (
@@ -487,6 +527,17 @@ func (vp *ViewPoller) poll(ctx context.Context, entry *viewEntry) {
 		return
 	}
 	defer entry.busy.Unlock()
+
+	// Bound global concurrency: at most maxConcurrentPolls starknet_calls run at
+	// once across all view goroutines, so a startup wave of initial polls doesn't
+	// trip the RPC provider's concurrent-request limit (429). Respect ctx so a
+	// shutdown doesn't block on a full semaphore.
+	select {
+	case vp.sem <- struct{}{}:
+		defer func() { <-vp.sem }()
+	case <-ctx.Done():
+		return
+	}
 
 	// Get current block number to anchor the poll.
 	blockNumber, err := vp.provider.BlockNumber(ctx)
