@@ -380,13 +380,14 @@ func (vp *ViewPoller) runInterval(ctx context.Context, entry *viewEntry) {
 	}
 }
 
-// pollUntilSuccess performs a view's initial read, retrying with capped
-// exponential backoff up to maxInitialPollAttempts. Returns true once a poll
-// succeeds. This is BOUNDED — it never loops forever: on exhaustion it logs and
-// returns false, leaving the view to be (re)populated by a later event or the
-// next restart. Used for the one-shot initial read of constant/reactive views,
-// so a transient RPC failure (e.g. a 429 during the startup wave) doesn't leave
-// the view empty with no recovery path.
+// pollUntilSuccess performs a view read, retrying with capped exponential
+// backoff up to maxInitialPollAttempts. Returns true once a poll succeeds. This
+// is BOUNDED — it never loops forever: on exhaustion it logs and returns false,
+// leaving the view to be (re)populated by a later event or the next restart.
+// Used for the one-shot initial read of constant/reactive views AND for reactive
+// re-reads (see doPoll), so a transient RPC failure (e.g. a 429 during a load
+// spike) doesn't leave the view stale with no recovery path until the next
+// trigger.
 func (vp *ViewPoller) pollUntilSuccess(ctx context.Context, entry *viewEntry) bool {
 	backoff := time.Second
 	for attempt := 1; attempt <= maxInitialPollAttempts; attempt++ {
@@ -457,7 +458,14 @@ func (vp *ViewPoller) runReactive(ctx context.Context, entry *viewEntry) {
 
 	doPoll := func() {
 		stopThrottle()
-		vp.poll(ctx, entry)
+		// Bounded retry on the re-read too, not just the initial read: a
+		// reactive view (e.g. get_active_deployment) re-reads only when its
+		// trigger fires, so if that single event-driven poll is dropped by a
+		// transient RPC failure (e.g. an Alchemy 429 during a load spike) the
+		// view freezes on its prior value until the NEXT trigger — which for a
+		// rarely-rotating manager can be hours/days away. Retrying with capped
+		// backoff turns a one-shot miss into an eventual success.
+		vp.pollUntilSuccess(ctx, entry)
 		lastPoll = time.Now()
 		pending = false
 	}
