@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -118,6 +119,68 @@ func TestViewPoller_ReactiveTriggerRePoll(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 	if got := mp.callCount.Load(); got <= initial {
 		t.Fatalf("matching event must trigger re-read; calls %d -> %d", initial, got)
+	}
+}
+
+// A transient RPC failure on the trigger-driven re-read must NOT freeze the
+// view: the re-read retries with bounded backoff and eventually lands the new
+// value. This is the regression guard for the prod incident where an Alchemy
+// 429 dropped a get_active_deployment re-poll and the view stayed stuck on the
+// (expired) prior deployment until the next rotation.
+func TestViewPoller_ReactiveRePollRetriesOnTransientError(t *testing.T) {
+	addr := new(felt.Felt).SetUint64(0xABC)
+	cs := reactiveViewContract(addr, "Mgr", "get_active_deployment",
+		&config.ViewRefreshConfig{On: []string{"ActiveDeploymentChanged"}, Debounce: "0"})
+
+	mp := &mockProvider{blockNumber: 100, callResult: []*felt.Felt{new(felt.Felt).SetUint64(1)}}
+	st := memory.New()
+	vp := NewViewPoller(mp, st, noopLogger())
+	cancel := startPoller(t, vp, cs, st)
+	defer cancel()
+
+	// Startup read lands at block 100.
+	time.Sleep(120 * time.Millisecond)
+	if got := mp.callCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 startup poll, got %d", got)
+	}
+
+	// Arm a transient failure for the upcoming re-read, and advance the chain so
+	// a successful retry is observable as a new block_number.
+	mp.mu.Lock()
+	mp.callErr = errors.New("429 Too Many Requests")
+	mp.callResult = []*felt.Felt{new(felt.Felt).SetUint64(2)}
+	mp.blockNumber = 200
+	mp.mu.Unlock()
+
+	// Matching trigger: first attempt fails (429), then pollUntilSuccess backs
+	// off ~1s before retrying.
+	vp.TriggerView("Mgr", addr, "ActiveDeploymentChanged")
+	time.Sleep(300 * time.Millisecond)
+
+	// Clear the failure mid-backoff so the retry succeeds.
+	mp.mu.Lock()
+	mp.callErr = nil
+	mp.mu.Unlock()
+
+	// Wait out the ~1s backoff plus margin for attempt 2 to land.
+	deadline := time.Now().Add(3 * time.Second)
+	var lastBlock uint64
+	for time.Now().Before(deadline) {
+		events, _ := st.GetUniqueEvents(context.Background(), "mgr_get_active_deployment", store.Query{Limit: 1})
+		if len(events) > 0 {
+			lastBlock = events[0].BlockNumber
+			if lastBlock == 200 {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if lastBlock != 200 {
+		t.Fatalf("reactive re-read did not recover from transient error: view stuck at block %d, want 200", lastBlock)
+	}
+	if got := mp.callCount.Load(); got < 3 {
+		t.Fatalf("expected the failed re-read to be retried (>=3 total calls), got %d", got)
 	}
 }
 
