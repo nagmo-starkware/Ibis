@@ -91,7 +91,21 @@ const maxConcurrentPolls = 16
 // on that one read would otherwise leave the view empty until the next restart. We
 // retry with capped backoff up to this many attempts, then give up (NOT an infinite
 // loop) — the next event or restart re-attempts.
-const maxInitialPollAttempts = 12
+//
+// A var (not const) so tests can shrink it; production value is fixed.
+var maxInitialPollAttempts = 12
+
+// recoveryInterval is the cadence at which a reactive view that has NEVER produced
+// a value re-attempts its read, until the first success. It exists for the case
+// where the registration-time initial read (pollUntilSuccess) exhausts its bounded
+// retry during a transient storm — e.g. a freshly-rotated order book whose seed
+// orders share a block with DeploymentCreated (so the event trigger can't be relied
+// on for them) and whose initial get_depth read lost to an Alchemy 429 burst. Such
+// a view would otherwise stay empty until its slow max_interval ceiling or the next
+// matching event. This bounds that gap to ~recoveryInterval after the RPC recovers.
+// It runs ONLY while the view is unpopulated, so healthy/idle views add no extra
+// RPC load. A var so tests can shrink it.
+var recoveryInterval = 30 * time.Second
 
 // ViewPoller manages periodic starknet_call polling for view functions.
 type ViewPoller struct {
@@ -439,7 +453,7 @@ func (vp *ViewPoller) runReactive(ctx context.Context, entry *viewEntry) {
 	// so a transient RPC failure (e.g. a 429 in the startup wave) doesn't leave
 	// the view empty until the next matching event — important for views like
 	// get_active_deployment that drive market discovery and rarely re-fire.
-	vp.pollUntilSuccess(ctx, entry)
+	populated := vp.pollUntilSuccess(ctx, entry)
 	lastPoll := time.Now()
 
 	var (
@@ -456,6 +470,29 @@ func (vp *ViewPoller) runReactive(ctx context.Context, entry *viewEntry) {
 	}
 	defer stopThrottle()
 
+	// Fast recovery cadence, active ONLY until the first successful read. If the
+	// registration-time initial read above gave up (e.g. a transient 429 storm
+	// outlasted its bounded retry), keep re-attempting every recoveryInterval so
+	// an unpopulated view — typically a just-rotated factory child whose seed
+	// orders can't be recovered via the event trigger — appears within seconds of
+	// the RPC clearing, rather than waiting for the slow max_interval ceiling.
+	var (
+		recovery  *time.Ticker
+		recoveryC <-chan time.Time
+	)
+	stopRecovery := func() {
+		if recovery != nil {
+			recovery.Stop()
+			recovery = nil
+			recoveryC = nil
+		}
+	}
+	defer stopRecovery()
+	if !populated {
+		recovery = time.NewTicker(recoveryInterval)
+		recoveryC = recovery.C
+	}
+
 	doPoll := func() {
 		stopThrottle()
 		// Bounded retry on the re-read too, not just the initial read: a
@@ -465,7 +502,11 @@ func (vp *ViewPoller) runReactive(ctx context.Context, entry *viewEntry) {
 		// view freezes on its prior value until the NEXT trigger — which for a
 		// rarely-rotating manager can be hours/days away. Retrying with capped
 		// backoff turns a one-shot miss into an eventual success.
-		vp.pollUntilSuccess(ctx, entry)
+		if vp.pollUntilSuccess(ctx, entry) && !populated {
+			// First value landed — stand down the fast recovery cadence.
+			populated = true
+			stopRecovery()
+		}
 		lastPoll = time.Now()
 		pending = false
 	}
@@ -483,6 +524,8 @@ func (vp *ViewPoller) runReactive(ctx context.Context, entry *viewEntry) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-recoveryC:
+			doPoll()
 		case <-entry.trigger:
 			if entry.debounce <= 0 {
 				doPoll()
