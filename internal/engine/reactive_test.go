@@ -221,6 +221,68 @@ func TestViewPoller_ReactiveDebounceCoalesces(t *testing.T) {
 	}
 }
 
+// When a reactive view's registration-time initial read gives up (a transient
+// 429 storm outlasts its bounded retry), the fast recovery cadence must keep
+// re-attempting and land the value within ~recoveryInterval of the RPC clearing —
+// WITHOUT any matching event. This is the guard for a just-rotated order book
+// whose seed orders shared the rotate block (so the event trigger can't recover
+// them) and whose get_depth read was dropped during the rotation storm.
+func TestViewPoller_ReactiveRecoversWhenInitialReadGivesUp(t *testing.T) {
+	origAttempts, origRecovery := maxInitialPollAttempts, recoveryInterval
+	maxInitialPollAttempts = 1 // give up immediately so the recovery path runs fast
+	recoveryInterval = 40 * time.Millisecond
+	t.Cleanup(func() { maxInitialPollAttempts = origAttempts; recoveryInterval = origRecovery })
+
+	addr := new(felt.Felt).SetUint64(0xABC)
+	cs := reactiveViewContract(addr, "OrderBook", "get_depth",
+		&config.ViewRefreshConfig{On: []string{"SellOrderPlaced"}, Debounce: "0"})
+
+	// Initial read FAILS, and no matching event is ever sent — recovery is the
+	// only path to a value.
+	mp := &mockProvider{
+		blockNumber: 100,
+		callErr:     errors.New("429 Too Many Requests"),
+		callResult:  []*felt.Felt{new(felt.Felt).SetUint64(1)},
+	}
+	st := memory.New()
+	vp := NewViewPoller(mp, st, noopLogger())
+	cancel := startPoller(t, vp, cs, st)
+	defer cancel()
+
+	// Initial read gives up; recovery ticks keep failing while the RPC is down.
+	time.Sleep(150 * time.Millisecond)
+	if events, _ := st.GetUniqueEvents(context.Background(), "orderbook_get_depth", store.Query{Limit: 1}); len(events) != 0 {
+		t.Fatalf("view should still be empty while the RPC is failing, got %d rows", len(events))
+	}
+
+	// RPC recovers — the next recovery tick must land the value with no event.
+	mp.mu.Lock()
+	mp.callErr = nil
+	mp.blockNumber = 200
+	mp.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var landed bool
+	for time.Now().Before(deadline) {
+		events, _ := st.GetUniqueEvents(context.Background(), "orderbook_get_depth", store.Query{Limit: 1})
+		if len(events) > 0 && events[0].BlockNumber == 200 {
+			landed = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !landed {
+		t.Fatal("reactive view did not recover via the fast recovery cadence after the RPC cleared")
+	}
+
+	// Recovery must stand down once populated: the call count stops climbing.
+	settle := mp.callCount.Load()
+	time.Sleep(200 * time.Millisecond) // several recoveryIntervals
+	if got := mp.callCount.Load(); got != settle {
+		t.Fatalf("recovery cadence did not stand down after first success: calls %d -> %d", settle, got)
+	}
+}
+
 // processEvent must NOT trigger reactive re-reads for catchup events, but MUST
 // trigger for live events.
 func TestProcessEvent_ReactiveTriggerSkippedDuringCatchup(t *testing.T) {
