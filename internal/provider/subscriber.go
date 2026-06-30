@@ -13,6 +13,14 @@ import (
 )
 
 const (
+	// maxConcurrentCatchup bounds how many contract goroutines can run RPC-heavy
+	// catchup or HTTP-polling iterations simultaneously. On restart with ~300 live
+	// contracts all goroutines fire their first BlockNumber+GetEvents pair at once,
+	// tripping Alchemy's rate limit (429) and cascading into CU exhaustion. The
+	// semaphore turns that thundering herd into a bounded, steady stream. Matches
+	// the view-poller's maxConcurrentPolls value in internal/engine/poller.go.
+	maxConcurrentCatchup = 16
+
 	// WSS reconnection backoff bounds.
 	minBackoff = 1 * time.Second
 	maxBackoff = 30 * time.Second
@@ -114,6 +122,10 @@ type EventSubscriber struct {
 	// dialWSS creates a WSS session. Override in tests.
 	dialWSS wssDialer
 
+	// sem bounds the number of goroutines that can execute RPC-heavy catchup or
+	// HTTP-polling iterations concurrently. See maxConcurrentCatchup.
+	sem chan struct{}
+
 	// Per-contract cancel functions for dynamic management.
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -143,6 +155,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		forcePolling:       forcePolling,
 		catchupWithPolling: catchupWithPolling,
 		dialWSS:            defaultWSSDialer,
+		sem:                make(chan struct{}, maxConcurrentCatchup),
 		cancels:            make(map[string]context.CancelFunc),
 	}
 }
@@ -263,11 +276,19 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 			return ctx.Err()
 		}
 
-		rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
-		latestBlock, err := s.provider.BlockNumber(rpcCtx)
-		cancel()
-		if err != nil {
-			logger.Warn("failed to get block number during catchup", "error", err)
+		// Bound catchup concurrency: acquire the semaphore for the RPC-heavy
+		// pair of calls (BlockNumber + GetEvents). Released before the
+		// inter-iteration sleep so other goroutines can proceed.
+		select {
+		case s.sem <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		events, endBlock, latestBlock, rpcErr := s.catchupIteration(ctx, contract, *lastBlock, logger)
+		<-s.sem // release before sleeping so other goroutines can run
+
+		if rpcErr != nil {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -280,34 +301,6 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 		if latestBlock < catchupThreshold || *lastBlock+catchupThreshold >= latestBlock {
 			return nil
 		}
-
-		endBlock := *lastBlock + s.blocksPerQuery
-		if endBlock > latestBlock {
-			endBlock = latestBlock
-		}
-
-		rpcCtx, cancel = context.WithTimeout(ctx, rpcCallTimeout)
-		events, err := s.provider.GetEvents(rpcCtx, GetEventsOptions{
-			FromBlock: *lastBlock,
-			ToBlock:   endBlock,
-			Address:   contract.Address,
-			Keys:      contract.Keys,
-			ChunkSize: 1000,
-		})
-		cancel()
-		if err != nil {
-			logger.Warn("failed to get events during catchup",
-				"error", err, "from", *lastBlock, "to", endBlock)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(tipPollInterval):
-				continue
-			}
-		}
-
-		logger.Debug("catchup range polled",
-			"from", *lastBlock, "to", endBlock, "events", len(events), "chain_tip", latestBlock)
 
 		s.resolveTimestamps(ctx, events, logger)
 
@@ -329,6 +322,52 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 		case <-time.After(catchupPollInterval):
 		}
 	}
+}
+
+// catchupIteration executes one catchup loop step: fetch the chain tip and
+// query events for the next block range. Called with the catchup semaphore held.
+// Returns the fetched events, the endBlock used, the current chain tip, and any
+// RPC error. On error, events is nil; the caller should retry after a delay.
+// A nil error with latestBlock within catchupThreshold of *lastBlock signals
+// that catchup is complete (check before consuming events).
+func (s *EventSubscriber) catchupIteration(ctx context.Context, contract ContractSubscription, lastBlock uint64, logger *slog.Logger) ([]RawEvent, uint64, uint64, error) {
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
+	latestBlock, err := s.provider.BlockNumber(rpcCtx)
+	cancel()
+	if err != nil {
+		logger.Warn("failed to get block number during catchup", "error", err)
+		return nil, 0, 0, err
+	}
+
+	// Signal tip reached without fetching events.
+	if latestBlock < catchupThreshold || lastBlock+catchupThreshold >= latestBlock {
+		return nil, 0, latestBlock, nil
+	}
+
+	endBlock := lastBlock + s.blocksPerQuery
+	if endBlock > latestBlock {
+		endBlock = latestBlock
+	}
+
+	rpcCtx, cancel = context.WithTimeout(ctx, rpcCallTimeout)
+	events, err := s.provider.GetEvents(rpcCtx, GetEventsOptions{
+		FromBlock: lastBlock,
+		ToBlock:   endBlock,
+		Address:   contract.Address,
+		Keys:      contract.Keys,
+		ChunkSize: 1000,
+	})
+	cancel()
+	if err != nil {
+		logger.Warn("failed to get events during catchup",
+			"error", err, "from", lastBlock, "to", endBlock)
+		return nil, 0, 0, err
+	}
+
+	logger.Debug("catchup range polled",
+		"from", lastBlock, "to", endBlock, "events", len(events), "chain_tip", latestBlock)
+
+	return events, endBlock, latestBlock, nil
 }
 
 // subscribeWSS manages a WSS subscription with automatic reconnection using
@@ -511,10 +550,21 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 			return ctx.Err()
 		}
 
+		// Bound polling concurrency: acquire the semaphore for the RPC-heavy
+		// pair of calls (BlockNumber + GetEvents). Released before the
+		// inter-iteration sleep so other goroutines can run while we wait.
+		select {
+		case s.sem <- struct{}{}:
+		case <-ctx.Done():
+			logger.Debug("polling stopped", "reason", ctx.Err())
+			return ctx.Err()
+		}
+
 		rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
 		latestBlock, err := s.provider.BlockNumber(rpcCtx)
 		cancel()
 		if err != nil {
+			<-s.sem
 			logger.Warn("failed to get block number", "error", err)
 			select {
 			case <-ctx.Done():
@@ -525,8 +575,9 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 			}
 		}
 
-		// At chain tip — wait before polling again.
+		// At chain tip — release and wait before polling again.
 		if *lastBlock > latestBlock {
+			<-s.sem
 			select {
 			case <-ctx.Done():
 				logger.Debug("polling stopped", "reason", ctx.Err())
@@ -551,6 +602,7 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 			ChunkSize: 1000,
 		})
 		cancel()
+		<-s.sem // release before sleeping
 		if err != nil {
 			logger.Warn("failed to get events", "error", err,
 				"from", *lastBlock, "to", endBlock)
