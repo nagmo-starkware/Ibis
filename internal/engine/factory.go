@@ -90,6 +90,11 @@ func (e *Engine) handleFactoryEvent(ctx context.Context, cs *contractState, fact
 		"address", childAddr,
 		"deploy_block", raw.BlockNumber,
 	)
+
+	// A child can be discovered after it is already dead (e.g. an option whose
+	// expiry+grace passed before this run reached its deploy block). Freeze it at
+	// registration so it never starts polling.
+	e.evaluatePredicateContract(childName)
 }
 
 // registerFactoryChild registers a factory child contract. It uses a per-ChildABI

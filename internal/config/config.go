@@ -139,6 +139,76 @@ type FreezeConfig struct {
 	// OrderBook/Exerciser deployed alongside it (they each carry the option
 	// token's address in factory_meta), not every order book.
 	OnSibling []SiblingTrigger `yaml:"on_sibling,omitempty" json:"on_sibling,omitempty"`
+
+	// Any is the declarative, OR-combined rule list: the contract freezes when
+	// ANY rule matches. A rule is either an observed local event (rule.Event,
+	// equivalent to adding to On) or a predicate over a captured factory_meta
+	// field (rule.Predicate). This is additive — On/OnForeign/OnSibling keep
+	// working unchanged, and an event rule here is merged with On via
+	// LocalEvents(). Predicates exist to express "should stop indexing" for
+	// contracts whose terminal condition is NOT an event (e.g. an option that
+	// expired without ever being sold emits no Settled, but expiry < now()-grace
+	// still means it is dead).
+	Any []FreezeRule `yaml:"any,omitempty" json:"any,omitempty"`
+}
+
+// FreezeRule is one entry in FreezeConfig.Any. Exactly one of Event or Predicate
+// should be set. Event is a local trigger event on THIS contract (same semantics
+// as a FreezeConfig.On entry); Predicate is a comparison over a captured
+// factory_meta field, re-evaluated against the current time.
+type FreezeRule struct {
+	// Event names a local event whose observation triggers the freeze.
+	Event string `yaml:"event,omitempty" json:"event,omitempty"`
+	// Predicate compares a stored factory_meta field against a value.
+	Predicate *FreezePredicate `yaml:"predicate,omitempty" json:"predicate,omitempty"`
+}
+
+// FreezePredicate freezes a contract when meta_field <op> value holds. MetaField
+// names a key in the contract's captured factory_meta (e.g. "expiry", already
+// captured from the DeploymentCreated event — no extra RPC). Op is one of
+// lt|gt|lte|gte|eq. Value is either a numeric literal or a time expression
+// "now() [+|-] <duration>" with a duration of the form <int><unit>, unit in
+// s|m|h|d. now() resolves to the current unix time in seconds, so a meta_field
+// holding a unix timestamp (like expiry) compares directly. Example: freeze two
+// days after expiry => {meta_field: expiry, op: lt, value: "now() - 2d"}.
+type FreezePredicate struct {
+	MetaField string `yaml:"meta_field" json:"meta_field"`
+	Op        string `yaml:"op" json:"op"`
+	Value     string `yaml:"value" json:"value"`
+}
+
+// LocalEvents returns the union of the legacy On events and the event-kind rules
+// in Any — the THIS-contract events that trigger a freeze. The no-Any fast path
+// returns On directly so the common case stays allocation-free.
+func (f *FreezeConfig) LocalEvents() []string {
+	if f == nil {
+		return nil
+	}
+	if len(f.Any) == 0 {
+		return f.On
+	}
+	out := make([]string, 0, len(f.On)+len(f.Any))
+	out = append(out, f.On...)
+	for _, r := range f.Any {
+		if r.Event != "" {
+			out = append(out, r.Event)
+		}
+	}
+	return out
+}
+
+// Predicates returns the predicate-kind rules declared in Any.
+func (f *FreezeConfig) Predicates() []FreezePredicate {
+	if f == nil || len(f.Any) == 0 {
+		return nil
+	}
+	out := make([]FreezePredicate, 0, len(f.Any))
+	for _, r := range f.Any {
+		if r.Predicate != nil {
+			out = append(out, *r.Predicate)
+		}
+	}
+	return out
 }
 
 // SiblingTrigger freezes a contract when Event fires on the contract whose
