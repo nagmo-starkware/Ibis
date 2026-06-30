@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/NethermindEth/juno/core/felt"
 
@@ -346,6 +347,10 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 		e.onContractRegistered(cc, schemaList)
 	}
 
+	// Freeze immediately if this contract registered already past a time-based
+	// predicate threshold, so we never start polling a dead contract.
+	e.evaluatePredicateContract(cc.Name)
+
 	return nil
 }
 
@@ -485,7 +490,7 @@ func (e *Engine) evaluateFreeze(emitterName string, emitterAddr *felt.Felt, even
 			continue
 		}
 		local := emitterAddr != nil && cs.address != nil &&
-			cs.address.Equal(emitterAddr) && containsString(cs.config.Freeze.On, eventName)
+			cs.address.Equal(emitterAddr) && containsString(cs.config.Freeze.LocalEvents(), eventName)
 		foreign := false
 		if len(cs.config.Freeze.OnForeign) > 0 {
 			if !fkComputed {
@@ -522,6 +527,72 @@ func (e *Engine) evaluateFreeze(emitterName string, emitterAddr *felt.Felt, even
 	}
 }
 
+// matchesFreezePredicate reports whether any predicate rule on cs.Freeze holds at
+// now. Pure read of the contract's captured factory_meta — no RPC, no store I/O.
+// A per-predicate eval error is logged and skipped (treated as no-match) so a
+// single bad field never blocks the others. Caller must hold at least e.mu.RLock.
+func (e *Engine) matchesFreezePredicate(cs *contractState, now time.Time) bool {
+	if cs.config.Frozen || cs.config.Freeze == nil {
+		return false
+	}
+	for _, p := range cs.config.Freeze.Predicates() {
+		match, err := config.EvalPredicate(cs.config.FactoryMeta, p, now)
+		if err != nil {
+			e.logger.Warn("freeze predicate eval failed",
+				"contract", cs.config.Name, "meta_field", p.MetaField, "error", err)
+			continue
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// evaluatePredicateFreezes scans every tracked contract and freezes any whose
+// freeze predicate now holds. Unlike event triggers (which fire on ingestion),
+// predicates depend on the wall clock, so this is the periodic re-check hook —
+// driven by the engine tick — that catches a contract crossing its threshold
+// (e.g. expiry+grace elapsing) while the indexer is live.
+func (e *Engine) evaluatePredicateFreezes(now time.Time) {
+	var targets []string
+	e.mu.RLock()
+	for _, cs := range e.contracts {
+		if e.matchesFreezePredicate(cs, now) {
+			targets = append(targets, cs.config.Name)
+		}
+	}
+	e.mu.RUnlock()
+	for _, name := range targets {
+		if err := e.FreezeContract(e.runCtx, name); err != nil {
+			e.logger.Error("failed to freeze contract (predicate)", "contract", name, "error", err)
+		}
+	}
+}
+
+// evaluatePredicateContract is the on-registration predicate hook: it freezes a
+// single newly-registered contract if it is already past its predicate threshold
+// (e.g. a factory child discovered after it had already expired), so the engine
+// never even starts polling it. Targeted to one contract to stay O(1) on the
+// per-child registration path during catchup.
+func (e *Engine) evaluatePredicateContract(name string) {
+	now := time.Now()
+	freeze := false
+	e.mu.RLock()
+	for _, cs := range e.contracts {
+		if cs.config.Name == name {
+			freeze = e.matchesFreezePredicate(cs, now)
+			break
+		}
+	}
+	e.mu.RUnlock()
+	if freeze {
+		if err := e.FreezeContract(e.runCtx, name); err != nil {
+			e.logger.Error("failed to freeze contract (predicate)", "contract", name, "error", err)
+		}
+	}
+}
+
 // reconcileFrozenContracts freezes, at startup, any contract whose local freeze
 // trigger event was already indexed in a previous run. Those events sit below
 // the contract's resume cursor and would never be replayed, so the live/catchup
@@ -541,12 +612,14 @@ func (e *Engine) reconcileFrozenContracts(ctx context.Context) {
 		if cs.config.Frozen || cs.config.Freeze == nil {
 			continue
 		}
-		if len(cs.config.Freeze.On) == 0 && len(cs.config.Freeze.OnSibling) == 0 {
+		if len(cs.config.Freeze.LocalEvents()) == 0 &&
+			len(cs.config.Freeze.OnSibling) == 0 &&
+			len(cs.config.Freeze.Predicates()) == 0 {
 			continue
 		}
 
 		triggered := false
-		for _, evName := range cs.config.Freeze.On {
+		for _, evName := range cs.config.Freeze.LocalEvents() {
 			sch, ok := cs.schemas[evName]
 			if !ok || sch == nil {
 				// Event not in this contract's ABI / not indexed — can't reconcile it.
@@ -576,6 +649,26 @@ func (e *Engine) reconcileFrozenContracts(ctx context.Context) {
 		if !triggered {
 			for _, st := range cs.config.Freeze.OnSibling {
 				if e.siblingEventAlreadyIndexed(ctx, cs, st) {
+					triggered = true
+					break
+				}
+			}
+		}
+		// Predicate triggers: a captured meta field already satisfies its
+		// condition (e.g. expiry < now()-grace). This is how a child that never
+		// emitted a terminal event — an option that expired without ever being
+		// sold, so settle() never ran — freezes on the next restart with no
+		// manual DB work. Evaluated against the current time; no RPC.
+		if !triggered {
+			now := time.Now()
+			for _, p := range cs.config.Freeze.Predicates() {
+				match, err := config.EvalPredicate(cs.config.FactoryMeta, p, now)
+				if err != nil {
+					e.logger.Warn("freeze reconcile: predicate eval failed",
+						"contract", cs.config.Name, "meta_field", p.MetaField, "error", err)
+					continue
+				}
+				if match {
 					triggered = true
 					break
 				}
@@ -1130,12 +1223,26 @@ func hasWildcardEvent(cc *config.ContractConfig) bool {
 	return false
 }
 
+// freezePredicateInterval is how often the engine re-checks time-based freeze
+// predicates (e.g. expiry+grace). Freeze conditions are day-scale, so an hourly
+// tick is ample; tighten here if sub-hour granularity is ever needed.
+const freezePredicateInterval = time.Hour
+
 // eventLoop processes events and reorg notifications until the context is canceled.
 func (e *Engine) eventLoop(ctx context.Context) error {
+	freezeTicker := time.NewTicker(freezePredicateInterval)
+	defer freezeTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+
+		case <-freezeTicker.C:
+			// Periodic re-check: freeze contracts whose time-based predicate has
+			// crossed its threshold since the last tick (event triggers fire on
+			// ingestion and don't need this).
+			e.evaluatePredicateFreezes(time.Now())
 
 		case reorg := <-e.reorgs:
 			if err := e.handleReorg(ctx, reorg); err != nil {

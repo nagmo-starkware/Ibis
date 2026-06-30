@@ -103,6 +103,9 @@ func Validate(cfg *Config) error {
 		if err := validateEvents(c.Events, prefix); err != nil {
 			return err
 		}
+		if err := validateFreeze(c.Freeze, prefix+".freeze"); err != nil {
+			return err
+		}
 
 		// Validate each factory config if present.
 		for j := range c.Factories {
@@ -191,6 +194,33 @@ func validateFactory(f *FactoryConfig, prefix string) error {
 	}
 	if err := validateViews(f.ChildViews, prefix); err != nil {
 		return err
+	}
+	if err := validateFreeze(f.ChildFreeze, prefix+".child_freeze"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateFreeze validates a freeze policy. The legacy On/OnForeign/OnSibling
+// fields are intentionally permissive (unchanged behavior); only the new Any
+// rule list is checked: each rule must be exactly one of event or predicate, and
+// predicates must have a valid meta_field/op/value (see FreezePredicate.Validate).
+func validateFreeze(f *FreezeConfig, prefix string) error {
+	if f == nil {
+		return nil
+	}
+	for i, r := range f.Any {
+		rp := fmt.Sprintf("%s.any[%d]", prefix, i)
+		hasEvent := r.Event != ""
+		hasPred := r.Predicate != nil
+		if hasEvent == hasPred {
+			return fieldError(rp, "must set exactly one of event or predicate")
+		}
+		if hasPred {
+			if err := r.Predicate.Validate(); err != nil {
+				return fieldError(rp+".predicate", err.Error())
+			}
+		}
 	}
 	return nil
 }
