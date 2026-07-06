@@ -13,12 +13,13 @@ import (
 )
 
 const (
-	// maxConcurrentCatchup bounds how many contract goroutines can run RPC-heavy
-	// catchup or HTTP-polling iterations simultaneously. On restart with ~300 live
-	// contracts all goroutines fire their first BlockNumber+GetEvents pair at once,
-	// tripping Alchemy's rate limit (429) and cascading into CU exhaustion. The
-	// semaphore turns that thundering herd into a bounded, steady stream. Matches
-	// the view-poller's maxConcurrentPolls value in internal/engine/poller.go.
+	// maxConcurrentCatchup is the default bound on how many contract goroutines
+	// can run RPC-heavy catchup or HTTP-polling iterations simultaneously. On
+	// restart with ~300 live contracts all goroutines fire their first GetEvents
+	// query at once, tripping Alchemy's rate limit (429) and cascading into CU
+	// exhaustion. The semaphore turns that thundering herd into a bounded, steady
+	// stream. Matches the view-poller's maxConcurrentPolls value in
+	// internal/engine/poller.go. Overridable via indexer.max_concurrent_catchup.
 	maxConcurrentCatchup = 16
 
 	// WSS reconnection backoff bounds.
@@ -33,9 +34,10 @@ const (
 	// since session drops can be transient.
 	maxWSSSessionFailures = 5
 
-	// Polling intervals.
-	catchupPollInterval = 100 * time.Millisecond
-	tipPollInterval     = 2 * time.Second
+	// Default polling intervals. Overridable per deployment via SubscriberConfig
+	// (wired from indexer.catchup_poll_interval / indexer.tip_poll_interval).
+	defaultCatchupPollInterval = 100 * time.Millisecond
+	defaultTipPollInterval     = 2 * time.Second
 
 	// Blocks behind chain tip that triggers fast catchup polling.
 	catchupThreshold uint64 = 50
@@ -105,19 +107,43 @@ type SubscriberConfig struct {
 	// the WSS provider accepts a block_id but does not replay older events
 	// (observed on Alchemy Starknet Sepolia).
 	CatchupWithPolling bool
+
+	// SharedFirehose replaces the per-contract subscription model with a SINGLE
+	// all-events WSS subscription, demultiplexed by from_address in-process. Each
+	// contract is first caught up over HTTP (as in CatchupWithPolling); then one
+	// subscription streams the whole chain's events and the router forwards only
+	// those from tracked addresses. Collapses ~N connections + N tip polls into 1.
+	// See firehose.go. Mutually exclusive with ForcePolling/CatchupWithPolling.
+	SharedFirehose bool
+
+	// TipPollInterval is how often the subscriber re-checks for new blocks while
+	// already at chain tip. 0 = defaultTipPollInterval. Should match the interval
+	// passed to StarknetProvider.StartTipPoller so the shared tip cache is fresh.
+	TipPollInterval time.Duration
+
+	// CatchupPollInterval is the delay between catchup/poll iterations while still
+	// more than catchupThreshold blocks behind tip. 0 = defaultCatchupPollInterval.
+	CatchupPollInterval time.Duration
+
+	// MaxConcurrentPolls bounds how many contract goroutines may run an RPC-heavy
+	// catchup/poll iteration simultaneously. 0 = maxConcurrentCatchup.
+	MaxConcurrentPolls int
 }
 
 // EventSubscriber manages per-contract event subscriptions with automatic
 // WSS reconnection and HTTP polling fallback.
 type EventSubscriber struct {
-	provider           *StarknetProvider
-	contracts          []ContractSubscription
-	events             chan<- RawEvent
-	reorgs             chan<- ReorgNotification
-	logger             *slog.Logger
-	blocksPerQuery     uint64
-	forcePolling       bool
-	catchupWithPolling bool
+	provider            *StarknetProvider
+	contracts           []ContractSubscription
+	events              chan<- RawEvent
+	reorgs              chan<- ReorgNotification
+	logger              *slog.Logger
+	blocksPerQuery      uint64
+	forcePolling        bool
+	catchupWithPolling  bool
+	sharedFirehose      bool
+	tipPollInterval     time.Duration
+	catchupPollInterval time.Duration
 
 	// dialWSS creates a WSS session. Override in tests.
 	dialWSS wssDialer
@@ -126,9 +152,14 @@ type EventSubscriber struct {
 	// HTTP-polling iterations concurrently. See maxConcurrentCatchup.
 	sem chan struct{}
 
-	// Per-contract cancel functions for dynamic management.
+	// Per-contract cancel functions for dynamic management (per-contract modes).
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
+
+	// router holds per-address forwarding state for the SharedFirehose transport,
+	// keyed by from_address hex. Nil in per-contract modes. See firehose.go.
+	routerMu sync.RWMutex
+	router   map[string]*firehoseSink
 }
 
 // NewSubscriber creates an EventSubscriber for the given contracts.
@@ -141,22 +172,40 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 
 	forcePolling := false
 	catchupWithPolling := false
+	sharedFirehose := false
+	tipInterval := defaultTipPollInterval
+	catchupInterval := defaultCatchupPollInterval
+	maxConcurrent := maxConcurrentCatchup
 	if cfg != nil {
 		forcePolling = cfg.ForcePolling
 		catchupWithPolling = cfg.CatchupWithPolling
+		sharedFirehose = cfg.SharedFirehose
+		if cfg.TipPollInterval > 0 {
+			tipInterval = cfg.TipPollInterval
+		}
+		if cfg.CatchupPollInterval > 0 {
+			catchupInterval = cfg.CatchupPollInterval
+		}
+		if cfg.MaxConcurrentPolls > 0 {
+			maxConcurrent = cfg.MaxConcurrentPolls
+		}
 	}
 
 	return &EventSubscriber{
-		provider:           p,
-		contracts:          contracts,
-		events:             events,
-		logger:             p.logger.With("component", "subscriber"),
-		blocksPerQuery:     blocksPerQuery,
-		forcePolling:       forcePolling,
-		catchupWithPolling: catchupWithPolling,
-		dialWSS:            defaultWSSDialer,
-		sem:                make(chan struct{}, maxConcurrentCatchup),
-		cancels:            make(map[string]context.CancelFunc),
+		provider:            p,
+		contracts:           contracts,
+		events:              events,
+		logger:              p.logger.With("component", "subscriber"),
+		blocksPerQuery:      blocksPerQuery,
+		forcePolling:        forcePolling,
+		catchupWithPolling:  catchupWithPolling,
+		sharedFirehose:      sharedFirehose,
+		tipPollInterval:     tipInterval,
+		catchupPollInterval: catchupInterval,
+		dialWSS:             defaultWSSDialer,
+		sem:                 make(chan struct{}, maxConcurrent),
+		cancels:             make(map[string]context.CancelFunc),
+		router:              make(map[string]*firehoseSink),
 	}
 }
 
@@ -168,6 +217,10 @@ func (s *EventSubscriber) SetReorgChan(ch chan<- ReorgNotification) {
 // Start begins event subscription for all contracts. Blocks until ctx is canceled.
 // Each contract gets its own goroutine with independent WSS/polling lifecycle.
 func (s *EventSubscriber) Start(ctx context.Context) error {
+	if s.sharedFirehose {
+		return s.startFirehose(ctx)
+	}
+
 	if len(s.contracts) == 0 {
 		// No initial contracts is valid when using dynamic registration.
 		<-ctx.Done()
@@ -206,6 +259,11 @@ func (s *EventSubscriber) Start(ctx context.Context) error {
 // AddContract dynamically adds a contract subscription to a running subscriber.
 // The new subscription runs in its own goroutine with independent lifecycle.
 func (s *EventSubscriber) AddContract(ctx context.Context, sub ContractSubscription) {
+	if s.sharedFirehose {
+		s.addContractFirehose(ctx, sub)
+		return
+	}
+
 	contractCtx, cancel := context.WithCancel(ctx)
 	addrHex := sub.Address.String()
 
@@ -225,6 +283,11 @@ func (s *EventSubscriber) AddContract(ctx context.Context, sub ContractSubscript
 
 // RemoveContract stops the subscription for a contract by its address hex string.
 func (s *EventSubscriber) RemoveContract(addressHex string) {
+	if s.sharedFirehose {
+		s.removeSink(addressHex)
+		return
+	}
+
 	s.mu.Lock()
 	cancel, ok := s.cancels[addressHex]
 	if ok {
@@ -277,8 +340,8 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 		}
 
 		// Bound catchup concurrency: acquire the semaphore for the RPC-heavy
-		// pair of calls (BlockNumber + GetEvents). Released before the
-		// inter-iteration sleep so other goroutines can proceed.
+		// GetEvents call (the chain tip is served from the shared cache, not an
+		// RPC). Released before the inter-iteration sleep so others can proceed.
 		select {
 		case s.sem <- struct{}{}:
 		case <-ctx.Done():
@@ -292,7 +355,7 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(tipPollInterval):
+			case <-time.After(s.tipPollInterval):
 				continue
 			}
 		}
@@ -319,7 +382,7 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(catchupPollInterval):
+		case <-time.After(s.catchupPollInterval):
 		}
 	}
 }
@@ -332,7 +395,7 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 // that catchup is complete (check before consuming events).
 func (s *EventSubscriber) catchupIteration(ctx context.Context, contract ContractSubscription, lastBlock uint64, logger *slog.Logger) ([]RawEvent, uint64, uint64, error) {
 	rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
-	latestBlock, err := s.provider.BlockNumber(rpcCtx)
+	latestBlock, err := s.provider.CachedBlockNumber(rpcCtx)
 	cancel()
 	if err != nil {
 		logger.Warn("failed to get block number during catchup", "error", err)
@@ -551,8 +614,8 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 		}
 
 		// Bound polling concurrency: acquire the semaphore for the RPC-heavy
-		// pair of calls (BlockNumber + GetEvents). Released before the
-		// inter-iteration sleep so other goroutines can run while we wait.
+		// GetEvents call (the chain tip is served from the shared cache, not an
+		// RPC). Released before the inter-iteration sleep so others can run.
 		select {
 		case s.sem <- struct{}{}:
 		case <-ctx.Done():
@@ -561,7 +624,7 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 		}
 
 		rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
-		latestBlock, err := s.provider.BlockNumber(rpcCtx)
+		latestBlock, err := s.provider.CachedBlockNumber(rpcCtx)
 		cancel()
 		if err != nil {
 			<-s.sem
@@ -570,7 +633,7 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 			case <-ctx.Done():
 				logger.Debug("polling stopped", "reason", ctx.Err())
 				return ctx.Err()
-			case <-time.After(tipPollInterval):
+			case <-time.After(s.tipPollInterval):
 				continue
 			}
 		}
@@ -582,7 +645,7 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 			case <-ctx.Done():
 				logger.Debug("polling stopped", "reason", ctx.Err())
 				return ctx.Err()
-			case <-time.After(tipPollInterval):
+			case <-time.After(s.tipPollInterval):
 				continue
 			}
 		}
@@ -610,7 +673,7 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 			case <-ctx.Done():
 				logger.Debug("polling stopped", "reason", ctx.Err())
 				return ctx.Err()
-			case <-time.After(tipPollInterval):
+			case <-time.After(s.tipPollInterval):
 				continue
 			}
 		}
@@ -638,9 +701,9 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 		*lastBlock = endBlock + 1
 
 		// Adaptive timing: fast catchup vs slow at tip.
-		interval := tipPollInterval
+		interval := s.tipPollInterval
 		if latestBlock-*lastBlock > catchupThreshold {
-			interval = catchupPollInterval
+			interval = s.catchupPollInterval
 		}
 
 		select {

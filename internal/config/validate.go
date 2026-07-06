@@ -81,6 +81,10 @@ func Validate(cfg *Config) error {
 		}
 	}
 
+	if err := validateIndexerPolling(&cfg.Indexer); err != nil {
+		return err
+	}
+
 	if len(cfg.Contracts) == 0 && len(cfg.Discover) == 0 {
 		return fieldError("contracts", "at least one contract or discover entry is required")
 	}
@@ -130,6 +134,33 @@ func Validate(cfg *Config) error {
 }
 
 // validateContractAddress checks that the address looks like a Starknet address.
+// validateIndexerPolling checks the optional polling-cadence knobs. Empty
+// duration strings and a zero concurrency are valid (built-in defaults apply).
+func validateIndexerPolling(ic *IndexerConfig) error {
+	if ic.TipPollInterval != "" {
+		d, err := time.ParseDuration(ic.TipPollInterval)
+		if err != nil {
+			return fieldError("indexer.tip_poll_interval", fmt.Sprintf("invalid duration: %v", err))
+		}
+		if d < 100*time.Millisecond {
+			return fieldError("indexer.tip_poll_interval", "minimum is 100ms")
+		}
+	}
+	if ic.CatchupPollInterval != "" {
+		d, err := time.ParseDuration(ic.CatchupPollInterval)
+		if err != nil {
+			return fieldError("indexer.catchup_poll_interval", fmt.Sprintf("invalid duration: %v", err))
+		}
+		if d < 10*time.Millisecond {
+			return fieldError("indexer.catchup_poll_interval", "minimum is 10ms")
+		}
+	}
+	if ic.MaxConcurrentCatchup < 0 {
+		return fieldError("indexer.max_concurrent_catchup", "must be >= 0")
+	}
+	return nil
+}
+
 func validateContractAddress(addr string) error {
 	if !strings.HasPrefix(addr, "0x") {
 		return fmt.Errorf("must start with 0x")

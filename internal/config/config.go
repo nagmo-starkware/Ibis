@@ -53,6 +53,22 @@ type IndexerConfig struct {
 	Transport     string          `yaml:"transport,omitempty"`
 	UDCAddress    string          `yaml:"udc_address,omitempty"`
 	UDCEvent      *UDCEventFormat `yaml:"udc_event,omitempty"`
+
+	// Polling cadence knobs. All optional; when empty/zero the built-in defaults
+	// in internal/provider apply. Exposed so the chain-tip poll rate and catchup
+	// aggressiveness can be tuned per deployment without recompiling the binary —
+	// tip-polling RPC dominates Compute-Unit consumption on busy indexers.
+	//
+	//   TipPollInterval      — how often the shared chain-tip poller refreshes the
+	//                          latest block number, and the at-tip re-check cadence
+	//                          (duration string, e.g. "2s"; default 2s).
+	//   CatchupPollInterval  — delay between catchup iterations while behind tip
+	//                          (duration string, e.g. "100ms"; default 100ms).
+	//   MaxConcurrentCatchup — bound on concurrent catchup/poll iterations across
+	//                          all contract goroutines (default 16).
+	TipPollInterval      string `yaml:"tip_poll_interval,omitempty"`
+	CatchupPollInterval  string `yaml:"catchup_poll_interval,omitempty"`
+	MaxConcurrentCatchup int    `yaml:"max_concurrent_catchup,omitempty"`
 }
 
 // UDCEventFormat configures how ibis parses UDC ContractDeployed events.

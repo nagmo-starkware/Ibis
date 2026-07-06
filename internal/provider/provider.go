@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/NethermindEth/juno/core/felt"
 	"github.com/NethermindEth/starknet.go/rpc"
@@ -58,6 +60,17 @@ type StarknetProvider struct {
 	// Block timestamp cache: block number -> Unix timestamp.
 	tsMu    sync.RWMutex
 	tsCache map[uint64]uint64
+
+	// Chain-tip cache. A single background poller (StartTipPoller) refreshes the
+	// latest block number so the per-contract subscriber goroutines read one
+	// shared value via CachedBlockNumber instead of each issuing their own
+	// starknet_blockNumber call — which previously scaled tip-polling RPC by the
+	// number of live contracts (the dominant CU consumer). tipUpdated is the
+	// UnixNano of the last successful refresh; tipIntervalNanos drives the
+	// staleness guard in CachedBlockNumber.
+	tipBlock         atomic.Uint64
+	tipUpdated       atomic.Int64
+	tipIntervalNanos atomic.Int64
 }
 
 // New creates a StarknetProvider from an RPC URL.
@@ -82,18 +95,96 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 		}
 	}
 
-	return &StarknetProvider{
+	p := &StarknetProvider{
 		httpRPC: httpRPC,
 		httpURL: httpURL,
 		wsURL:   wsURL,
 		logger:  logger,
 		tsCache: make(map[uint64]uint64),
-	}, nil
+	}
+	p.tipIntervalNanos.Store(int64(defaultTipPollInterval))
+	return p, nil
 }
 
-// BlockNumber returns the latest block number from the chain.
+// BlockNumber returns the latest block number directly from the chain (one RPC
+// call). Prefer CachedBlockNumber on hot paths — see StartTipPoller.
 func (p *StarknetProvider) BlockNumber(ctx context.Context) (uint64, error) {
 	return p.httpRPC.BlockNumber(ctx)
+}
+
+// StartTipPoller primes the chain-tip cache with one synchronous fetch, then
+// launches a background goroutine that refreshes it every interval until ctx is
+// canceled. Subscriber goroutines read the cached value via CachedBlockNumber,
+// so the process issues a single starknet_blockNumber per interval regardless of
+// how many contracts are indexed — previously it was one call per contract per
+// poll iteration, the dominant source of RPC/CU consumption. Call once at
+// startup, before the subscriber begins, so the cache is warm.
+func (p *StarknetProvider) StartTipPoller(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultTipPollInterval
+	}
+	p.tipIntervalNanos.Store(int64(interval))
+
+	// Prime synchronously so subscribers never observe a zero tip at startup.
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
+	if bn, err := p.httpRPC.BlockNumber(rpcCtx); err == nil {
+		p.tipBlock.Store(bn)
+		p.tipUpdated.Store(time.Now().UnixNano())
+	} else if ctx.Err() == nil {
+		p.logger.Warn("tip poller: initial block number fetch failed", "error", err)
+	}
+	cancel()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
+				bn, err := p.httpRPC.BlockNumber(rpcCtx)
+				cancel()
+				if err != nil {
+					if ctx.Err() == nil {
+						p.logger.Warn("tip poller: block number refresh failed", "error", err)
+					}
+					continue
+				}
+				p.tipBlock.Store(bn)
+				p.tipUpdated.Store(time.Now().UnixNano())
+			}
+		}
+	}()
+}
+
+// CachedBlockNumber returns the most recently polled chain tip without issuing an
+// RPC call in the common case. It falls back to a direct fetch when the cache has
+// never been primed, or when the background poller has gone stale (older than 4×
+// the poll interval), so callers never read a zero tip or stall behind a wedged
+// poller. When a fallback fetch fails but a prior value exists, the stale value
+// is returned in preference to an error: a slightly old tip only delays event
+// delivery by one poll, whereas an error aborts the caller's iteration.
+func (p *StarknetProvider) CachedBlockNumber(ctx context.Context) (uint64, error) {
+	bn := p.tipBlock.Load()
+	if bn != 0 {
+		maxStale := 4 * time.Duration(p.tipIntervalNanos.Load())
+		if maxStale <= 0 || time.Since(time.Unix(0, p.tipUpdated.Load())) < maxStale {
+			return bn, nil
+		}
+	}
+
+	fresh, err := p.httpRPC.BlockNumber(ctx)
+	if err != nil {
+		if bn != 0 {
+			return bn, nil
+		}
+		return 0, err
+	}
+	p.tipBlock.Store(fresh)
+	p.tipUpdated.Store(time.Now().UnixNano())
+	return fresh, nil
 }
 
 // GetBlockTimestamp returns the Unix timestamp for a block, using a cache
