@@ -30,6 +30,14 @@ var runCmd = &cobra.Command{
 			return err
 		}
 
+		// IBIS_TRANSPORT overrides indexer.transport at runtime (e.g. "firehose"),
+		// so the transport can be flipped per-deployment via an env var — no shared
+		// config edit or image rebuild. This is the firehose A/B enable switch and
+		// the instant rollback lever (unset/change the env var + redeploy).
+		if t := os.Getenv("IBIS_TRANSPORT"); t != "" {
+			cfg.Indexer.Transport = t
+		}
+
 		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 			Level: slog.LevelInfo,
 		}))

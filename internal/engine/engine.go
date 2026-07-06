@@ -781,6 +781,20 @@ func (e *Engine) FindContract(name string) *config.ContractConfig {
 	return nil
 }
 
+// parseDurationOrZero parses a duration string, returning 0 for an empty or
+// invalid value so callers fall back to their built-in defaults. Values are
+// validated up front in config.Validate; this is a defensive re-parse.
+func parseDurationOrZero(s string) time.Duration {
+	if s == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
 // Run starts the indexing engine. It resolves ABIs, creates table schemas,
 // determines the starting block, starts the event subscriber, and processes
 // events until the context is canceled.
@@ -805,11 +819,19 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	// Step 3: Build subscriptions and start the subscriber.
+	// Polling cadence is validated in config.Validate; parse defensively here and
+	// treat a bad/empty value as 0 so the provider/subscriber apply their defaults.
+	tipInterval := parseDurationOrZero(e.cfg.Indexer.TipPollInterval)
+	catchupInterval := parseDurationOrZero(e.cfg.Indexer.CatchupPollInterval)
 	subs := e.buildSubscriptions(startBlocks)
 	subscriber := e.provider.NewSubscriber(subs, e.events, &provider.SubscriberConfig{
-		BlocksPerQuery:     uint64(e.cfg.Indexer.BatchSize) * 10,
-		ForcePolling:       e.cfg.Indexer.Transport == "http",
-		CatchupWithPolling: e.cfg.Indexer.Transport == "catchup",
+		BlocksPerQuery:      uint64(e.cfg.Indexer.BatchSize) * 10,
+		ForcePolling:        e.cfg.Indexer.Transport == "http",
+		CatchupWithPolling:  e.cfg.Indexer.Transport == "catchup",
+		SharedFirehose:      e.cfg.Indexer.Transport == "firehose",
+		TipPollInterval:     tipInterval,
+		CatchupPollInterval: catchupInterval,
+		MaxConcurrentPolls:  e.cfg.Indexer.MaxConcurrentCatchup,
 	})
 	subscriber.SetReorgChan(e.reorgs)
 
@@ -820,6 +842,11 @@ func (e *Engine) Run(ctx context.Context) error {
 	defer subCancel()
 
 	e.runCtx = subCtx
+
+	// Start the shared chain-tip poller before the subscriber so every contract
+	// goroutine reads one cached block number (via CachedBlockNumber) instead of
+	// each issuing its own starknet_blockNumber call. Stops when subCtx cancels.
+	e.provider.StartTipPoller(subCtx, tipInterval)
 
 	var subErr error
 	var wg sync.WaitGroup
