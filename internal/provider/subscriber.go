@@ -128,6 +128,13 @@ type SubscriberConfig struct {
 	// MaxConcurrentPolls bounds how many contract goroutines may run an RPC-heavy
 	// catchup/poll iteration simultaneously. 0 = maxConcurrentCatchup.
 	MaxConcurrentPolls int
+
+	// SharedTipPoller makes the subscriber read the chain tip from the provider's
+	// shared cache (CachedBlockNumber) instead of issuing a direct BlockNumber per
+	// poll. The caller must also start StarknetProvider.StartTipPoller. Implied by
+	// SharedFirehose. When false, the subscriber uses direct per-poll BlockNumber
+	// (legacy behavior).
+	SharedTipPoller bool
 }
 
 // EventSubscriber manages per-contract event subscriptions with automatic
@@ -142,6 +149,7 @@ type EventSubscriber struct {
 	forcePolling        bool
 	catchupWithPolling  bool
 	sharedFirehose      bool
+	sharedTipPoller     bool
 	tipPollInterval     time.Duration
 	catchupPollInterval time.Duration
 
@@ -173,6 +181,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 	forcePolling := false
 	catchupWithPolling := false
 	sharedFirehose := false
+	sharedTipPoller := false
 	tipInterval := defaultTipPollInterval
 	catchupInterval := defaultCatchupPollInterval
 	maxConcurrent := maxConcurrentCatchup
@@ -180,6 +189,8 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		forcePolling = cfg.ForcePolling
 		catchupWithPolling = cfg.CatchupWithPolling
 		sharedFirehose = cfg.SharedFirehose
+		// The firehose relies on the shared tip cache, so it implies the poller.
+		sharedTipPoller = cfg.SharedTipPoller || cfg.SharedFirehose
 		if cfg.TipPollInterval > 0 {
 			tipInterval = cfg.TipPollInterval
 		}
@@ -200,6 +211,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		forcePolling:        forcePolling,
 		catchupWithPolling:  catchupWithPolling,
 		sharedFirehose:      sharedFirehose,
+		sharedTipPoller:     sharedTipPoller,
 		tipPollInterval:     tipInterval,
 		catchupPollInterval: catchupInterval,
 		dialWSS:             defaultWSSDialer,
@@ -300,6 +312,16 @@ func (s *EventSubscriber) RemoveContract(addressHex string) {
 	}
 }
 
+// tipBlockNumber returns the current chain tip: from the provider's shared cache
+// when the tip poller is enabled (one RPC per interval, shared across contracts),
+// otherwise a direct per-poll BlockNumber call (legacy per-contract behavior).
+func (s *EventSubscriber) tipBlockNumber(ctx context.Context) (uint64, error) {
+	if s.sharedTipPoller {
+		return s.provider.CachedBlockNumber(ctx)
+	}
+	return s.provider.BlockNumber(ctx)
+}
+
 // subscribeContract handles the full subscription lifecycle for one contract:
 // try WSS first, fall back to polling if WSS fails.
 func (s *EventSubscriber) subscribeContract(ctx context.Context, contract ContractSubscription) error {
@@ -395,7 +417,7 @@ func (s *EventSubscriber) pollUntilCaughtUp(ctx context.Context, contract Contra
 // that catchup is complete (check before consuming events).
 func (s *EventSubscriber) catchupIteration(ctx context.Context, contract ContractSubscription, lastBlock uint64, logger *slog.Logger) ([]RawEvent, uint64, uint64, error) {
 	rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
-	latestBlock, err := s.provider.CachedBlockNumber(rpcCtx)
+	latestBlock, err := s.tipBlockNumber(rpcCtx)
 	cancel()
 	if err != nil {
 		logger.Warn("failed to get block number during catchup", "error", err)
@@ -624,7 +646,7 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 		}
 
 		rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
-		latestBlock, err := s.provider.CachedBlockNumber(rpcCtx)
+		latestBlock, err := s.tipBlockNumber(rpcCtx)
 		cancel()
 		if err != nil {
 			<-s.sem

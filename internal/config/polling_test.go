@@ -30,11 +30,15 @@ contracts:
 func TestValidate_PollingKnobsValid(t *testing.T) {
 	path := writeTestConfig(t, pollingConfigYAML(`  tip_poll_interval: 5s
   catchup_poll_interval: 200ms
-  max_concurrent_catchup: 8`))
+  max_concurrent_catchup: 8
+  shared_tip_poller: true`))
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.Indexer.SharedTipPoller {
+		t.Error("SharedTipPoller = false, want true")
 	}
 	if cfg.Indexer.TipPollInterval != "5s" {
 		t.Errorf("TipPollInterval = %q, want 5s", cfg.Indexer.TipPollInterval)
@@ -57,7 +61,7 @@ func TestValidate_PollingKnobsOmittedOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() with no polling knobs errored: %v", err)
 	}
-	if cfg.Indexer.TipPollInterval != "" || cfg.Indexer.CatchupPollInterval != "" || cfg.Indexer.MaxConcurrentCatchup != 0 {
+	if cfg.Indexer.TipPollInterval != "" || cfg.Indexer.CatchupPollInterval != "" || cfg.Indexer.MaxConcurrentCatchup != 0 || cfg.Indexer.SharedTipPoller {
 		t.Errorf("omitted knobs should be zero-valued, got %+v", cfg.Indexer)
 	}
 }
