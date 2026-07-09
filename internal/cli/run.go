@@ -37,6 +37,11 @@ var runCmd = &cobra.Command{
 		if t := os.Getenv("IBIS_TRANSPORT"); t != "" {
 			cfg.Indexer.Transport = t
 		}
+		// IBIS_SHARED_TIP_POLLER enables the shared chain-tip poller independently of
+		// transport (same flip/rollback ergonomics as IBIS_TRANSPORT).
+		if v := os.Getenv("IBIS_SHARED_TIP_POLLER"); v != "" {
+			cfg.Indexer.SharedTipPoller = v == "1" || v == "true"
+		}
 
 		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 			Level: slog.LevelInfo,

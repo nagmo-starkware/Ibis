@@ -823,12 +823,17 @@ func (e *Engine) Run(ctx context.Context) error {
 	// treat a bad/empty value as 0 so the provider/subscriber apply their defaults.
 	tipInterval := parseDurationOrZero(e.cfg.Indexer.TipPollInterval)
 	catchupInterval := parseDurationOrZero(e.cfg.Indexer.CatchupPollInterval)
+	// The shared tip poller is opt-in (default off = legacy per-contract polling),
+	// so bumping the image is inert until enabled. The firehose transport requires
+	// it, so it turns the poller on implicitly.
+	useSharedTip := e.cfg.Indexer.SharedTipPoller || e.cfg.Indexer.Transport == "firehose"
 	subs := e.buildSubscriptions(startBlocks)
 	subscriber := e.provider.NewSubscriber(subs, e.events, &provider.SubscriberConfig{
 		BlocksPerQuery:      uint64(e.cfg.Indexer.BatchSize) * 10,
 		ForcePolling:        e.cfg.Indexer.Transport == "http",
 		CatchupWithPolling:  e.cfg.Indexer.Transport == "catchup",
 		SharedFirehose:      e.cfg.Indexer.Transport == "firehose",
+		SharedTipPoller:     useSharedTip,
 		TipPollInterval:     tipInterval,
 		CatchupPollInterval: catchupInterval,
 		MaxConcurrentPolls:  e.cfg.Indexer.MaxConcurrentCatchup,
@@ -843,10 +848,13 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	e.runCtx = subCtx
 
-	// Start the shared chain-tip poller before the subscriber so every contract
-	// goroutine reads one cached block number (via CachedBlockNumber) instead of
-	// each issuing its own starknet_blockNumber call. Stops when subCtx cancels.
-	e.provider.StartTipPoller(subCtx, tipInterval)
+	// Start the shared chain-tip poller (only when enabled) before the subscriber
+	// so every contract goroutine reads one cached block number instead of each
+	// issuing its own starknet_blockNumber call. Stops when subCtx cancels. When
+	// disabled, the subscriber falls back to direct per-poll BlockNumber calls.
+	if useSharedTip {
+		e.provider.StartTipPoller(subCtx, tipInterval)
+	}
 
 	var subErr error
 	var wg sync.WaitGroup

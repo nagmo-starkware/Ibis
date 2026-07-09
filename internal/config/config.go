@@ -69,6 +69,13 @@ type IndexerConfig struct {
 	TipPollInterval      string `yaml:"tip_poll_interval,omitempty"`
 	CatchupPollInterval  string `yaml:"catchup_poll_interval,omitempty"`
 	MaxConcurrentCatchup int    `yaml:"max_concurrent_catchup,omitempty"`
+
+	// SharedTipPoller enables the shared chain-tip poller: one starknet_blockNumber
+	// per interval into a cache, read by every contract, instead of each contract
+	// polling the tip itself. Default false = legacy per-contract polling, so the
+	// change is inert until explicitly enabled. The firehose transport turns it on
+	// implicitly. Overridable at runtime via IBIS_SHARED_TIP_POLLER.
+	SharedTipPoller bool `yaml:"shared_tip_poller,omitempty"`
 }
 
 // UDCEventFormat configures how ibis parses UDC ContractDeployed events.

@@ -135,7 +135,7 @@ func (s *EventSubscriber) firehoseGapFill(ctx context.Context) uint64 {
 	sinks := s.snapshotSinks()
 	if len(sinks) == 0 {
 		// Dynamic-only: no contracts yet. Resume from the current tip.
-		bn, err := s.provider.CachedBlockNumber(ctx)
+		bn, err := s.tipBlockNumber(ctx)
 		if err != nil {
 			return 0
 		}
@@ -165,7 +165,7 @@ func (s *EventSubscriber) firehoseGapFill(ctx context.Context) uint64 {
 	wg.Wait()
 
 	if minLast == math.MaxUint64 {
-		bn, err := s.provider.CachedBlockNumber(ctx)
+		bn, err := s.tipBlockNumber(ctx)
 		if err != nil {
 			return 0
 		}
@@ -273,7 +273,7 @@ func (s *EventSubscriber) forwardIfTracked(ctx context.Context, evt *rpc.Emitted
 // through the shared subscription. The two ranges partition cleanly at the tip
 // captured now, so there is no overlap (dup) and no gap.
 func (s *EventSubscriber) addContractFirehose(ctx context.Context, sub ContractSubscription) {
-	tip, err := s.provider.CachedBlockNumber(ctx)
+	tip, err := s.tipBlockNumber(ctx)
 	if err != nil {
 		// No tip available: fall back to forwarding from StartBlock and skip
 		// backfill; gap-fill on the next reconnect will reconcile.

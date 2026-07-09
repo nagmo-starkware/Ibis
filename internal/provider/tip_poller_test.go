@@ -289,6 +289,58 @@ func TestNewSubscriberResolvesPollingConfig(t *testing.T) {
 	}
 }
 
+// TestSubscriberTipBlockNumberGate: with sharedTipPoller off, each tip read hits
+// RPC directly (legacy); on, reads are served from the shared cache; and the
+// firehose transport implies the poller.
+func TestSubscriberTipBlockNumberGate(t *testing.T) {
+	var calls atomic.Int64
+	server := mockRPCServer(t, blockNumberCounter(&calls, func() uint64 { return 900 }))
+	defer server.Close()
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer p.Close()
+	events := make(chan RawEvent, 1)
+
+	// Off (default): each call is a direct, uncached BlockNumber.
+	off := p.NewSubscriber(nil, events, &SubscriberConfig{})
+	if off.sharedTipPoller {
+		t.Fatal("sharedTipPoller should default to false")
+	}
+	for i := 0; i < 3; i++ {
+		if bn, err := off.tipBlockNumber(context.Background()); err != nil || bn != 900 {
+			t.Fatalf("tipBlockNumber = %d, %v; want 900, nil", bn, err)
+		}
+	}
+	if n := calls.Load(); n != 3 {
+		t.Errorf("off: %d RPC calls, want 3 (uncached)", n)
+	}
+
+	// On: a primed cache serves reads with no further RPC.
+	calls.Store(0)
+	p.tipBlock.Store(900)
+	p.tipUpdated.Store(time.Now().UnixNano())
+	p.tipIntervalNanos.Store(int64(2 * time.Second))
+	on := p.NewSubscriber(nil, events, &SubscriberConfig{SharedTipPoller: true})
+	if !on.sharedTipPoller {
+		t.Fatal("sharedTipPoller should be true")
+	}
+	for i := 0; i < 3; i++ {
+		if bn, _ := on.tipBlockNumber(context.Background()); bn != 900 {
+			t.Fatalf("cached tip = %d, want 900", bn)
+		}
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("on: %d RPC calls, want 0 (served from cache)", n)
+	}
+
+	// The firehose transport implies the shared tip poller.
+	if fh := p.NewSubscriber(nil, events, &SubscriberConfig{SharedFirehose: true}); !fh.sharedTipPoller {
+		t.Error("SharedFirehose should imply sharedTipPoller")
+	}
+}
+
 // TestStartTipPollerStopsOnCancel: cancelling the context stops the background
 // refresh (no further RPC calls after cancel settles).
 func TestStartTipPollerStopsOnCancel(t *testing.T) {
