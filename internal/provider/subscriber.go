@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NethermindEth/juno/core/felt"
 	"github.com/NethermindEth/starknet.go/client"
 	"github.com/NethermindEth/starknet.go/rpc"
 )
@@ -116,6 +117,21 @@ type SubscriberConfig struct {
 	// See firehose.go. Mutually exclusive with ForcePolling/CatchupWithPolling.
 	SharedFirehose bool
 
+	// KeysFirehose enables the "firehose-keys" transport (option D): MULTIPLE
+	// WSS subscriptions partitioned by event-key filter (one keys-sub for the
+	// option-event-family chain-wide, plus one address-sub per non-wildcard
+	// contract and per ERC20 wildcard child), sharing ONE in-process tracked-
+	// address set. Unlike SharedFirehose's single empty-filter subscription,
+	// the node only delivers events matching each stream's filter, cutting CU
+	// usage. See firehose_keys.go. Mutually exclusive with SharedFirehose.
+	KeysFirehose bool
+
+	// OptionSelectors is the union of option-family event selectors (i.e. every
+	// event of every option-manager/factory/child ABI, EXCLUDING Transfer and
+	// Approval) used as the keys-sub filter when KeysFirehose is enabled.
+	// Required (non-empty) for KeysFirehose to do anything useful.
+	OptionSelectors []*felt.Felt
+
 	// TipPollInterval is how often the subscriber re-checks for new blocks while
 	// already at chain tip. 0 = defaultTipPollInterval. Should match the interval
 	// passed to StarknetProvider.StartTipPoller so the shared tip cache is fresh.
@@ -149,6 +165,8 @@ type EventSubscriber struct {
 	forcePolling        bool
 	catchupWithPolling  bool
 	sharedFirehose      bool
+	keysFirehose        bool
+	optionSelectors     []*felt.Felt
 	sharedTipPoller     bool
 	tipPollInterval     time.Duration
 	catchupPollInterval time.Duration
@@ -168,6 +186,33 @@ type EventSubscriber struct {
 	// keyed by from_address hex. Nil in per-contract modes. See firehose.go.
 	routerMu sync.RWMutex
 	router   map[string]*firehoseSink
+
+	// --- firehose-keys (option D) transport state — see firehose_keys.go ---
+
+	// tracked is the SHARED membership set across every firehose-keys stream:
+	// which addresses are forwarded at all, keyed by address hex. This is the
+	// ONLY state shared between streams — each stream owns its own per-address
+	// cursor map (firehoseKeysStream.cursors), so one stream advancing past an
+	// address's events can never cause another stream covering the same
+	// address to drop events it hasn't forwarded yet.
+	trackedMu sync.RWMutex
+	tracked   map[string]ContractSubscription
+
+	// streamsMu guards keysStream, addrStreams, and addrCancels below (stream
+	// *membership*, not any individual stream's internal cursors/fills, which
+	// each stream guards itself).
+	streamsMu sync.Mutex
+	// keysStream is the single chain-wide keys-sub stream (option-family event
+	// selectors, no from_address filter). Nil until startKeysFirehose runs.
+	keysStream *firehoseKeysStream
+	// addrStreams holds every address-sub stream — the static ones seeded at
+	// Start for non-wildcard contracts (tokens, UDC), and the dynamic
+	// per-child Transfer/Approval streams created by AddContract for ERC20
+	// wildcard children (OptionToken instances) — keyed by address hex.
+	addrStreams map[string]*firehoseKeysStream
+	// addrCancels holds the cancel func for each entry in addrStreams, so
+	// RemoveContract can tear one down.
+	addrCancels map[string]context.CancelFunc
 }
 
 // NewSubscriber creates an EventSubscriber for the given contracts.
@@ -181,6 +226,8 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 	forcePolling := false
 	catchupWithPolling := false
 	sharedFirehose := false
+	keysFirehose := false
+	var optionSelectors []*felt.Felt
 	sharedTipPoller := false
 	tipInterval := defaultTipPollInterval
 	catchupInterval := defaultCatchupPollInterval
@@ -189,8 +236,11 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		forcePolling = cfg.ForcePolling
 		catchupWithPolling = cfg.CatchupWithPolling
 		sharedFirehose = cfg.SharedFirehose
-		// The firehose relies on the shared tip cache, so it implies the poller.
-		sharedTipPoller = cfg.SharedTipPoller || cfg.SharedFirehose
+		keysFirehose = cfg.KeysFirehose
+		optionSelectors = cfg.OptionSelectors
+		// Both firehose transports rely on the shared tip cache, so either
+		// implies the poller.
+		sharedTipPoller = cfg.SharedTipPoller || cfg.SharedFirehose || cfg.KeysFirehose
 		if cfg.TipPollInterval > 0 {
 			tipInterval = cfg.TipPollInterval
 		}
@@ -211,6 +261,8 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		forcePolling:        forcePolling,
 		catchupWithPolling:  catchupWithPolling,
 		sharedFirehose:      sharedFirehose,
+		keysFirehose:        keysFirehose,
+		optionSelectors:     optionSelectors,
 		sharedTipPoller:     sharedTipPoller,
 		tipPollInterval:     tipInterval,
 		catchupPollInterval: catchupInterval,
@@ -218,6 +270,9 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		sem:                 make(chan struct{}, maxConcurrent),
 		cancels:             make(map[string]context.CancelFunc),
 		router:              make(map[string]*firehoseSink),
+		tracked:             make(map[string]ContractSubscription),
+		addrStreams:         make(map[string]*firehoseKeysStream),
+		addrCancels:         make(map[string]context.CancelFunc),
 	}
 }
 
@@ -231,6 +286,9 @@ func (s *EventSubscriber) SetReorgChan(ch chan<- ReorgNotification) {
 func (s *EventSubscriber) Start(ctx context.Context) error {
 	if s.sharedFirehose {
 		return s.startFirehose(ctx)
+	}
+	if s.keysFirehose {
+		return s.startKeysFirehose(ctx)
 	}
 
 	if len(s.contracts) == 0 {
@@ -275,6 +333,10 @@ func (s *EventSubscriber) AddContract(ctx context.Context, sub ContractSubscript
 		s.addContractFirehose(ctx, sub)
 		return
 	}
+	if s.keysFirehose {
+		s.addContractKeysFirehose(ctx, sub)
+		return
+	}
 
 	contractCtx, cancel := context.WithCancel(ctx)
 	addrHex := sub.Address.String()
@@ -297,6 +359,10 @@ func (s *EventSubscriber) AddContract(ctx context.Context, sub ContractSubscript
 func (s *EventSubscriber) RemoveContract(addressHex string) {
 	if s.sharedFirehose {
 		s.removeSink(addressHex)
+		return
+	}
+	if s.keysFirehose {
+		s.removeContractKeysFirehose(addressHex)
 		return
 	}
 

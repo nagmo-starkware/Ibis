@@ -226,6 +226,8 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 		sub := provider.ContractSubscription{
 			Address:    address,
 			StartBlock: derefUint64(cc.StartBlock),
+			Wildcard:   hasWildcardEvent(cc),
+			ERC20:      registry.MatchName("Transfer") != nil,
 		}
 
 		if !hasWildcardEvent(cc) {
@@ -319,6 +321,8 @@ func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig,
 		sub := provider.ContractSubscription{
 			Address:    address,
 			StartBlock: derefUint64(cc.StartBlock),
+			Wildcard:   hasWildcardEvent(cc),
+			ERC20:      registry.MatchName("Transfer") != nil,
 		}
 
 		if !hasWildcardEvent(cc) {

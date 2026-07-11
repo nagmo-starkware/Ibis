@@ -144,6 +144,16 @@ func (r *ABIResolver) resolveLocal(contractName string) (*abi.ABI, error) {
 	return abi.ParseFile(path)
 }
 
+// ResolveByName resolves an ABI by contract/type name using ONLY local
+// discovery (target/dev/ search, optionally running scarb build) — no chain
+// fetch, no cache lookup by address. Used to resolve a factory's declared
+// ChildABI (e.g. "OptionToken") independent of any specific deployed
+// instance, so callers can learn a factory child's event set before any
+// child has actually been discovered on chain.
+func (r *ABIResolver) ResolveByName(name string) (*abi.ABI, error) {
+	return r.resolveLocal(name)
+}
+
 // resolveFromChain fetches the contract class ABI from the chain via RPC.
 func (r *ABIResolver) resolveFromChain(ctx context.Context, address string) (*abi.ABI, error) {
 	if r.fetcher == nil {
