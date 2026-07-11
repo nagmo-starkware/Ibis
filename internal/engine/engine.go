@@ -119,6 +119,13 @@ type Engine struct {
 	// lastLoggedBlock tracks the last block number logged at INFO level
 	// to avoid spamming logs with per-event messages.
 	lastLoggedBlock uint64
+
+	// optionSelectors is the union of option-family event selectors (every
+	// event of every wildcard contract's ABI, plus every factory's declared
+	// ChildABI, EXCLUDING Transfer/Approval) computed once in setup() by
+	// computeOptionSelectors. Used as the firehose-keys transport's keys-sub
+	// filter; unused by every other transport.
+	optionSelectors []*felt.Felt
 }
 
 // New creates an Engine with the given dependencies.
@@ -309,6 +316,8 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 		sub := provider.ContractSubscription{
 			Address:    address,
 			StartBlock: derefUint64(resolvedStart),
+			Wildcard:   hasWildcardEvent(cc),
+			ERC20:      registry.MatchName("Transfer") != nil,
 		}
 
 		// Build key filters if no wildcard.
@@ -824,15 +833,19 @@ func (e *Engine) Run(ctx context.Context) error {
 	tipInterval := parseDurationOrZero(e.cfg.Indexer.TipPollInterval)
 	catchupInterval := parseDurationOrZero(e.cfg.Indexer.CatchupPollInterval)
 	// The shared tip poller is opt-in (default off = legacy per-contract polling),
-	// so bumping the image is inert until enabled. The firehose transport requires
-	// it, so it turns the poller on implicitly.
-	useSharedTip := e.cfg.Indexer.SharedTipPoller || e.cfg.Indexer.Transport == "firehose"
+	// so bumping the image is inert until enabled. Both firehose transports
+	// require it, so either turns the poller on implicitly.
+	useSharedTip := e.cfg.Indexer.SharedTipPoller ||
+		e.cfg.Indexer.Transport == "firehose" ||
+		e.cfg.Indexer.Transport == "firehose-keys"
 	subs := e.buildSubscriptions(startBlocks)
 	subscriber := e.provider.NewSubscriber(subs, e.events, &provider.SubscriberConfig{
 		BlocksPerQuery:      uint64(e.cfg.Indexer.BatchSize) * 10,
 		ForcePolling:        e.cfg.Indexer.Transport == "http",
 		CatchupWithPolling:  e.cfg.Indexer.Transport == "catchup",
 		SharedFirehose:      e.cfg.Indexer.Transport == "firehose",
+		KeysFirehose:        e.cfg.Indexer.Transport == "firehose-keys",
+		OptionSelectors:     e.optionSelectors,
 		SharedTipPoller:     useSharedTip,
 		TipPollInterval:     tipInterval,
 		CatchupPollInterval: catchupInterval,
@@ -1031,7 +1044,63 @@ func (e *Engine) setup(ctx context.Context) error {
 	}
 	e.poller = vp
 
+	// Compute the option-family selector union for the firehose-keys
+	// transport. Cheap and config-driven (not per-child), so always computed
+	// regardless of which transport is configured — harmless dead weight when
+	// not firehose-keys, and this way switching transport at runtime (e.g. via
+	// IBIS_TRANSPORT) never needs a setup-path change.
+	e.computeOptionSelectors()
+
 	return nil
+}
+
+// computeOptionSelectors builds the union of option-family event selectors
+// (excluding Transfer/Approval) used as the firehose-keys transport's
+// keys-sub filter: every already-registered wildcard contract's own ABI
+// events, PLUS every factory's declared child ABI resolved by name (children
+// are discovered later at runtime, but a factory's ChildABI is known — and
+// stable — from config at setup time, so the union is complete without
+// waiting for any child to actually appear on chain). Deduplicated by
+// selector hex string.
+func (e *Engine) computeOptionSelectors() {
+	seen := make(map[string]*felt.Felt)
+	add := func(events []*abi.EventDef) {
+		for _, ev := range events {
+			if ev.Name == "Transfer" || ev.Name == "Approval" {
+				continue
+			}
+			seen[ev.Selector.String()] = ev.Selector
+		}
+	}
+
+	childABIsSeen := make(map[string]bool)
+	resolver := config.NewABIResolver(e.provider)
+
+	for _, cs := range e.contracts {
+		if hasWildcardEvent(&cs.config) {
+			add(cs.registry.Events())
+		}
+		for _, f := range cs.config.Factories {
+			if f.ChildABI == "" || childABIsSeen[f.ChildABI] {
+				continue
+			}
+			childABIsSeen[f.ChildABI] = true
+			childABI, err := resolver.ResolveByName(f.ChildABI)
+			if err != nil {
+				e.logger.Warn("computeOptionSelectors: failed to resolve factory child ABI",
+					"child_abi", f.ChildABI, "factory", cs.config.Name, "error", err)
+				continue
+			}
+			add(abi.NewEventRegistry(childABI).Events())
+		}
+	}
+
+	e.optionSelectors = make([]*felt.Felt, 0, len(seen))
+	for _, sel := range seen {
+		e.optionSelectors = append(e.optionSelectors, sel)
+	}
+	e.logger.Info("computed option-family selector union (firehose-keys keys-sub filter)",
+		"selectors", len(e.optionSelectors))
 }
 
 // resyncDynamicChildConfig refreshes a reloaded factory child's Views/Events
@@ -1214,6 +1283,8 @@ func (e *Engine) buildSubscriptions(startBlocks map[string]uint64) []provider.Co
 		sub := provider.ContractSubscription{
 			Address:    cs.address,
 			StartBlock: startBlocks[cs.config.Name],
+			Wildcard:   hasWildcardEvent(&cs.config),
+			ERC20:      cs.registry.MatchName("Transfer") != nil,
 		}
 
 		// Only set key filters when there is no wildcard event configured.

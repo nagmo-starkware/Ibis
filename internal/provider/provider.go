@@ -39,6 +39,14 @@ type ContractSubscription struct {
 	Address    *felt.Felt
 	StartBlock uint64
 	Keys       [][]*felt.Felt // Optional event key filters
+
+	// Wildcard and ERC20 are used ONLY by the firehose-keys transport (option
+	// D — see firehose_keys.go) to classify a contract's routing: Wildcard is
+	// true for a contract configured with a "*" event (no key filter, e.g. an
+	// option-family contract); ERC20 is true if the contract's ABI has a
+	// Transfer event. Ignored by every other transport.
+	Wildcard bool
+	ERC20    bool
 }
 
 // GetEventsOptions configures a GetEvents request.

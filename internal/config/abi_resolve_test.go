@@ -336,6 +336,49 @@ func TestLocalDiscovery(t *testing.T) {
 	}
 }
 
+// TestResolveByName exercises the firehose-keys transport's need to resolve
+// a factory's declared ChildABI by name alone (no ContractConfig, no
+// address) — used by engine.computeOptionSelectors to learn a factory
+// child's event set before any child has actually been deployed/discovered.
+func TestResolveByName(t *testing.T) {
+	dir := t.TempDir()
+	devDir := filepath.Join(dir, "target", "dev")
+	if err := os.MkdirAll(devDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	abiFile := filepath.Join(devDir, "mypackage_MyToken.contract_class.json")
+	if err := os.WriteFile(abiFile, []byte(testContractClassJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	resolver := NewABIResolver(nil)
+	parsed, err := resolver.ResolveByName("MyToken")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if len(parsed.Events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(parsed.Events))
+	}
+}
+
+// TestResolveByName_NotFound mirrors TestLocalDiscovery_NotFound for the
+// ResolveByName entry point.
+func TestResolveByName_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	resolver := NewABIResolver(nil)
+	if _, err := resolver.ResolveByName("MissingContract"); err == nil {
+		t.Fatal("expected error for missing local ABI")
+	}
+}
+
 func TestLocalDiscovery_NotFound(t *testing.T) {
 	// cd to a temp dir without target/dev/.
 	dir := t.TempDir()

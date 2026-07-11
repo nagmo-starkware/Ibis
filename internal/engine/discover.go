@@ -434,6 +434,8 @@ func (e *Engine) registerSharedDiscoveredChild(ctx context.Context, dc *config.D
 		sub := provider.ContractSubscription{
 			Address:    address,
 			StartBlock: derefUint64(cc.StartBlock),
+			Wildcard:   hasWildcardEvent(cc),
+			ERC20:      registry.MatchName("Transfer") != nil,
 		}
 
 		if !hasWildcardEvent(cc) {
