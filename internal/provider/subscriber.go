@@ -35,6 +35,14 @@ const (
 	// since session drops can be transient.
 	maxWSSSessionFailures = 5
 
+	// sharedSubscribeConcurrency bounds how many SubscribeEvents requests may be
+	// in flight at once over the firehose-keys shared address connection. A mass
+	// reconnect wakes every address-sub simultaneously; without a bound they
+	// would pipe hundreds of subscribe requests into one socket in a single
+	// burst. This is NOT a connection limit — multiplexing already collapses the
+	// address-subs onto one socket — just gentle pacing of the re-subscribe wave.
+	sharedSubscribeConcurrency = 16
+
 	// Default polling intervals. Overridable per deployment via SubscriberConfig
 	// (wired from indexer.catchup_poll_interval / indexer.tip_poll_interval).
 	defaultCatchupPollInterval = 100 * time.Millisecond
@@ -85,6 +93,86 @@ func defaultWSSDialer(ctx context.Context, wsURL string, input *rpc.EventSubscri
 			ws.Close()
 		},
 	}, nil
+}
+
+// multiplexKeysDialer is the firehose-keys transport's WSS dialer (see the
+// addrWS field docs). The keys-sub (no from_address) keeps its own dedicated
+// connection via defaultWSSDialer; every address-sub multiplexes onto the
+// single shared addrWS socket. Assigned as s.dialWSS when KeysFirehose is set.
+func (s *EventSubscriber) multiplexKeysDialer(ctx context.Context, wsURL string, input *rpc.EventSubscriptionInput) (*wssSession, error) {
+	if input.FromAddress == nil {
+		// keys-sub: isolated on its own connection so its (rare) reconnects
+		// never couple to the address-sub re-subscribe wave.
+		return defaultWSSDialer(ctx, wsURL, input)
+	}
+
+	ws, err := s.sharedAddrWS(ctx, wsURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pace subscribe requests over the single shared socket (see
+	// sharedSubscribeConcurrency — pacing, not a connection cap).
+	select {
+	case s.addrSubSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	eventCh := make(chan *rpc.EmittedEventWithFinalityStatus, 100)
+	sub, err := ws.SubscribeEvents(ctx, eventCh, input)
+	<-s.addrSubSem
+	if err != nil {
+		// The failure is this one subscription's; leave the shared socket up
+		// for every other address-sub riding it.
+		return nil, fmt.Errorf("subscribing to events (shared conn): %w", err)
+	}
+
+	return &wssSession{
+		events: eventCh,
+		errs:   sub.Err(),
+		reorgs: sub.Reorg(),
+		// Unsubscribe this stream only; the shared socket stays open for the
+		// others and is closed once by startKeysFirehose on shutdown.
+		close: func() { sub.Unsubscribe() },
+	}, nil
+}
+
+// sharedAddrWS returns the shared address-sub websocket, dialing it exactly
+// once (serialized under addrWSMu, so only ONE handshake ever races even when
+// hundreds of address streams start together). Reused across reconnects — the
+// underlying starknet.go client reconnects the socket transparently, so a
+// dropped connection re-establishes without a fresh handshake per stream.
+func (s *EventSubscriber) sharedAddrWS(ctx context.Context, wsURL string) (*rpc.WsProvider, error) {
+	s.addrWSMu.Lock()
+	defer s.addrWSMu.Unlock()
+	if s.addrWS != nil {
+		return s.addrWS, nil
+	}
+	// Dial against the subscriber-scoped ctx, not the caller's per-stream ctx,
+	// so one stream's cancellation (e.g. a frozen child) can't close the socket
+	// every other address-sub shares.
+	connCtx := s.wsCtx
+	if connCtx == nil {
+		connCtx = ctx
+	}
+	ws, err := s.dialSharedWS(connCtx, wsURL)
+	if err != nil {
+		return nil, fmt.Errorf("dialing shared address websocket: %w", err)
+	}
+	s.addrWS = ws
+	return ws, nil
+}
+
+// closeSharedAddrWS tears down the shared address-sub socket. Called once on
+// firehose-keys shutdown, after every stream goroutine has exited.
+func (s *EventSubscriber) closeSharedAddrWS() {
+	s.addrWSMu.Lock()
+	ws := s.addrWS
+	s.addrWS = nil
+	s.addrWSMu.Unlock()
+	if ws != nil {
+		ws.Close()
+	}
 }
 
 // ReorgNotification informs the engine about a chain reorganization.
@@ -213,6 +301,28 @@ type EventSubscriber struct {
 	// addrCancels holds the cancel func for each entry in addrStreams, so
 	// RemoveContract can tear one down.
 	addrCancels map[string]context.CancelFunc
+
+	// --- firehose-keys shared WSS connection (multiplexing) -----------------
+	//
+	// The keys-sub uses its own dedicated connection; every address-sub (static
+	// tokens + per-child Transfer/Approval) multiplexes onto ONE shared socket,
+	// so N children add N cheap _subscribeEvents calls over a single connection
+	// instead of N websocket handshakes. N simultaneous handshakes previously
+	// tripped Alchemy's handshake rate limit (429) and cascaded into a getEvents
+	// catchup storm. Alchemy permits 1000 subscriptions per connection — far
+	// above the live child count.
+	addrWSMu   sync.Mutex
+	addrWS     *rpc.WsProvider // shared address-sub socket; lazily dialed, reused across reconnects
+	addrSubSem chan struct{}   // paces concurrent SubscribeEvents over addrWS
+
+	// wsCtx is the subscriber-scoped context governing the shared addrWS socket's
+	// lifetime, set at the top of startKeysFirehose. addrWS is dialed against it
+	// (not a caller's per-stream ctx) so the socket outlives any single stream.
+	wsCtx context.Context
+
+	// dialSharedWS creates the shared address socket; a seam for tests to avoid
+	// real network dials. Defaults to rpc.NewWebsocketProvider (via NewSubscriber).
+	dialSharedWS func(ctx context.Context, wsURL string) (*rpc.WsProvider, error)
 }
 
 // NewSubscriber creates an EventSubscriber for the given contracts.
@@ -252,7 +362,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		}
 	}
 
-	return &EventSubscriber{
+	sub := &EventSubscriber{
 		provider:            p,
 		contracts:           contracts,
 		events:              events,
@@ -273,7 +383,19 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		tracked:             make(map[string]ContractSubscription),
 		addrStreams:         make(map[string]*firehoseKeysStream),
 		addrCancels:         make(map[string]context.CancelFunc),
+		addrSubSem:          make(chan struct{}, sharedSubscribeConcurrency),
+		dialSharedWS: func(ctx context.Context, wsURL string) (*rpc.WsProvider, error) {
+			return rpc.NewWebsocketProvider(ctx, wsURL)
+		},
 	}
+	// Firehose-keys multiplexes all address-subs onto one shared socket (see
+	// multiplexKeysDialer); other transports keep the one-socket-per-dial
+	// default. Tests override sub.dialWSS after construction, so this default
+	// only applies in production wiring.
+	if keysFirehose {
+		sub.dialWSS = sub.multiplexKeysDialer
+	}
+	return sub
 }
 
 // SetReorgChan sets the channel for reorg notifications. Must be called before Start.

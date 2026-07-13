@@ -192,6 +192,12 @@ func (s *EventSubscriber) isTracked(addrHex string) bool {
 // keys-sub, plus one address-sub per non-wildcard contract and per ERC20
 // wildcard child); then block until ctx is canceled.
 func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
+	// Record the subscriber-scoped context for the shared address-sub socket
+	// (multiplexKeysDialer/sharedAddrWS) so it outlives any single stream, and
+	// tear that socket down once every stream goroutine has exited.
+	s.wsCtx = ctx
+	defer s.closeSharedAddrWS()
+
 	// An empty selector union is a misconfiguration (e.g. option-family ABIs
 	// failed to resolve at setup). The keys-sub filter would then be [[]],
 	// which Starknet treats as "match any" at position 0 — silently degrading

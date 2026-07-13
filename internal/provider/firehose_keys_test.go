@@ -3,6 +3,9 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,6 +76,80 @@ func mockWSSDialerKeyed(keysSubEvents []*rpc.EmittedEventWithFinalityStatus, add
 			reorgs: reorgCh,
 			close:  func() {},
 		}, nil
+	}
+}
+
+// TestSharedAddrWSDialedOnce verifies the multiplexing guarantee: every
+// address-sub shares ONE websocket connection. Many concurrent sharedAddrWS
+// callers must dial exactly once (one handshake, not N) and all receive the
+// same provider instance — the property that removes the per-child 429
+// handshake storm.
+func TestSharedAddrWSDialedOnce(t *testing.T) {
+	sub, _, cleanup := newKeysFirehoseSub(t, nil)
+	defer cleanup()
+	sub.wsCtx = context.Background()
+
+	var dials int64
+	sentinel := &rpc.WsProvider{}
+	sub.dialSharedWS = func(_ context.Context, _ string) (*rpc.WsProvider, error) {
+		atomic.AddInt64(&dials, 1)
+		return sentinel, nil
+	}
+
+	const n = 64
+	var wg sync.WaitGroup
+	got := make([]*rpc.WsProvider, n)
+	errs := make([]error, n)
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got[i], errs[i] = sub.sharedAddrWS(context.Background(), "ws://mock")
+		}(i)
+	}
+	wg.Wait()
+
+	if d := atomic.LoadInt64(&dials); d != 1 {
+		t.Fatalf("shared address socket dialed %d times, want exactly 1", d)
+	}
+	for i := range n {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: unexpected error %v", i, errs[i])
+		}
+		if got[i] != sentinel {
+			t.Fatalf("caller %d got a different provider; all address-subs must share one", i)
+		}
+	}
+}
+
+// TestSharedAddrWSDialErrorNotMemoized verifies a failed dial is not cached:
+// the next caller retries rather than being stuck on the earlier failure.
+func TestSharedAddrWSDialErrorNotMemoized(t *testing.T) {
+	sub, _, cleanup := newKeysFirehoseSub(t, nil)
+	defer cleanup()
+	sub.wsCtx = context.Background()
+
+	var dials int64
+	sentinel := &rpc.WsProvider{}
+	sub.dialSharedWS = func(_ context.Context, _ string) (*rpc.WsProvider, error) {
+		if atomic.AddInt64(&dials, 1) == 1 {
+			return nil, errors.New("boom")
+		}
+		return sentinel, nil
+	}
+
+	if _, err := sub.sharedAddrWS(context.Background(), "ws://mock"); err == nil {
+		t.Fatal("expected first dial to error")
+	}
+	ws, err := sub.sharedAddrWS(context.Background(), "ws://mock")
+	if err != nil {
+		t.Fatalf("second dial should retry and succeed, got %v", err)
+	}
+	if ws != sentinel {
+		t.Fatal("second dial should return the freshly dialed provider")
+	}
+	if d := atomic.LoadInt64(&dials); d != 2 {
+		t.Fatalf("dials = %d, want 2 (a failed dial must not be memoized)", d)
 	}
 }
 
