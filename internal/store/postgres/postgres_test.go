@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -624,6 +626,34 @@ func TestCreateAndMigrateTable(t *testing.T) {
 	}
 }
 
+// TestCreateTableFailureDoesNotCacheSchema guards the ordering CreateTable
+// relies on: storeSchema is only called after the DDL has actually
+// succeeded. A table name with an unquoted hyphen breaks CREATE TABLE's own
+// generated SQL (generateCreateTableDDL interpolates sch.Name unquoted --
+// Postgres parses the hyphen as subtraction), guaranteeing a genuine DDL
+// failure distinct from the concurrent-create race isConcurrentCreateRace
+// tolerates. If a schema were cached before the DDL succeeds, anything
+// built on top of CreateTable that skips re-issuing DDL for an
+// already-known table name (see the dedup PR stacked on this one) would
+// silently believe a table exists when it was never actually created.
+func TestCreateTableFailureDoesNotCacheSchema(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	broken := types.TableSchema{
+		Name:      "bad-table-name",
+		TableType: types.TableTypeLog,
+		Columns:   []types.Column{{Name: "block_number", Type: "uint64"}},
+	}
+	if err := s.CreateTable(ctx, &broken); err == nil {
+		t.Fatal("expected CreateTable to fail for a table name that breaks the generated DDL")
+	}
+
+	if _, exists := s.lookupSchema("bad-table-name"); exists {
+		t.Fatal("a failed CreateTable must not cache the schema for a table that was never created")
+	}
+}
+
 func TestEmptyTableReturnsNoEvents(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -768,5 +798,79 @@ func TestAggregationAvg(t *testing.T) {
 	avg := toFloat64(result.Values["avg_score"])
 	if avg != 20.0 {
 		t.Errorf("expected avg 20, got %v", avg)
+	}
+}
+
+// TestConcurrentSchemaAccessIsRaceFree exercises exactly the pattern dynamic
+// contract registration produces in practice: CreateTable calls for a
+// handful of shared table names running concurrently with each other and
+// with the query/insert paths that read the same schemas -- registration
+// deliberately happens outside the engine's own lock (see
+// factory.go/discover.go's "I/O outside the lock" sections), so nothing
+// serializes access to the store itself. Before schemasMu, this was an
+// unguarded map hit from multiple goroutines: a data race at best, and a
+// fatal, unrecoverable `fatal error: concurrent map read and map write`
+// crash at worst, not just a slow test. Run with `go test -race` to verify.
+func TestConcurrentSchemaAccessIsRaceFree(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const tableCount = 5
+	const workersPerTable = 8
+
+	schemaFor := func(i int) types.TableSchema {
+		return types.TableSchema{
+			Name:      fmt.Sprintf("concurrent_table_%d", i),
+			Contract:  "Factory",
+			Event:     "Transfer",
+			TableType: types.TableTypeLog,
+			Columns: []types.Column{
+				{Name: "block_number", Type: "uint64"},
+				{Name: "log_index", Type: "uint64"},
+				{Name: "from_addr", Type: "string"},
+			},
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, tableCount*workersPerTable*3)
+
+	for i := 0; i < tableCount; i++ {
+		sch := schemaFor(i)
+		for w := 0; w < workersPerTable; w++ {
+			wg.Add(1)
+			go func(sch types.TableSchema, block uint64) {
+				defer wg.Done()
+				// Every worker races to create the same table name --
+				// idempotent DDL, but the in-memory cache write is where an
+				// unguarded map would crash or race.
+				if err := s.CreateTable(ctx, &sch); err != nil {
+					errs <- fmt.Errorf("CreateTable(%s): %w", sch.Name, err)
+					return
+				}
+				// Concurrently insert and read back -- exercises every other
+				// lookupSchema call site (insertRow, buildSelectQuery,
+				// scanEvents, hasLogIndexColumn) while registration is still
+				// happening on other goroutines.
+				if err := s.ApplyOperations(ctx, []store.Operation{{
+					Type: store.OpInsert, Table: sch.Name, BlockNumber: block, LogIndex: 0,
+					Data: map[string]any{
+						"block_number": block, "log_index": uint64(0), "from_addr": "0x1",
+					},
+				}}); err != nil {
+					errs <- fmt.Errorf("insert into %s: %w", sch.Name, err)
+					return
+				}
+				if _, err := s.GetEvents(ctx, sch.Name, store.Query{Limit: 1}); err != nil {
+					errs <- fmt.Errorf("get events for %s: %w", sch.Name, err)
+				}
+			}(sch, uint64(w+1))
+		}
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

@@ -3,12 +3,15 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/b-j-roberts/ibis/internal/config"
@@ -18,8 +21,39 @@ import (
 
 // PostgresStore implements store.Store using PostgreSQL via pgx/v5.
 type PostgresStore struct {
-	pool    *pgxpool.Pool
-	schemas map[string]types.TableSchema
+	pool *pgxpool.Pool
+
+	// schemasMu guards schemas. CreateTable/MigrateTable can run concurrently
+	// with each other and with every query/insert path that reads schemas --
+	// dynamic contract registration deliberately does this I/O outside the
+	// engine's own lock (see factory.go/discover.go), so two goroutines can
+	// reach this map at the same time. An unguarded map here isn't just a
+	// data race: a concurrent read/write on a Go map is a fatal,
+	// unrecoverable runtime crash, not a catchable error.
+	schemasMu sync.RWMutex
+	schemas   map[string]types.TableSchema
+}
+
+// lookupSchema returns the cached schema for table, if known.
+func (s *PostgresStore) lookupSchema(table string) (types.TableSchema, bool) {
+	s.schemasMu.RLock()
+	defer s.schemasMu.RUnlock()
+	sch, ok := s.schemas[table]
+	return sch, ok
+}
+
+// storeSchema records sch as the cached schema for its table name.
+func (s *PostgresStore) storeSchema(sch types.TableSchema) {
+	s.schemasMu.Lock()
+	defer s.schemasMu.Unlock()
+	s.schemas[sch.Name] = sch
+}
+
+// deleteSchema removes the cached schema for table, if any.
+func (s *PostgresStore) deleteSchema(table string) {
+	s.schemasMu.Lock()
+	defer s.schemasMu.Unlock()
+	delete(s.schemas, table)
 }
 
 // New creates a new PostgresStore from the given config.
@@ -149,7 +183,7 @@ type aggDelta struct {
 }
 
 func (s *PostgresStore) applyOp(ctx context.Context, tx pgx.Tx, op store.Operation, aggDeltas map[string][]aggDelta) error {
-	sch, hasSchema := s.schemas[op.Table]
+	sch, hasSchema := s.lookupSchema(op.Table)
 
 	switch op.Type {
 	case store.OpInsert:
@@ -187,7 +221,7 @@ func (s *PostgresStore) insertRow(ctx context.Context, tx pgx.Tx, op store.Opera
 		return nil
 	}
 
-	sch, hasSchema := s.schemas[op.Table]
+	sch, hasSchema := s.lookupSchema(op.Table)
 
 	// Build column list from schema if available, otherwise from data keys.
 	var cols []string
@@ -252,7 +286,7 @@ func (s *PostgresStore) updateRow(ctx context.Context, tx pgx.Tx, op store.Opera
 		return nil
 	}
 
-	sch, hasSchema := s.schemas[op.Table]
+	sch, hasSchema := s.lookupSchema(op.Table)
 
 	var setClauses []string
 	var vals []any
@@ -415,7 +449,7 @@ func (s *PostgresStore) GetEvents(ctx context.Context, table string, q store.Que
 }
 
 func (s *PostgresStore) GetUniqueEvents(ctx context.Context, table string, q store.Query) ([]types.IndexedEvent, error) {
-	sch, ok := s.schemas[table]
+	sch, ok := s.lookupSchema(table)
 	if !ok || sch.UniqueKey == "" {
 		return s.GetEvents(ctx, table, q)
 	}
@@ -436,7 +470,7 @@ func (s *PostgresStore) GetAggregation(ctx context.Context, table string, _ stor
 	result := store.AggResult{Values: make(map[string]any)}
 	aggTable := table + "_agg"
 
-	sch, ok := s.schemas[table]
+	sch, ok := s.lookupSchema(table)
 	if !ok {
 		return result, nil
 	}
@@ -518,23 +552,46 @@ func (s *PostgresStore) GetAllCursors(ctx context.Context) (map[string]uint64, e
 }
 
 func (s *PostgresStore) CreateTable(ctx context.Context, sch *types.TableSchema) error {
-	s.schemas[sch.Name] = *sch
-
 	// Generate CREATE TABLE directly from schema columns.
 	ddl := s.generateCreateTableDDL(sch)
-	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+	if _, err := s.pool.Exec(ctx, ddl); err != nil && !isConcurrentCreateRace(err) {
 		return fmt.Errorf("creating table %s: %w", sch.Name, err)
 	}
 
 	// Create aggregation companion table if needed.
 	if sch.TableType == types.TableTypeAggregation && len(sch.Aggregates) > 0 {
 		aggDDL := s.generateAggTableDDL(sch)
-		if _, err := s.pool.Exec(ctx, aggDDL); err != nil {
+		if _, err := s.pool.Exec(ctx, aggDDL); err != nil && !isConcurrentCreateRace(err) {
 			return fmt.Errorf("creating agg table for %s: %w", sch.Name, err)
 		}
 	}
 
+	s.storeSchema(*sch)
 	return nil
+}
+
+// isConcurrentCreateRace reports whether err is Postgres's own signature for
+// two concurrent CREATE TABLE IF NOT EXISTS calls racing on the same table
+// name. CREATE TABLE IF NOT EXISTS is not actually atomic across concurrent
+// sessions: both can pass the "doesn't exist" check and then collide on the
+// catalog insert. Deliberately narrow (exact SQLSTATE match) rather than a
+// broad retry/lock -- see the schemasMu comment for why nothing here holds a
+// lock across this network call. The end state either way is the table
+// exists, which is exactly what CreateTable is asking for, so this is a
+// correct treatment of the error, not just a tolerant one.
+func isConcurrentCreateRace(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "23505": // unique_violation, e.g. pg_type_typname_nsp_index
+		return true
+	case "42710": // duplicate_object ("already exists")
+		return true
+	default:
+		return false
+	}
 }
 
 // generateCreateTableDDL builds CREATE TABLE SQL from the schema's actual columns.
@@ -620,7 +677,7 @@ func (s *PostgresStore) generateAggTableDDL(sch *types.TableSchema) string {
 }
 
 func (s *PostgresStore) MigrateTable(ctx context.Context, sch *types.TableSchema) error {
-	oldSchema, exists := s.schemas[sch.Name]
+	oldSchema, exists := s.lookupSchema(sch.Name)
 	if !exists {
 		return s.CreateTable(ctx, sch)
 	}
@@ -642,7 +699,7 @@ func (s *PostgresStore) MigrateTable(ctx context.Context, sch *types.TableSchema
 		}
 	}
 
-	s.schemas[sch.Name] = *sch
+	s.storeSchema(*sch)
 	return nil
 }
 
@@ -659,7 +716,7 @@ func (s *PostgresStore) CountEvents(ctx context.Context, table string, filters [
 }
 
 func (s *PostgresStore) DropTable(ctx context.Context, tableName string) error {
-	delete(s.schemas, tableName)
+	s.deleteSchema(tableName)
 
 	// Drop the main table and aggregation companion.
 	_, err := s.pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", tableName))
@@ -727,7 +784,7 @@ func (s *PostgresStore) Close() error {
 // ---- Query builders ----
 
 func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query string, args []any) {
-	sch, hasSchema := s.schemas[table]
+	sch, hasSchema := s.lookupSchema(table)
 
 	var cols string
 	if hasSchema {
@@ -755,7 +812,7 @@ func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query str
 	// Secondary sort by log_index for stable ordering when available. View
 	// tables don't have a log_index column; skip the secondary sort there.
 	orderClause := fmt.Sprintf("%s %s", orderBy, dir)
-	if hasLogIndexColumn(s.schemas, table) {
+	if s.hasLogIndexColumn(table) {
 		orderClause = fmt.Sprintf("%s %s, %s %s", orderBy, dir, qid("log_index"), dir)
 	}
 
@@ -775,8 +832,8 @@ func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query str
 // column. Event tables do; view-result tables don't. When no schema is
 // registered we conservatively assume log_index is present so the existing
 // behaviour is preserved.
-func hasLogIndexColumn(schemas map[string]types.TableSchema, table string) bool {
-	sch, ok := schemas[table]
+func (s *PostgresStore) hasLogIndexColumn(table string) bool {
+	sch, ok := s.lookupSchema(table)
 	if !ok {
 		return true
 	}
@@ -789,7 +846,7 @@ func hasLogIndexColumn(schemas map[string]types.TableSchema, table string) bool 
 }
 
 func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.Query) (query string, args []any) {
-	sch, hasSchema := s.schemas[table]
+	sch, hasSchema := s.lookupSchema(table)
 
 	var cols string
 	if hasSchema {
@@ -833,7 +890,7 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 	// newest.
 	innerTieBreak := fmt.Sprintf("%s DESC", qid("block_number"))
 	outerTieBreak := ""
-	if hasLogIndexColumn(s.schemas, table) {
+	if s.hasLogIndexColumn(table) {
 		innerTieBreak = fmt.Sprintf("%s DESC, %s DESC", qid("block_number"), qid("log_index"))
 		outerTieBreak = fmt.Sprintf(", %s %s", qid("log_index"), dir)
 	}
@@ -889,7 +946,7 @@ func filterOpToSQL(op string) string {
 }
 
 func (s *PostgresStore) scanEvents(rows pgx.Rows, table string) ([]types.IndexedEvent, error) {
-	sch, hasSchema := s.schemas[table]
+	sch, hasSchema := s.lookupSchema(table)
 	descs := rows.FieldDescriptions()
 
 	var events []types.IndexedEvent
