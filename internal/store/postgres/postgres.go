@@ -10,9 +10,12 @@ import (
 	"strings"
 	"sync"
 
+	"ariga.io/atlas/sql/migrate"
+	atlaspostgres "ariga.io/atlas/sql/postgres"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/b-j-roberts/ibis/internal/config"
 	"github.com/b-j-roberts/ibis/internal/store"
@@ -32,6 +35,18 @@ type PostgresStore struct {
 	// unrecoverable runtime crash, not a catchable error.
 	schemasMu sync.RWMutex
 	schemas   map[string]types.TableSchema
+
+	// atlas drives schema introspection/diffing for reconcileSchema, so that
+	// a shared table already created by one dynamic child can be safely
+	// widened when a later child registers a schema with extra columns.
+	atlas migrate.Driver
+}
+
+// newAtlasDriver wraps pool as a database/sql handle for atlas, which only
+// speaks the standard library interface.
+func newAtlasDriver(pool *pgxpool.Pool) (migrate.Driver, error) {
+	sqlDB := stdlib.OpenDBFromPool(pool)
+	return atlaspostgres.Open(sqlDB)
 }
 
 // lookupSchema returns the cached schema for table, if known.
@@ -70,9 +85,16 @@ func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error)
 		return nil, fmt.Errorf("pinging postgres: %w", err)
 	}
 
+	atlas, err := newAtlasDriver(pool)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("initializing schema driver: %w", err)
+	}
+
 	s := &PostgresStore{
 		pool:    pool,
 		schemas: make(map[string]types.TableSchema),
+		atlas:   atlas,
 	}
 
 	if err := s.ensureMetaTable(ctx); err != nil {
@@ -103,9 +125,15 @@ func buildConnString(cfg config.PostgresConfig) string {
 
 // NewFromPool creates a PostgresStore from an existing connection pool (for testing).
 func NewFromPool(ctx context.Context, pool *pgxpool.Pool) (*PostgresStore, error) {
+	atlas, err := newAtlasDriver(pool)
+	if err != nil {
+		return nil, fmt.Errorf("initializing schema driver: %w", err)
+	}
+
 	s := &PostgresStore{
 		pool:    pool,
 		schemas: make(map[string]types.TableSchema),
+		atlas:   atlas,
 	}
 
 	if err := s.ensureMetaTable(ctx); err != nil {
@@ -558,31 +586,25 @@ func (s *PostgresStore) CreateTable(ctx context.Context, sch *types.TableSchema)
 	// already dedupe in-memory per (factory, ChildABI) or class hash, and only
 	// call CreateTable for the first child of each group), but via
 	// Engine.setup() reloading every persisted dynamic contract on cold start
-	// with no such cache across contracts of the same factory. CREATE TABLE IF
-	// NOT EXISTS is already a no-op DDL-wise once the table exists, but it
-	// still pays a full round trip to Postgres every time -- with hundreds of
-	// persisted children sharing a handful of factory tables, that's hundreds
-	// of redundant round trips on every cold start. Skip it once this process
-	// already knows the table exists.
-	if _, exists := s.lookupSchema(sch.Name); exists {
+	// with no such cache across contracts of the same factory, and via
+	// genuinely concurrent registration (the admin API's RegisterContract can
+	// run on an HTTP goroutine at the same time as the event loop's own
+	// registration path). Skip the round trip once this process already
+	// knows the table exists AND already has every column this child's
+	// schema needs, with matching types -- different children's ABIs can add
+	// columns, or map the same field name to a different type, that an
+	// earlier child never saw, so a name-only cache hit isn't enough to skip
+	// reconciliation.
+	if known, exists := s.lookupSchema(sch.Name); exists && hasAllColumns(&known, sch) {
 		return nil
 	}
 
-	// Generate CREATE TABLE directly from schema columns.
-	ddl := s.generateCreateTableDDL(sch)
-	if _, err := s.pool.Exec(ctx, ddl); err != nil && !isConcurrentCreateRace(err) {
-		return fmt.Errorf("creating table %s: %w", sch.Name, err)
+	merged, err := s.reconcileSchema(ctx, sch)
+	if err != nil {
+		return err
 	}
 
-	// Create aggregation companion table if needed.
-	if sch.TableType == types.TableTypeAggregation && len(sch.Aggregates) > 0 {
-		aggDDL := s.generateAggTableDDL(sch)
-		if _, err := s.pool.Exec(ctx, aggDDL); err != nil && !isConcurrentCreateRace(err) {
-			return fmt.Errorf("creating agg table for %s: %w", sch.Name, err)
-		}
-	}
-
-	s.storeSchema(*sch)
+	s.storeSchema(*merged)
 	return nil
 }
 

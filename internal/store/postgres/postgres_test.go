@@ -658,13 +658,11 @@ func TestCreateTableFailureDoesNotCacheSchema(t *testing.T) {
 // Engine.setup() reloads every persisted dynamic contract on cold start and
 // calls CreateTable per contract with no dedup cache across contracts of the
 // same factory, so CreateTable can be called more than once with the same
-// schema.Name. The second (and every subsequent) call must be a cheap no-op
-// rather than re-issuing the CREATE TABLE DDL -- with hundreds of persisted
-// children sharing a handful of factory tables, re-running it every time
-// turns into hundreds of redundant Postgres round trips on a cold start.
-// This PR only dedupes; it doesn't reconcile schema drift across children
-// (that's a separate concern), so a second call's extra column is expected
-// to be silently skipped, not added.
+// schema.Name. A second call whose columns (and their types) are already
+// all present must be a cheap no-op rather than re-issuing DDL -- with
+// hundreds of persisted children sharing a handful of factory tables,
+// re-running it every time turns into hundreds of redundant Postgres round
+// trips on a cold start.
 func TestCreateTableSkipsRedundantDDL(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -684,11 +682,9 @@ func TestCreateTableSkipsRedundantDDL(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
-	// Simulate a second dynamic child registering against the same shared
-	// table name with an extra column. The skip means this is a no-op: the
-	// stored schema stays exactly as the first call left it.
+	// A second dynamic child registering the exact same columns hits the
+	// name+columns cache hit and never reaches reconcileSchema.
 	dup := sch
-	dup.Columns = append(dup.Columns, types.Column{Name: "extra", Type: "string"})
 	if err := s.CreateTable(ctx, &dup); err != nil {
 		t.Fatalf("second CreateTable for same table name: %v", err)
 	}
@@ -698,10 +694,9 @@ func TestCreateTableSkipsRedundantDDL(t *testing.T) {
 		t.Fatal("schema missing after second CreateTable")
 	}
 	if len(stored.Columns) != 3 {
-		t.Errorf("expected the first call's 3-column schema to be preserved (skip path), got %d columns", len(stored.Columns))
+		t.Errorf("expected the cached 3-column schema to be unchanged, got %d columns", len(stored.Columns))
 	}
 
-	// Table is still usable with its original 3-column shape.
 	if err := s.ApplyOperations(ctx, []store.Operation{{
 		Type: store.OpInsert, Table: "shared_table", BlockNumber: 1, LogIndex: 0,
 		Data: map[string]any{
@@ -709,6 +704,191 @@ func TestCreateTableSkipsRedundantDDL(t *testing.T) {
 		},
 	}}); err != nil {
 		t.Fatalf("insert into shared table: %v", err)
+	}
+}
+
+// TestCreateTableReconcilesNewColumns covers schema drift across dynamic
+// children sharing a factory table: a second child whose ABI has an extra
+// field must widen the live table via reconcileSchema, rather than being
+// silently skipped or rejected. The end state must include both the
+// original and the new column, and both must be usable.
+func TestCreateTableReconcilesNewColumns(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	sch := types.TableSchema{
+		Name:      "reconciled_table",
+		Contract:  "Factory",
+		Event:     "TransferA",
+		TableType: types.TableTypeLog,
+		Columns: []types.Column{
+			{Name: "block_number", Type: "uint64"},
+			{Name: "log_index", Type: "uint64"},
+			{Name: "from_addr", Type: "string"},
+		},
+	}
+	if err := s.CreateTable(ctx, &sch); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// A second child with an extra column must widen the live table.
+	widened := sch
+	widened.Event = "TransferB"
+	widened.Columns = append(widened.Columns, types.Column{Name: "extra", Type: "string"})
+	if err := s.CreateTable(ctx, &widened); err != nil {
+		t.Fatalf("reconciling CreateTable with a new column: %v", err)
+	}
+
+	stored, ok := s.lookupSchema("reconciled_table")
+	if !ok {
+		t.Fatal("schema missing after reconciling CreateTable")
+	}
+	if len(stored.Columns) != 4 {
+		t.Fatalf("expected the reconciled schema to have 4 columns, got %d", len(stored.Columns))
+	}
+
+	if err := s.ApplyOperations(ctx, []store.Operation{
+		{
+			Type: store.OpInsert, Table: "reconciled_table", BlockNumber: 1, LogIndex: 0,
+			Data: map[string]any{"block_number": uint64(1), "log_index": uint64(0), "from_addr": "0x1"},
+		},
+		{
+			Type: store.OpInsert, Table: "reconciled_table", BlockNumber: 2, LogIndex: 0,
+			Data: map[string]any{"block_number": uint64(2), "log_index": uint64(0), "from_addr": "0x2", "extra": "hi"},
+		},
+	}); err != nil {
+		t.Fatalf("insert using pre- and post-reconciliation columns: %v", err)
+	}
+
+	events, err := s.GetEvents(ctx, "reconciled_table", store.Query{Limit: 10})
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+}
+
+// TestSharedTableSchemaOrderIndependence proves reconciliation is
+// commutative: three schemas (X, Y, Z) for a single shared table, each with
+// a unique column, a column shared with exactly one other schema, and a
+// column shared with both other schemas, must converge on the exact same
+// table shape and contents regardless of which order the three dynamic
+// children happen to register in.
+func TestSharedTableSchemaOrderIndependence(t *testing.T) {
+	// X: unique_x, shared_xy, shared_xz, shared_all
+	// Y: unique_y, shared_xy, shared_yz, shared_all
+	// Z: unique_z, shared_xz, shared_yz, shared_all
+	base := func(name string, extra ...string) types.TableSchema {
+		cols := []types.Column{
+			{Name: "block_number", Type: "uint64"},
+			{Name: "log_index", Type: "uint64"},
+		}
+		for _, c := range extra {
+			cols = append(cols, types.Column{Name: c, Type: "string"})
+		}
+		return types.TableSchema{
+			Name:      "shared_xyz",
+			Contract:  "Factory",
+			Event:     name,
+			TableType: types.TableTypeLog,
+			Columns:   cols,
+		}
+	}
+	schemas := map[string]types.TableSchema{
+		"X": base("X", "unique_x", "shared_xy", "shared_xz", "shared_all"),
+		"Y": base("Y", "unique_y", "shared_xy", "shared_yz", "shared_all"),
+		"Z": base("Z", "unique_z", "shared_xz", "shared_yz", "shared_all"),
+	}
+	blockFor := map[string]uint64{"X": 1, "Y": 2, "Z": 3}
+
+	wantCols := map[string]bool{
+		"block_number": true, "log_index": true,
+		"unique_x": true, "unique_y": true, "unique_z": true,
+		"shared_xy": true, "shared_xz": true, "shared_yz": true,
+		"shared_all": true,
+	}
+
+	orderings := [][]string{
+		{"X", "Y", "Z"}, {"X", "Z", "Y"},
+		{"Y", "X", "Z"}, {"Y", "Z", "X"},
+		{"Z", "X", "Y"}, {"Z", "Y", "X"},
+	}
+
+	for _, order := range orderings {
+		t.Run(fmt.Sprintf("%v", order), func(t *testing.T) {
+			s := newTestStore(t)
+			ctx := context.Background()
+
+			for _, name := range order {
+				sch := schemas[name]
+				if err := s.CreateTable(ctx, &sch); err != nil {
+					t.Fatalf("CreateTable(%s) in order %v: %v", name, order, err)
+				}
+			}
+
+			stored, ok := s.lookupSchema("shared_xyz")
+			if !ok {
+				t.Fatal("schema missing after registering all three")
+			}
+			gotCols := make(map[string]bool, len(stored.Columns))
+			for _, c := range stored.Columns {
+				gotCols[c.Name] = true
+			}
+			if len(gotCols) != len(wantCols) {
+				t.Fatalf("order %v: expected %d columns, got %d (%v)", order, len(wantCols), len(gotCols), gotCols)
+			}
+			for name := range wantCols {
+				if !gotCols[name] {
+					t.Errorf("order %v: missing expected column %q", order, name)
+				}
+			}
+
+			// Insert one row per schema, using only that schema's own columns.
+			var ops []store.Operation
+			for _, name := range order {
+				sch := schemas[name]
+				data := map[string]any{
+					"block_number": blockFor[name], "log_index": uint64(0),
+				}
+				for _, c := range sch.Columns {
+					if c.Name == "block_number" || c.Name == "log_index" {
+						continue
+					}
+					data[c.Name] = name
+				}
+				ops = append(ops, store.Operation{
+					Type: store.OpInsert, Table: "shared_xyz",
+					BlockNumber: blockFor[name], LogIndex: 0, Data: data,
+				})
+			}
+			if err := s.ApplyOperations(ctx, ops); err != nil {
+				t.Fatalf("order %v: inserting rows: %v", order, err)
+			}
+
+			events, err := s.GetEvents(ctx, "shared_xyz", store.Query{Limit: 10})
+			if err != nil {
+				t.Fatalf("order %v: get events: %v", order, err)
+			}
+			if len(events) != 3 {
+				t.Fatalf("order %v: expected 3 rows, got %d", order, len(events))
+			}
+			for _, evt := range events {
+				name, ok := map[uint64]string{1: "X", 2: "Y", 3: "Z"}[evt.BlockNumber]
+				if !ok {
+					t.Fatalf("order %v: unexpected block_number %d", order, evt.BlockNumber)
+				}
+				sch := schemas[name]
+				for _, c := range sch.Columns {
+					if c.Name == "block_number" || c.Name == "log_index" {
+						continue
+					}
+					if got := evt.Data[c.Name]; got != name {
+						t.Errorf("order %v: row for %s: column %s = %v, want %s", order, name, c.Name, got, name)
+					}
+				}
+			}
+		})
 	}
 }
 
