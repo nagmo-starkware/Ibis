@@ -574,20 +574,33 @@ func (s *PostgresStore) CreateTable(ctx context.Context, sch *types.TableSchema)
 // two concurrent CREATE TABLE IF NOT EXISTS calls racing on the same table
 // name. CREATE TABLE IF NOT EXISTS is not actually atomic across concurrent
 // sessions: both can pass the "doesn't exist" check and then collide on the
-// catalog insert. Deliberately narrow (exact SQLSTATE match) rather than a
-// broad retry/lock -- see the schemasMu comment for why nothing here holds a
-// lock across this network call. The end state either way is the table
-// exists, which is exactly what CreateTable is asking for, so this is a
-// correct treatment of the error, not just a tolerant one.
+// catalog insert. The end state either way is the table exists, which is
+// exactly what CreateTable is asking for, so this is a correct treatment of
+// the error, not just a tolerant one -- see the schemasMu comment for why
+// nothing here holds a lock across this network call instead.
+//
+// generateCreateTableDDL batches CREATE TABLE with its CREATE INDEX/CREATE
+// UNIQUE INDEX statements into one Exec call, so a 23505 here isn't
+// necessarily the benign catalog race: it's also the real SQLSTATE Postgres
+// raises when a CREATE UNIQUE INDEX fails because the table already has
+// duplicate data for that key -- a genuine failure that must not be
+// swallowed. The two are distinguished by ConstraintName: the catalog race
+// always collides on one of Postgres's own system indexes (e.g.
+// pg_type_typname_nsp_index), never on an index this codebase names itself
+// (idx_<table>_unique_<key>, see generateCreateTableDDL).
 func isConcurrentCreateRace(err error) bool {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return false
 	}
 	switch pgErr.Code {
-	case "23505": // unique_violation, e.g. pg_type_typname_nsp_index
-		return true
+	case "23505": // unique_violation
+		return strings.HasPrefix(pgErr.ConstraintName, "pg_")
 	case "42710": // duplicate_object ("already exists")
+		return true
+	case "42P07": // duplicate_table ("relation already exists") -- CREATE TABLE
+		// IF NOT EXISTS's own check-then-create race, unambiguous: unlike
+		// 23505 there's no real-data-conflict interpretation for this code.
 		return true
 	default:
 		return false

@@ -874,3 +874,48 @@ func TestConcurrentSchemaAccessIsRaceFree(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// TestCreateTableDoesNotSwallowRealUniqueViolation guards
+// isConcurrentCreateRace's ConstraintName check: generateCreateTableDDL
+// batches CREATE TABLE with its CREATE UNIQUE INDEX statement into one Exec
+// call, so a 23505 from real duplicate data (not a concurrent-create race)
+// must still surface as an error, not be swallowed as if it were benign.
+//
+// The dirty data is seeded via a raw SQL statement rather than a first
+// CreateTable call + inserts, deliberately: a second CreateTable call for an
+// already-cached table name can be short-circuited by dedup logic built on
+// top of this package (see the PR stacked on this one), which would never
+// reach the DDL this test needs to exercise. Seeding out-of-band keeps this
+// test about isConcurrentCreateRace specifically, independent of whatever
+// fast-path skip CreateTable itself grows later.
+func TestCreateTableDoesNotSwallowRealUniqueViolation(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Seed a table with two rows sharing the same "trader" value -- no
+	// unique constraint exists yet, so nothing prevents this.
+	if _, err := s.pool.Exec(ctx, `
+		CREATE TABLE dirty_leaderboard (block_number BIGINT, log_index BIGINT, trader TEXT);
+		INSERT INTO dirty_leaderboard (block_number, log_index, trader) VALUES (1, 0, 'alice'), (2, 0, 'alice');
+	`); err != nil {
+		t.Fatalf("seeding duplicate trader rows: %v", err)
+	}
+
+	// Registering the same table name as unique on "trader" now must fail --
+	// CREATE UNIQUE INDEX cannot succeed against the duplicate data already
+	// present, and that failure must not be mistaken for the benign
+	// concurrent-create race.
+	err := s.CreateTable(ctx, &types.TableSchema{
+		Name:      "dirty_leaderboard",
+		TableType: types.TableTypeUnique,
+		UniqueKey: "trader",
+		Columns: []types.Column{
+			{Name: "block_number", Type: "uint64"},
+			{Name: "log_index", Type: "uint64"},
+			{Name: "trader", Type: "string"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected CreateTable to fail when a unique index collides with real duplicate data, got nil")
+	}
+}
