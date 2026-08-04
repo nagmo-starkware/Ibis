@@ -654,15 +654,17 @@ func TestCreateTableFailureDoesNotCacheSchema(t *testing.T) {
 	}
 }
 
-// TestCreateTableSkipsRedundantDDL covers the shared/factory-table case: many
-// dynamic children (e.g. every OptionToken spawned by the same factory) call
-// CreateTable with the same schema.Name. The second (and every subsequent)
-// call must be a cheap no-op rather than re-issuing the CREATE TABLE DDL --
-// with hundreds of children sharing a handful of factory tables, re-running
-// it every time turns into hundreds of redundant Postgres round trips on a
-// cold start. This PR only dedupes; it doesn't reconcile schema drift across
-// children (that's a separate concern), so a second call's extra column is
-// expected to be silently skipped, not added.
+// TestCreateTableSkipsRedundantDDL covers the shared/factory-table case:
+// Engine.setup() reloads every persisted dynamic contract on cold start and
+// calls CreateTable per contract with no dedup cache across contracts of the
+// same factory, so CreateTable can be called more than once with the same
+// schema.Name. The second (and every subsequent) call must be a cheap no-op
+// rather than re-issuing the CREATE TABLE DDL -- with hundreds of persisted
+// children sharing a handful of factory tables, re-running it every time
+// turns into hundreds of redundant Postgres round trips on a cold start.
+// This PR only dedupes; it doesn't reconcile schema drift across children
+// (that's a separate concern), so a second call's extra column is expected
+// to be silently skipped, not added.
 func TestCreateTableSkipsRedundantDDL(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
