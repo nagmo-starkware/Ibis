@@ -1157,3 +1157,89 @@ func TestCreateTableDoesNotSwallowRealUniqueViolation(t *testing.T) {
 		t.Fatal("expected CreateTable to fail when a unique index collides with real duplicate data, got nil")
 	}
 }
+
+// TestConcurrentReconciliationConverges proves two fixes for real races in
+// reconcileSchema: (1) a new-table race, where the loser's CREATE TABLE IF
+// NOT EXISTS silently no-ops but reconcileSchema used to trust its own
+// (possibly wrong) schema unconditionally instead of re-inspecting; and (2)
+// a stale-live-snapshot race, where a concurrent reconciliation computed
+// from an older live-table snapshot could clobber a wider schema that had
+// just been cached. N goroutines all register the SAME brand-new shared
+// table name with N different single-column schemas concurrently -- after
+// they all complete, the cached schema and the live table must both
+// contain every column from every goroutine, not just whichever happened
+// to win a given race.
+func TestConcurrentReconciliationConverges(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const workers = 8
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sch := types.TableSchema{
+				Name:      "converging_table",
+				Contract:  "Factory",
+				Event:     fmt.Sprintf("Variant%d", i),
+				TableType: types.TableTypeLog,
+				Columns: []types.Column{
+					{Name: "block_number", Type: "uint64"},
+					{Name: "log_index", Type: "uint64"},
+					{Name: fmt.Sprintf("field_%d", i), Type: "string"},
+				},
+			}
+			if err := s.CreateTable(ctx, &sch); err != nil {
+				errs <- fmt.Errorf("CreateTable variant %d: %w", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	stored, ok := s.lookupSchema("converging_table")
+	if !ok {
+		t.Fatal("schema missing after concurrent registration")
+	}
+	gotCols := make(map[string]bool, len(stored.Columns))
+	for _, c := range stored.Columns {
+		gotCols[c.Name] = true
+	}
+	for i := 0; i < workers; i++ {
+		if !gotCols[fmt.Sprintf("field_%d", i)] {
+			t.Errorf("cached schema missing field_%d after concurrent registration", i)
+		}
+	}
+
+	// A row using every worker's column must insert successfully -- proves
+	// the LIVE table (not just the cache) actually has every column.
+	data := map[string]any{"block_number": uint64(1), "log_index": uint64(0)}
+	for i := 0; i < workers; i++ {
+		data[fmt.Sprintf("field_%d", i)] = fmt.Sprintf("v%d", i)
+	}
+	if err := s.ApplyOperations(ctx, []store.Operation{{
+		Type: store.OpInsert, Table: "converging_table", BlockNumber: 1, LogIndex: 0, Data: data,
+	}}); err != nil {
+		t.Fatalf("insert using every concurrently-registered column: %v", err)
+	}
+
+	events, err := s.GetEvents(ctx, "converging_table", store.Query{Limit: 1})
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	for i := 0; i < workers; i++ {
+		want := fmt.Sprintf("v%d", i)
+		if got := events[0].Data[fmt.Sprintf("field_%d", i)]; got != want {
+			t.Errorf("field_%d = %v, want %s", i, got, want)
+		}
+	}
+}

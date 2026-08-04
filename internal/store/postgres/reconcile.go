@@ -13,16 +13,22 @@ import (
 const atlasInspectSchema = "public"
 
 // hasAllColumns reports whether every column in incoming is already present
-// in known, by name. A cached schema that's missing a column incoming has
-// (e.g. a later dynamic child's event has a field an earlier one didn't)
-// means the live table needs reconciliation, not a skip.
+// in known, by name AND type. A cached schema that's missing a column
+// incoming has (e.g. a later dynamic child's event has a field an earlier
+// one didn't), or that has the same column name mapped to a different type
+// (two child ABIs disagreeing on a shared field, e.g. u64 vs u256), means
+// the live table needs reconciliation, not a skip -- a name-only match
+// would let CreateTable's fast path apply the wrong cached type to the
+// second child's inserts silently, instead of routing through
+// reconcileSchema's incompatible-schema guard.
 func hasAllColumns(known, incoming *types.TableSchema) bool {
-	existing := make(map[string]bool, len(known.Columns))
+	existing := make(map[string]types.Column, len(known.Columns))
 	for _, col := range known.Columns {
-		existing[col.Name] = true
+		existing[col.Name] = col
 	}
 	for _, col := range incoming.Columns {
-		if !existing[col.Name] {
+		match, ok := existing[col.Name]
+		if !ok || match.Type != col.Type {
 			return false
 		}
 	}
@@ -46,10 +52,17 @@ func (s *PostgresStore) reconcileSchema(ctx context.Context, sch *types.TableSch
 		if _, err := s.pool.Exec(ctx, ddl); err != nil && !isConcurrentCreateRace(err) {
 			return nil, fmt.Errorf("creating table %s: %w", sch.Name, err)
 		}
-		if err := s.ensureAggTable(ctx, sch); err != nil {
-			return nil, err
+
+		// A concurrent CreateTable for this same (new) table may have won
+		// the race with a different column set than ours -- CREATE TABLE IF
+		// NOT EXISTS silently no-ops for the loser, so sch is not
+		// necessarily what's now on disk. Re-inspect and fall through to the
+		// same diff-and-reconcile path used for pre-existing tables instead
+		// of trusting our own schema unconditionally.
+		live, err = s.inspectLiveTable(ctx, sch.Name)
+		if err != nil {
+			return nil, fmt.Errorf("inspecting live table %s after create: %w", sch.Name, err)
 		}
-		return sch, nil
 	}
 
 	if err := s.ensureAggTable(ctx, sch); err != nil {
@@ -89,7 +102,14 @@ func (s *PostgresStore) reconcileSchema(ctx context.Context, sch *types.TableSch
 	for _, add := range toAdd {
 		col, ok := findColumn(sch, add.C.Name)
 		if !ok {
-			continue
+			// desired was built 1:1 from sch.Columns, so every AddColumn
+			// Atlas reports must already be in sch.Columns -- this is a
+			// should-never-happen internal inconsistency, not a routine
+			// case to skip past silently.
+			return nil, fmt.Errorf(
+				"internal inconsistency reconciling %s: atlas wants to add column %q which is not present in the schema being registered",
+				sch.Name, add.C.Name,
+			)
 		}
 		query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
 			sch.Name, qid(col.Name), columnTypeToPostgres(col.Type))

@@ -71,6 +71,33 @@ func (s *PostgresStore) deleteSchema(table string) {
 	delete(s.schemas, table)
 }
 
+// mergeAndStoreSchema unions sch's columns into whatever is already cached
+// for its table name, so a concurrent reconcileSchema racing against this
+// one -- each computed from its own live-table snapshot taken before the
+// other's ALTER landed -- can never regress the cache to fewer columns than
+// it already reflects.
+func (s *PostgresStore) mergeAndStoreSchema(sch types.TableSchema) {
+	s.schemasMu.Lock()
+	defer s.schemasMu.Unlock()
+
+	existing, ok := s.schemas[sch.Name]
+	if !ok {
+		s.schemas[sch.Name] = sch
+		return
+	}
+
+	seen := make(map[string]bool, len(sch.Columns))
+	for _, col := range sch.Columns {
+		seen[col.Name] = true
+	}
+	for _, col := range existing.Columns {
+		if !seen[col.Name] {
+			sch.Columns = append(sch.Columns, col)
+		}
+	}
+	s.schemas[sch.Name] = sch
+}
+
 // New creates a new PostgresStore from the given config.
 func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error) {
 	connStr := buildConnString(cfg)
@@ -604,7 +631,7 @@ func (s *PostgresStore) CreateTable(ctx context.Context, sch *types.TableSchema)
 		return err
 	}
 
-	s.storeSchema(*merged)
+	s.mergeAndStoreSchema(*merged)
 	return nil
 }
 
