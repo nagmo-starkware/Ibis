@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,13 +41,25 @@ type PostgresStore struct {
 	// a shared table already created by one dynamic child can be safely
 	// widened when a later child registers a schema with extra columns.
 	atlas migrate.Driver
+
+	// atlasDB is the database/sql handle atlas is built on. It owns no
+	// connections of its own (stdlib.OpenDBFromPool draws from pool), but
+	// must still be closed explicitly -- database/sql never garbage-collects
+	// a *sql.DB's driver-level bookkeeping on its own.
+	atlasDB *sql.DB
 }
 
 // newAtlasDriver wraps pool as a database/sql handle for atlas, which only
-// speaks the standard library interface.
-func newAtlasDriver(pool *pgxpool.Pool) (migrate.Driver, error) {
+// speaks the standard library interface. The returned *sql.DB is owned by
+// the caller and must be closed independently of pool.
+func newAtlasDriver(pool *pgxpool.Pool) (migrate.Driver, *sql.DB, error) {
 	sqlDB := stdlib.OpenDBFromPool(pool)
-	return atlaspostgres.Open(sqlDB)
+	driver, err := atlaspostgres.Open(sqlDB)
+	if err != nil {
+		sqlDB.Close()
+		return nil, nil, err
+	}
+	return driver, sqlDB, nil
 }
 
 // lookupSchema returns the cached schema for table, if known.
@@ -112,7 +125,7 @@ func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error)
 		return nil, fmt.Errorf("pinging postgres: %w", err)
 	}
 
-	atlas, err := newAtlasDriver(pool)
+	atlas, atlasDB, err := newAtlasDriver(pool)
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("initializing schema driver: %w", err)
@@ -122,10 +135,11 @@ func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error)
 		pool:    pool,
 		schemas: make(map[string]types.TableSchema),
 		atlas:   atlas,
+		atlasDB: atlasDB,
 	}
 
 	if err := s.ensureMetaTable(ctx); err != nil {
-		pool.Close()
+		s.Close()
 		return nil, fmt.Errorf("creating meta table: %w", err)
 	}
 
@@ -152,7 +166,7 @@ func buildConnString(cfg config.PostgresConfig) string {
 
 // NewFromPool creates a PostgresStore from an existing connection pool (for testing).
 func NewFromPool(ctx context.Context, pool *pgxpool.Pool) (*PostgresStore, error) {
-	atlas, err := newAtlasDriver(pool)
+	atlas, atlasDB, err := newAtlasDriver(pool)
 	if err != nil {
 		return nil, fmt.Errorf("initializing schema driver: %w", err)
 	}
@@ -161,9 +175,11 @@ func NewFromPool(ctx context.Context, pool *pgxpool.Pool) (*PostgresStore, error
 		pool:    pool,
 		schemas: make(map[string]types.TableSchema),
 		atlas:   atlas,
+		atlasDB: atlasDB,
 	}
 
 	if err := s.ensureMetaTable(ctx); err != nil {
+		atlasDB.Close()
 		return nil, fmt.Errorf("creating meta table: %w", err)
 	}
 
@@ -855,6 +871,7 @@ func (s *PostgresStore) DeleteCursor(ctx context.Context, contract string) error
 }
 
 func (s *PostgresStore) Close() error {
+	s.atlasDB.Close()
 	s.pool.Close()
 	return nil
 }
