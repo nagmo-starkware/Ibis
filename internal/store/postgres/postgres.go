@@ -56,7 +56,7 @@ func newAtlasDriver(pool *pgxpool.Pool) (migrate.Driver, *sql.DB, error) {
 	sqlDB := stdlib.OpenDBFromPool(pool)
 	driver, err := atlaspostgres.Open(sqlDB)
 	if err != nil {
-		sqlDB.Close()
+		sqlDB.Close() //nolint:errcheck // cleanup on a path already returning a more relevant error
 		return nil, nil, err
 	}
 	return driver, sqlDB, nil
@@ -139,7 +139,7 @@ func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error)
 	}
 
 	if err := s.ensureMetaTable(ctx); err != nil {
-		s.Close()
+		s.Close() //nolint:errcheck // cleanup on a path already returning a more relevant error
 		return nil, fmt.Errorf("creating meta table: %w", err)
 	}
 
@@ -179,7 +179,7 @@ func NewFromPool(ctx context.Context, pool *pgxpool.Pool) (*PostgresStore, error
 	}
 
 	if err := s.ensureMetaTable(ctx); err != nil {
-		atlasDB.Close()
+		atlasDB.Close() //nolint:errcheck // cleanup on a path already returning a more relevant error
 		return nil, fmt.Errorf("creating meta table: %w", err)
 	}
 
@@ -871,9 +871,9 @@ func (s *PostgresStore) DeleteCursor(ctx context.Context, contract string) error
 }
 
 func (s *PostgresStore) Close() error {
-	s.atlasDB.Close()
+	err := s.atlasDB.Close()
 	s.pool.Close()
-	return nil
+	return err
 }
 
 // ---- Query builders ----
