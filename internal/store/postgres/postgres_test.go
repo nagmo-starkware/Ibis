@@ -654,6 +654,64 @@ func TestCreateTableFailureDoesNotCacheSchema(t *testing.T) {
 	}
 }
 
+// TestCreateTableSkipsRedundantDDL covers the shared/factory-table case:
+// Engine.setup() reloads every persisted dynamic contract on cold start and
+// calls CreateTable per contract with no dedup cache across contracts of the
+// same factory, so CreateTable can be called more than once with the same
+// schema.Name. The second (and every subsequent) call must be a cheap no-op
+// rather than re-issuing the CREATE TABLE DDL -- with hundreds of persisted
+// children sharing a handful of factory tables, re-running it every time
+// turns into hundreds of redundant Postgres round trips on a cold start.
+// This PR only dedupes; it doesn't reconcile schema drift across children
+// (that's a separate concern), so a second call's extra column is expected
+// to be silently skipped, not added.
+func TestCreateTableSkipsRedundantDDL(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	sch := types.TableSchema{
+		Name:      "shared_table",
+		Contract:  "Factory",
+		Event:     "Transfer",
+		TableType: types.TableTypeLog,
+		Columns: []types.Column{
+			{Name: "block_number", Type: "uint64"},
+			{Name: "log_index", Type: "uint64"},
+			{Name: "from_addr", Type: "string"},
+		},
+	}
+	if err := s.CreateTable(ctx, &sch); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Simulate a second dynamic child registering against the same shared
+	// table name with an extra column. The skip means this is a no-op: the
+	// stored schema stays exactly as the first call left it.
+	dup := sch
+	dup.Columns = append(dup.Columns, types.Column{Name: "extra", Type: "string"})
+	if err := s.CreateTable(ctx, &dup); err != nil {
+		t.Fatalf("second CreateTable for same table name: %v", err)
+	}
+
+	stored, ok := s.lookupSchema("shared_table")
+	if !ok {
+		t.Fatal("schema missing after second CreateTable")
+	}
+	if len(stored.Columns) != 3 {
+		t.Errorf("expected the first call's 3-column schema to be preserved (skip path), got %d columns", len(stored.Columns))
+	}
+
+	// Table is still usable with its original 3-column shape.
+	if err := s.ApplyOperations(ctx, []store.Operation{{
+		Type: store.OpInsert, Table: "shared_table", BlockNumber: 1, LogIndex: 0,
+		Data: map[string]any{
+			"block_number": uint64(1), "log_index": uint64(0), "from_addr": "0x1",
+		},
+	}}); err != nil {
+		t.Fatalf("insert into shared table: %v", err)
+	}
+}
+
 func TestEmptyTableReturnsNoEvents(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

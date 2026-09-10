@@ -552,6 +552,22 @@ func (s *PostgresStore) GetAllCursors(ctx context.Context) (map[string]uint64, e
 }
 
 func (s *PostgresStore) CreateTable(ctx context.Context, sch *types.TableSchema) error {
+	// Shared/factory tables can get CreateTable called more than once for
+	// the same table name -- NOT via the auto-detected factory/discovery
+	// child-registration path (registerSharedChild/registerSharedDiscoveredChild
+	// already dedupe in-memory per (factory, ChildABI) or class hash, and only
+	// call CreateTable for the first child of each group), but via
+	// Engine.setup() reloading every persisted dynamic contract on cold start
+	// with no such cache across contracts of the same factory. CREATE TABLE IF
+	// NOT EXISTS is already a no-op DDL-wise once the table exists, but it
+	// still pays a full round trip to Postgres every time -- with hundreds of
+	// persisted children sharing a handful of factory tables, that's hundreds
+	// of redundant round trips on every cold start. Skip it once this process
+	// already knows the table exists.
+	if _, exists := s.lookupSchema(sch.Name); exists {
+		return nil
+	}
+
 	// Generate CREATE TABLE directly from schema columns.
 	ddl := s.generateCreateTableDDL(sch)
 	if _, err := s.pool.Exec(ctx, ddl); err != nil && !isConcurrentCreateRace(err) {
