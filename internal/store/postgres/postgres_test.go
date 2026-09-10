@@ -892,6 +892,22 @@ func TestSharedTableSchemaOrderIndependence(t *testing.T) {
 	}
 }
 
+// TestCloseClosesAtlasSQLDB guards against leaking the database/sql handle
+// atlas is built on: stdlib.OpenDBFromPool returns a *sql.DB distinct from
+// the pgxpool.Pool, and database/sql never reclaims it on its own -- it must
+// be closed explicitly wherever the store is closed.
+func TestCloseClosesAtlasSQLDB(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if err := s.atlasDB.PingContext(context.Background()); err == nil {
+		t.Fatal("expected the atlas *sql.DB to be closed by Store.Close, but it still accepts pings")
+	}
+}
+
 func TestEmptyTableReturnsNoEvents(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
