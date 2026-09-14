@@ -183,7 +183,7 @@ func (s *EventSubscriber) processFirehose(ctx context.Context, session *wssSessi
 			return ctx.Err()
 
 		case err := <-session.errs:
-			return fmt.Errorf("firehose subscription error: %w", err)
+			return fmt.Errorf("firehose subscription error: %w", RedactErr(err))
 
 		case reorg := <-session.reorgs:
 			if reorg != nil {

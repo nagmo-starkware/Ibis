@@ -74,14 +74,14 @@ type wssDialer func(ctx context.Context, wsURL string, input *rpc.EventSubscript
 func defaultWSSDialer(ctx context.Context, wsURL string, input *rpc.EventSubscriptionInput) (*wssSession, error) {
 	ws, err := rpc.NewWebsocketProvider(ctx, wsURL)
 	if err != nil {
-		return nil, fmt.Errorf("connecting websocket: %w", err)
+		return nil, fmt.Errorf("connecting websocket: %w", RedactErr(err))
 	}
 
 	eventCh := make(chan *rpc.EmittedEventWithFinalityStatus, 100)
 	sub, err := ws.SubscribeEvents(ctx, eventCh, input)
 	if err != nil {
 		ws.Close()
-		return nil, fmt.Errorf("subscribing to events: %w", err)
+		return nil, fmt.Errorf("subscribing to events: %w", RedactErr(err))
 	}
 
 	return &wssSession{
@@ -124,7 +124,7 @@ func (s *EventSubscriber) multiplexKeysDialer(ctx context.Context, wsURL string,
 	if err != nil {
 		// The failure is this one subscription's; leave the shared socket up
 		// for every other address-sub riding it.
-		return nil, fmt.Errorf("subscribing to events (shared conn): %w", err)
+		return nil, fmt.Errorf("subscribing to events (shared conn): %w", RedactErr(err))
 	}
 
 	return &wssSession{
@@ -157,7 +157,7 @@ func (s *EventSubscriber) sharedAddrWS(ctx context.Context, wsURL string) (*rpc.
 	}
 	ws, err := s.dialSharedWS(connCtx, wsURL)
 	if err != nil {
-		return nil, fmt.Errorf("dialing shared address websocket: %w", err)
+		return nil, fmt.Errorf("dialing shared address websocket: %w", RedactErr(err))
 	}
 	s.addrWS = ws
 	return ws, nil
@@ -749,7 +749,7 @@ func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSess
 			return eventsProcessed, ctx.Err()
 
 		case err := <-session.errs:
-			return eventsProcessed, fmt.Errorf("subscription error: %w", err)
+			return eventsProcessed, fmt.Errorf("subscription error: %w", RedactErr(err))
 
 		case reorg := <-session.reorgs:
 			if reorg != nil {

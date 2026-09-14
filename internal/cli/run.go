@@ -49,7 +49,7 @@ var runCmd = &cobra.Command{
 
 		fmt.Fprintf(cmd.OutOrStdout(), "Loaded config from %s\n", cfgPath)
 		fmt.Fprintf(cmd.OutOrStdout(), "  Network:  %s\n", cfg.Network)
-		fmt.Fprintf(cmd.OutOrStdout(), "  RPC:      %s\n", cfg.RPC)
+		fmt.Fprintf(cmd.OutOrStdout(), "  RPC:      %s\n", provider.RedactURL(cfg.RPC))
 		fmt.Fprintf(cmd.OutOrStdout(), "  Backend:  %s\n", cfg.Database.Backend)
 		fmt.Fprintf(cmd.OutOrStdout(), "  API:      %s:%d\n", cfg.API.Host, cfg.API.Port)
 		fmt.Fprintf(cmd.OutOrStdout(), "  Contracts: %d\n", len(cfg.Contracts))
