@@ -169,7 +169,8 @@ See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full configuration 
 
 ```
 ibis init       Scaffold a config by inspecting contracts on-chain
-ibis run        Start the indexer
+ibis run        Start the indexer (indexes AND serves the REST API)
+ibis serve      Serve the REST API read-only from an existing database, without indexing
 ibis query      Query indexed data from the terminal
 ```
 
@@ -183,6 +184,23 @@ ibis query      Query indexed data from the terminal
 | `--rpc` | RPC endpoint URL |
 | `--database` | Backend: `memory`, `badger`, or `postgres` |
 | `--non-interactive` | Skip interactive prompts |
+
+### `ibis serve`
+
+Serves the REST API from the database `ibis run` is indexing into, without doing any
+indexing itself: no contract discovery, no event subscriptions, no view-function
+polling, no table creation. Use it to run a scalable, stateless reader fleet in front
+of a single indexing writer — with `ibis run`, every autoscaled instance is a full
+indexer, so read traffic that scales instance count scales RPC load on the upstream
+node by the same factor.
+
+Reads the same `--config` file as `run`. Point `database.postgres` at read-only
+credentials. Dynamic contracts (e.g. factory children) that the writer registers after
+`serve` starts are picked up automatically by polling the store — see `--refresh-interval`.
+
+| Flag | Description |
+|------|-------------|
+| `--refresh-interval` | How often to check for dynamic contracts registered by the writer (default: `30s`) |
 
 ### `ibis query [contract] [event]`
 
