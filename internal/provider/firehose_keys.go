@@ -467,7 +467,7 @@ func (s *EventSubscriber) processKeysStream(ctx context.Context, st *firehoseKey
 			return ctx.Err()
 
 		case err := <-session.errs:
-			return fmt.Errorf("firehose-keys subscription error (%s): %w", st.label, err)
+			return fmt.Errorf("firehose-keys subscription error (%s): %w", st.label, RedactErr(err))
 
 		case reorg := <-session.reorgs:
 			if reorg != nil {
