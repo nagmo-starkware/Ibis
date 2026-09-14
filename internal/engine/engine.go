@@ -912,14 +912,14 @@ func (e *Engine) Run(ctx context.Context) error {
 	return err
 }
 
-// setup resolves ABIs, builds event registries and table schemas, and creates
-// tables in the store. Also loads persisted dynamic contracts.
-func (e *Engine) setup(ctx context.Context) error {
-	// Initialize contract discovery if configured.
-	if err := e.setupDiscovery(); err != nil {
-		return fmt.Errorf("setup discovery: %w", err)
-	}
-
+// buildContractStates loads static contracts from config plus any persisted
+// dynamic contracts, resolves their ABIs, builds table schemas, and appends
+// the resulting contractState to e.contracts. When createTables is true, it
+// also creates each schema's table in the store — the indexing writer's
+// setup() does this; the read-only reader's setupReadOnly() (see readonly.go)
+// does not, since it connects with a read-only DB user and relies on the
+// writer to own table creation.
+func (e *Engine) buildContractStates(ctx context.Context, createTables bool) error {
 	// Load static contracts from config.
 	allContracts := make([]config.ContractConfig, len(e.cfg.Contracts))
 	copy(allContracts, e.cfg.Contracts)
@@ -993,6 +993,10 @@ func (e *Engine) setup(ctx context.Context) error {
 		}
 		e.contracts = append(e.contracts, cs)
 
+		if !createTables {
+			continue
+		}
+
 		// Create tables in store.
 		for _, schema := range schemas {
 			if err := e.store.CreateTable(ctx, schema); err != nil {
@@ -1004,6 +1008,21 @@ func (e *Engine) setup(ctx context.Context) error {
 				"columns", len(schema.Columns),
 			)
 		}
+	}
+
+	return nil
+}
+
+// setup resolves ABIs, builds event registries and table schemas, and creates
+// tables in the store. Also loads persisted dynamic contracts.
+func (e *Engine) setup(ctx context.Context) error {
+	// Initialize contract discovery if configured.
+	if err := e.setupDiscovery(); err != nil {
+		return fmt.Errorf("setup discovery: %w", err)
+	}
+
+	if err := e.buildContractStates(ctx, true); err != nil {
+		return err
 	}
 
 	// Reconcile contracts whose terminal freeze event was already indexed in a
