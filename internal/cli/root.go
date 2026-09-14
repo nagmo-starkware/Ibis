@@ -31,4 +31,5 @@ func init() {
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(queryCmd)
+	rootCmd.AddCommand(serveCmd)
 }
