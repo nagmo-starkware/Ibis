@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -55,4 +57,44 @@ func TestRedactURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRedactErr(t *testing.T) {
+	t.Run("nil error returns nil", func(t *testing.T) {
+		if got := RedactErr(nil); got != nil {
+			t.Errorf("RedactErr(nil) = %v, want nil", got)
+		}
+	})
+
+	t.Run("redacts message and preserves wrapping via errors.Is", func(t *testing.T) {
+		sentinel := errors.New("deadline exceeded")
+		wrapped := fmt.Errorf(`fetching events: -32603 Post "https://rpc.example.com/v1/super-secret-key": %w`, sentinel)
+
+		redacted := RedactErr(wrapped)
+
+		wantMsg := `fetching events: -32603 Post "https://rpc.example.com/<redacted>": deadline exceeded`
+		if redacted.Error() != wantMsg {
+			t.Errorf("redacted.Error() = %q, want %q", redacted.Error(), wantMsg)
+		}
+		if !errors.Is(redacted, sentinel) {
+			t.Errorf("errors.Is(redacted, sentinel) = false, want true")
+		}
+
+		// Wrapping the redacted error again with %w must keep the chain intact
+		// and must not reintroduce the raw URL.
+		outer := fmt.Errorf("catchup: %w", redacted)
+		if !errors.Is(outer, sentinel) {
+			t.Errorf("errors.Is(outer, sentinel) = false, want true")
+		}
+		if got, want := outer.Error(), "catchup: "+wantMsg; got != want {
+			t.Errorf("outer.Error() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("no URL leaves error untouched", func(t *testing.T) {
+		err := errors.New("context deadline exceeded")
+		if got := RedactErr(err); got != err {
+			t.Errorf("RedactErr returned a different error for a message with no URL: %v", got)
+		}
+	})
 }
