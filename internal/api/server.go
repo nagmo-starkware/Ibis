@@ -165,6 +165,20 @@ func (s *Server) lookupSchema(contract, event string) *types.TableSchema {
 	return s.schemas[key]
 }
 
+// SetSchemas replaces the schema/contract set wholesale. Used once, after
+// Engine.Setup() completes, by callers that construct the server before setup
+// so the listener is bound early — at construction there is nothing to pass.
+func (s *Server) SetSchemas(schemas []*types.TableSchema, contracts []config.ContractConfig) {
+	m := make(map[string]*types.TableSchema, len(schemas))
+	for _, sch := range schemas {
+		m[strings.ToLower(sch.Contract)+"/"+strings.ToLower(sch.Event)] = sch
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.schemas = m
+	s.contracts = contracts
+}
+
 // AddSchemas registers additional table schemas (for dynamically registered contracts).
 func (s *Server) AddSchemas(cc *config.ContractConfig, schemas []*types.TableSchema) {
 	s.mu.Lock()
