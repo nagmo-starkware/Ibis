@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -13,6 +16,14 @@ import (
 	"github.com/b-j-roberts/ibis/internal/config"
 	"github.com/b-j-roberts/ibis/internal/engine"
 )
+
+// defaultServeRefreshInterval is how often `serve` re-reads dynamic contracts
+// from the store to notice ones the indexing writer registered after this
+// reader started (e.g. a new factory child, which appears roughly every 12
+// minutes in production).
+const defaultServeRefreshInterval = 30 * time.Second
+
+var serveRefreshInterval time.Duration
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -59,6 +70,10 @@ the instance count scales RPC load by the same factor.`,
 			Engine:    eng,
 		})
 
+		// Periodically pick up dynamic contracts (e.g. factory children) the
+		// indexing writer registers after this reader started.
+		go refreshDynamicContractsLoop(ctx, eng, apiServer, logger, serveRefreshInterval)
+
 		fmt.Fprintf(cmd.OutOrStdout(), "\nAPI server listening on %s:%d (read-only)\n", cfg.API.Host, cfg.API.Port)
 		if err := apiServer.Start(ctx); err != nil {
 			return fmt.Errorf("API server: %w", err)
@@ -66,4 +81,38 @@ the instance count scales RPC load by the same factor.`,
 
 		return nil
 	},
+}
+
+func init() {
+	serveCmd.Flags().DurationVar(&serveRefreshInterval, "refresh-interval", defaultServeRefreshInterval,
+		"how often to re-check the store for dynamic contracts registered by the indexing writer")
+}
+
+// refreshDynamicContractsLoop periodically calls eng.RefreshDynamicContracts
+// and wires any newly discovered contracts into the running API server. A
+// store error is logged and retried on the next tick — it never crashes the
+// reader, since a transient DB hiccup shouldn't take down read serving.
+func refreshDynamicContractsLoop(ctx context.Context, eng *engine.Engine, apiServer *api.Server, logger *slog.Logger, interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultServeRefreshInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			configs, schemas, err := eng.RefreshDynamicContracts(ctx)
+			if err != nil {
+				logger.Error("dynamic contract refresh failed", "error", err)
+				continue
+			}
+			for i, cc := range configs {
+				apiServer.AddSchemas(cc, schemas[i])
+				logger.Info("registered new dynamic contract", "name", cc.Name, "address", cc.Address)
+			}
+		}
+	}
 }
