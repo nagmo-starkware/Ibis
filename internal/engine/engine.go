@@ -1013,6 +1013,47 @@ func (e *Engine) buildContractStates(ctx context.Context, createTables bool) err
 	return nil
 }
 
+// setupViewPoller builds the view-function poller for e.contracts and
+// attaches the resulting view schemas to each contract's schema map (so
+// they're included in Schemas() and accessible by the API server). When
+// createTables is true, it also creates the view tables in the store — the
+// indexing writer's setup() needs this, but a read-only reader's setup must
+// not create anything.
+func (e *Engine) setupViewPoller(ctx context.Context, createTables bool) error {
+	vp := NewViewPoller(e.provider, e.store, e.logger)
+	viewSchemas, err := vp.Setup(e.contracts)
+	if err != nil {
+		return fmt.Errorf("view poller setup: %w", err)
+	}
+	for _, vs := range viewSchemas {
+		// For shared-table contracts, the view schema's Contract field
+		// carries the factory/ABI name (e.g. "OrderBook") rather than
+		// the instance name, so fall back to a FactoryName match so the
+		// schema still gets attached and surfaces in the API.
+		for _, cs := range e.contracts {
+			if cs.config.Name == vs.Contract ||
+				(cs.config.SharedTables && cs.config.FactoryName == vs.Contract) {
+				cs.schemas[vs.Event] = vs
+				break
+			}
+		}
+		if !createTables {
+			continue
+		}
+		// Create view table in store.
+		if err := e.store.CreateTable(ctx, vs); err != nil {
+			return fmt.Errorf("create view table %s: %w", vs.Name, err)
+		}
+		e.logger.Info("created view table",
+			"name", vs.Name,
+			"type", vs.TableType,
+			"columns", len(vs.Columns),
+		)
+	}
+	e.poller = vp
+	return nil
+}
+
 // setup resolves ABIs, builds event registries and table schemas, and creates
 // tables in the store. Also loads persisted dynamic contracts.
 func (e *Engine) setup(ctx context.Context) error {
@@ -1032,36 +1073,9 @@ func (e *Engine) setup(ctx context.Context) error {
 	e.reconcileFrozenContracts(ctx)
 
 	// Set up view function poller for contracts with views configured.
-	vp := NewViewPoller(e.provider, e.store, e.logger)
-	viewSchemas, err := vp.Setup(e.contracts)
-	if err != nil {
-		return fmt.Errorf("view poller setup: %w", err)
+	if err := e.setupViewPoller(ctx, true); err != nil {
+		return err
 	}
-	for _, vs := range viewSchemas {
-		// Add view schemas to the contract's schema map so they're
-		// included in Schemas() and accessible by the API server.
-		// For shared-table contracts, the view schema's Contract field
-		// carries the factory/ABI name (e.g. "OrderBook") rather than
-		// the instance name, so fall back to a FactoryName match so the
-		// schema still gets attached and surfaces in the API.
-		for _, cs := range e.contracts {
-			if cs.config.Name == vs.Contract ||
-				(cs.config.SharedTables && cs.config.FactoryName == vs.Contract) {
-				cs.schemas[vs.Event] = vs
-				break
-			}
-		}
-		// Create view table in store.
-		if err := e.store.CreateTable(ctx, vs); err != nil {
-			return fmt.Errorf("create view table %s: %w", vs.Name, err)
-		}
-		e.logger.Info("created view table",
-			"name", vs.Name,
-			"type", vs.TableType,
-			"columns", len(vs.Columns),
-		)
-	}
-	e.poller = vp
 
 	// Compute the option-family selector union for the firehose-keys
 	// transport. Cheap and config-driven (not per-child), so always computed
