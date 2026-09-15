@@ -250,29 +250,15 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 		return fmt.Errorf("no ABI resolved for contract %s (%s)", cc.Name, cc.Address)
 	}
 
-	registry := abi.NewEventRegistry(contractABI)
-
-	// For admin-registered contracts with shared tables, use BuildOptions
-	// so schemas are named after the factory/ABI name instead of the contract.
-	var buildOpts *schema.BuildOptions
-	if cc.SharedTables && cc.FactoryName != "" {
-		buildOpts = &schema.BuildOptions{
-			SharedTable: true,
-			FactoryName: cc.FactoryName,
-		}
-	}
-	schemas := schema.BuildSchemas(cc, contractABI, registry, buildOpts)
-
-	// Parse contract address.
-	address, err := new(felt.Felt).SetString(cc.Address)
+	cs, err := buildContractState(cc, contractABI)
 	if err != nil {
-		return fmt.Errorf("parsing address for %s: %w", cc.Name, err)
+		return err
 	}
 
 	// Create tables in store. For shared tables that already exist (created by a
 	// prior registration with the same FactoryName), CreateTable is idempotent.
 	var schemaList []*types.TableSchema
-	for _, sch := range schemas {
+	for _, sch := range cs.schemas {
 		if err := e.store.CreateTable(ctx, sch); err != nil {
 			return fmt.Errorf("create table %s: %w", sch.Name, err)
 		}
@@ -288,13 +274,6 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 		return fmt.Errorf("persisting dynamic contract %s: %w", cc.Name, err)
 	}
 
-	cs := &contractState{
-		config:   *cc,
-		address:  address,
-		abi:      contractABI,
-		registry: registry,
-		schemas:  schemas,
-	}
 	e.contracts = append(e.contracts, cs)
 
 	// Spawn subscription if the engine is running.
@@ -314,17 +293,17 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 		}
 
 		sub := provider.ContractSubscription{
-			Address:    address,
+			Address:    cs.address,
 			StartBlock: derefUint64(resolvedStart),
 			Wildcard:   hasWildcardEvent(cc),
-			ERC20:      registry.MatchName("Transfer") != nil,
+			ERC20:      cs.registry.MatchName("Transfer") != nil,
 		}
 
 		// Build key filters if no wildcard.
 		if !hasWildcardEvent(cc) {
 			var selectors []*felt.Felt
 			for _, ec := range cc.Events {
-				if ev := registry.MatchName(ec.Name); ev != nil {
+				if ev := cs.registry.MatchName(ec.Name); ev != nil {
 					selectors = append(selectors, ev.Selector)
 				}
 			}
@@ -966,30 +945,9 @@ func (e *Engine) buildContractStates(ctx context.Context, createTables bool) err
 			return fmt.Errorf("no ABI resolved for contract %s (%s)", cc.Name, cc.Address)
 		}
 
-		registry := abi.NewEventRegistry(contractABI)
-
-		// For factory children with shared tables, use factory name for table naming.
-		var buildOpts *schema.BuildOptions
-		if cc.SharedTables && cc.FactoryName != "" {
-			buildOpts = &schema.BuildOptions{
-				SharedTable: true,
-				FactoryName: cc.FactoryName,
-			}
-		}
-		schemas := schema.BuildSchemas(cc, contractABI, registry, buildOpts)
-
-		// Parse contract address.
-		address, err := new(felt.Felt).SetString(cc.Address)
+		cs, err := buildContractState(cc, contractABI)
 		if err != nil {
-			return fmt.Errorf("parsing address for %s: %w", cc.Name, err)
-		}
-
-		cs := &contractState{
-			config:   *cc,
-			address:  address,
-			abi:      contractABI,
-			registry: registry,
-			schemas:  schemas,
+			return err
 		}
 		e.contracts = append(e.contracts, cs)
 
@@ -998,19 +956,49 @@ func (e *Engine) buildContractStates(ctx context.Context, createTables bool) err
 		}
 
 		// Create tables in store.
-		for _, schema := range schemas {
-			if err := e.store.CreateTable(ctx, schema); err != nil {
-				return fmt.Errorf("create table %s: %w", schema.Name, err)
+		for _, sch := range cs.schemas {
+			if err := e.store.CreateTable(ctx, sch); err != nil {
+				return fmt.Errorf("create table %s: %w", sch.Name, err)
 			}
 			e.logger.Info("created table",
-				"name", schema.Name,
-				"type", schema.TableType,
-				"columns", len(schema.Columns),
+				"name", sch.Name,
+				"type", sch.TableType,
+				"columns", len(sch.Columns),
 			)
 		}
 	}
 
 	return nil
+}
+
+// buildContractState resolves the per-contract fields shared by every
+// contract-registration path (registry, schemas, parsed address) from an
+// already-resolved ABI. Creates nothing; callers append to e.contracts.
+func buildContractState(cc *config.ContractConfig, contractABI *abi.ABI) (*contractState, error) {
+	registry := abi.NewEventRegistry(contractABI)
+
+	// Shared-table contracts name schemas after the factory/ABI, not the instance.
+	var buildOpts *schema.BuildOptions
+	if cc.SharedTables && cc.FactoryName != "" {
+		buildOpts = &schema.BuildOptions{
+			SharedTable: true,
+			FactoryName: cc.FactoryName,
+		}
+	}
+	schemas := schema.BuildSchemas(cc, contractABI, registry, buildOpts)
+
+	address, err := new(felt.Felt).SetString(cc.Address)
+	if err != nil {
+		return nil, fmt.Errorf("parsing address for %s: %w", cc.Name, err)
+	}
+
+	return &contractState{
+		config:   *cc,
+		address:  address,
+		abi:      contractABI,
+		registry: registry,
+		schemas:  schemas,
+	}, nil
 }
 
 // setupViewPoller builds the view-function poller for e.contracts and
