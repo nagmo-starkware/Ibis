@@ -152,6 +152,55 @@ Starting indexer...
 
 ---
 
+## `ibis serve`
+
+Serve the REST API read-only from a database another `ibis run` process is indexing
+into. Never writes to the database and never indexes: no contract discovery, no event
+subscriptions, no view-function polling, no table creation.
+
+Use this to split read-serving from indexing. With `ibis run`, every instance is a full
+indexer, so autoscaling on read traffic multiplies RPC load on the upstream node by the
+instance count. `ibis serve` lets a scalable reader fleet absorb read traffic while a
+single pinned `ibis run` process owns indexing. Point the reader's `database.postgres`
+credentials at a read-only database role.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config <path>` | `./ibis.config.yaml` | Path to ibis config file |
+| `--refresh-interval` | `30s` | How often to re-check the store for dynamic contracts (e.g. factory children) registered by the indexing writer since this reader started |
+
+### Startup Sequence
+
+1. Load and validate `ibis.config.yaml`
+2. Connect to Starknet RPC (only used for ABI resolution when a contract's `abi` is
+   `fetch`; contracts with a local ABI file or name need no RPC)
+3. Connect to the database backend — expects the writer to already own table creation
+4. Bind the REST API listener immediately, not-ready: data endpoints 503 while
+   `/v1/health` and `/v1/status` keep answering (same early-bind fix as `ibis run` — see
+   its Startup Sequence)
+5. Resolve contract ABIs and build table schemas (no `CREATE TABLE`, no discovery, no
+   freeze reconciliation)
+6. Publish the schemas and flip the API server ready — data endpoints stop 503ing
+7. On a timer (`--refresh-interval`), re-read dynamic contracts from the store and
+   register any new ones with the running API server
+
+### Graceful Shutdown
+
+Same signal handling as `ibis run` (`SIGINT`/`SIGTERM`): stops the refresh loop, shuts
+down the API server, and closes the database connection.
+
+```bash
+# Start with default config path
+ibis serve
+
+# Start with custom config and a faster refresh
+ibis serve --config ./configs/production.yaml --refresh-interval 10s
+```
+
+---
+
 ## `ibis query`
 
 Query indexed event data directly from the configured database without needing the API server running. Connects to the same database backend specified in the config file.
