@@ -70,42 +70,15 @@ var runCmd = &cobra.Command{
 			})
 		})
 
-		// Start API server in background, with engine reference for dynamic contract management.
-		// Schemas are empty here on purpose: the listener binds BEFORE
-		// Engine.Setup() so a slow setup can't blow a platform startup deadline
-		// (Cloud Run enforces ~600s and no probe setting extends it). The real
-		// schemas are published by SetSchemas once setup returns.
-		apiServer := api.New(&api.ServerConfig{
-			Store:     st,
-			APIConfig: &cfg.API,
-			Logger:    logger,
-			EventBus:  bus,
-			Engine:    eng,
-		})
-		// Data endpoints 503 until setup finishes, so a consumer gets a loud
-		// failure rather than a silently empty result. /v1/health and
-		// /v1/status keep answering.
-		apiServer.SetReady(false)
-
-		go func() {
-			if err := apiServer.Start(ctx); err != nil {
-				logger.Error("API server error", "error", err)
-			}
-		}()
-
-		fmt.Fprintf(cmd.OutOrStdout(), "\nAPI server listening on %s:%d\n", cfg.API.Host, cfg.API.Port)
-
-		// Setup engine (resolve ABIs, build schemas, create tables). Runs with
-		// the listener already bound. Still synchronous: an error here returns
-		// and exits the process, so a broken instance dies rather than serving
-		// 503s forever.
-		fmt.Fprintln(cmd.OutOrStdout(), "Setting up engine...")
-		if err := eng.Setup(ctx); err != nil {
+		// Bind the listener, run setup, then go ready — shared with `serve`.
+		// See startAPIServer: the listener binds BEFORE Engine.Setup() so a
+		// slow setup can't blow a platform startup deadline (Cloud Run
+		// enforces ~600s and no probe setting extends it). Setup stays
+		// synchronous here, so an error still returns and exits the process.
+		apiServer, err := startAPIServer(ctx, cmd.OutOrStdout(), p, eng, bus, "", eng.Setup)
+		if err != nil {
 			return fmt.Errorf("engine setup: %w", err)
 		}
-
-		apiServer.SetSchemas(eng.Schemas(), eng.AllContracts())
-		apiServer.SetReady(true)
 
 		// Wire engine callbacks AFTER SetSchemas: it replaces the schema set
 		// wholesale, so a contract registered mid-setup would be wiped. Same
