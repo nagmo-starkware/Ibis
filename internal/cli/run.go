@@ -78,11 +78,6 @@ var runCmd = &cobra.Command{
 
 		eng := engine.New(cfg, st, prov, logger)
 
-		// Setup engine (resolve ABIs, build schemas, create tables).
-		if err := eng.Setup(ctx); err != nil {
-			return fmt.Errorf("engine setup: %w", err)
-		}
-
 		// Create event bus for SSE streaming.
 		bus := api.NewEventBus()
 		eng.SetOnEvent(func(contract, event, table string, blockNumber, logIndex uint64, data map[string]any) {
@@ -97,23 +92,21 @@ var runCmd = &cobra.Command{
 		})
 
 		// Start API server in background, with engine reference for dynamic contract management.
+		// Schemas are empty here on purpose: the listener binds BEFORE
+		// Engine.Setup() so a slow setup can't blow a platform startup deadline
+		// (Cloud Run enforces ~600s and no probe setting extends it). The real
+		// schemas are published by SetSchemas once setup returns.
 		apiServer := api.New(&api.ServerConfig{
 			Store:     st,
-			Schemas:   eng.Schemas(),
 			APIConfig: &cfg.API,
-			Contracts: eng.AllContracts(),
 			Logger:    logger,
 			EventBus:  bus,
 			Engine:    eng,
 		})
-
-		// Wire engine callbacks to API server for dynamic registration.
-		eng.SetOnContractRegistered(func(cc *config.ContractConfig, schemas []*types.TableSchema) {
-			apiServer.AddSchemas(cc, schemas)
-		})
-		eng.SetOnContractDeregistered(func(name string) {
-			apiServer.RemoveSchemas(name)
-		})
+		// Data endpoints 503 until setup finishes, so a consumer gets a loud
+		// failure rather than a silently empty result. /v1/health and
+		// /v1/status keep answering.
+		apiServer.SetReady(false)
 
 		go func() {
 			if err := apiServer.Start(ctx); err != nil {
@@ -122,6 +115,29 @@ var runCmd = &cobra.Command{
 		}()
 
 		fmt.Fprintf(cmd.OutOrStdout(), "\nAPI server listening on %s:%d\n", cfg.API.Host, cfg.API.Port)
+
+		// Setup engine (resolve ABIs, build schemas, create tables). Runs with
+		// the listener already bound. Still synchronous: an error here returns
+		// and exits the process, so a broken instance dies rather than serving
+		// 503s forever.
+		fmt.Fprintln(cmd.OutOrStdout(), "Setting up engine...")
+		if err := eng.Setup(ctx); err != nil {
+			return fmt.Errorf("engine setup: %w", err)
+		}
+
+		apiServer.SetSchemas(eng.Schemas(), eng.AllContracts())
+		apiServer.SetReady(true)
+
+		// Wire engine callbacks AFTER SetSchemas: it replaces the schema set
+		// wholesale, so a contract registered mid-setup would be wiped. Same
+		// order relative to Setup as before this reorder.
+		eng.SetOnContractRegistered(func(cc *config.ContractConfig, schemas []*types.TableSchema) {
+			apiServer.AddSchemas(cc, schemas)
+		})
+		eng.SetOnContractDeregistered(func(name string) {
+			apiServer.RemoveSchemas(name)
+		})
+
 		fmt.Fprintln(cmd.OutOrStdout(), "Starting indexer...")
 		if err := eng.Run(ctx); err != nil {
 			return fmt.Errorf("engine: %w", err)
