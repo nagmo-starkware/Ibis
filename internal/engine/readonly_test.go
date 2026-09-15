@@ -94,3 +94,60 @@ func TestEngine_SetupReadOnly_NeverCreatesTables(t *testing.T) {
 		t.Fatalf("SetupReadOnly is not idempotent: got %d contracts", len(e.AllContracts()))
 	}
 }
+
+func TestEngine_RefreshDynamicContracts_PicksUpNewContract(t *testing.T) {
+	abiPath := writeTestABI(t)
+	st := memory.New()
+	ctx := context.Background()
+
+	cfg := &config.Config{} // no static contracts
+	e := New(cfg, st, nil, noopLogger())
+
+	if err := e.SetupReadOnly(ctx); err != nil {
+		t.Fatalf("SetupReadOnly: %v", err)
+	}
+	if len(e.AllContracts()) != 0 {
+		t.Fatalf("expected no contracts before any dynamic contract is registered, got %d", len(e.AllContracts()))
+	}
+
+	// Simulate the writer registering a new dynamic contract (e.g. a factory
+	// child) after this reader's initial setup.
+	if err := st.SaveDynamicContract(ctx, &config.ContractConfig{
+		Name:    "Child_1",
+		Address: "0x2",
+		ABI:     abiPath,
+		Events: []config.EventConfig{
+			{Name: "Transfer", Table: config.TableConfig{Type: "log"}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	newConfigs, newSchemas, err := e.RefreshDynamicContracts(ctx)
+	if err != nil {
+		t.Fatalf("RefreshDynamicContracts: %v", err)
+	}
+	if len(newConfigs) != 1 || newConfigs[0].Name != "Child_1" {
+		t.Fatalf("expected Child_1 to be reported as newly seen, got %+v", newConfigs)
+	}
+	if len(newSchemas) != 1 || len(newSchemas[0]) != 1 {
+		t.Fatalf("expected 1 schema for Child_1, got %+v", newSchemas)
+	}
+	if newSchemas[0][0].Contract != "Child_1" || newSchemas[0][0].Event != "Transfer" {
+		t.Fatalf("unexpected schema: %+v", newSchemas[0][0])
+	}
+
+	// The engine's own state now includes it.
+	if len(e.AllContracts()) != 1 {
+		t.Fatalf("expected Child_1 to be added to engine state, got %d contracts", len(e.AllContracts()))
+	}
+
+	// A second refresh with no new store entries reports nothing new.
+	newConfigs, newSchemas, err = e.RefreshDynamicContracts(ctx)
+	if err != nil {
+		t.Fatalf("second RefreshDynamicContracts: %v", err)
+	}
+	if len(newConfigs) != 0 || len(newSchemas) != 0 {
+		t.Fatalf("expected no newly-seen contracts on second refresh, got configs=%+v schemas=%+v", newConfigs, newSchemas)
+	}
+}
