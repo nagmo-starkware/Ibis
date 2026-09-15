@@ -137,6 +137,7 @@ ibis/
 │   │   ├── root.go                  # Cobra root command setup
 │   │   ├── init.go                  # `ibis init` -- scaffold config
 │   │   ├── run.go                   # `ibis run` -- start indexer
+│   │   ├── serve.go                 # `ibis serve` -- read-only REST API, no indexing
 │   │   ├── query.go                 # `ibis query` -- CLI queries
 │   │   └── prompt.go                # Interactive prompt helpers
 │   ├── config/                      # Configuration management

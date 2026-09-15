@@ -25,7 +25,7 @@ cmd/ibis/main.go          # CLI entry point (cobra root)
 internal/
   abi/                     # ABI parsing, event decoding, selector computation
   api/                     # HTTP server, REST handlers, SSE streaming, event bus
-  cli/                     # CLI commands: init, run, query
+  cli/                     # CLI commands: init, run, serve, query
   config/                  # YAML config loader, validation, ABI resolution
   engine/                  # Core indexing orchestrator, pending blocks, reorg handling
   provider/                # Starknet RPC/WS provider, event subscriber
