@@ -218,7 +218,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]any{
 		"current_block": globalCursor,
-		"contracts":     contracts,
+		// Alias of current_block. promote-ibis.sh's parity check reads this
+		// name; the field never existed, so every promote silently fell through
+		// to its "could not reach /v1/status" warning and proceeded unverified.
+		"indexed_block_number": globalCursor,
+		"ready":                s.ready.Load(),
+		"contracts":            contracts,
 	}
 
 	// Add factory summary: child count, synced count, backfilling count.

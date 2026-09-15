@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/b-j-roberts/ibis/internal/config"
@@ -28,7 +29,17 @@ type Server struct {
 	bus       *EventBus      // SSE event bus for real-time streaming
 	engine    *engine.Engine // Engine reference for dynamic contract management
 	mu        sync.RWMutex   // Protects schemas and contracts
+
+	// ready gates the data endpoints. Defaults true, so a server that never
+	// calls SetReady behaves as before. Callers that bind the listener before
+	// the engine has built its schemas set it false until setup finishes, so
+	// consumers get a loud 503 rather than a silently empty result.
+	ready atomic.Bool
 }
+
+// SetReady toggles whether the data endpoints serve. /v1/health and /v1/status
+// answer regardless, so a not-ready instance stays diagnosable.
+func (s *Server) SetReady(ready bool) { s.ready.Store(ready) }
 
 // ServerConfig holds the dependencies needed to create an API server.
 type ServerConfig struct {
@@ -54,7 +65,7 @@ func New(cfg *ServerConfig) *Server {
 		logger = slog.Default()
 	}
 
-	return &Server{
+	srv := &Server{
 		store:     cfg.Store,
 		schemas:   schemaMap,
 		cfg:       cfg.APIConfig,
@@ -63,13 +74,15 @@ func New(cfg *ServerConfig) *Server {
 		bus:       cfg.EventBus,
 		engine:    cfg.Engine,
 	}
+	srv.ready.Store(true)
+	return srv
 }
 
 // Handler returns the configured http.Handler (for testing with httptest).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
-	return s.corsMiddleware(s.loggingMiddleware(mux))
+	return s.corsMiddleware(s.loggingMiddleware(s.readyGate(mux)))
 }
 
 // Start begins serving HTTP requests. It blocks until the context is canceled.
@@ -101,6 +114,20 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// readyGate 503s the data endpoints until the server is marked ready. Health
+// and status are always allowed: promote-ibis.sh reads /v1/status to decide
+// whether a standby slot has caught up, and it can only tell "not ready yet"
+// from "unreachable" if the endpoint answers.
+func (s *Server) readyGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.ready.Load() && r.URL.Path != "/v1/health" && r.URL.Path != "/v1/status" {
+			writeError(w, http.StatusServiceUnavailable, "indexer is still starting up")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
