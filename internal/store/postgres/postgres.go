@@ -47,6 +47,25 @@ type PostgresStore struct {
 	// must still be closed explicitly -- database/sql never garbage-collects
 	// a *sql.DB's driver-level bookkeeping on its own.
 	atlasDB *sql.DB
+
+	// livePreloadOnce guards the single bulk information_schema query that
+	// seeds liveColumns (see preloadLiveColumns). It runs lazily on this
+	// store's first CreateTable call rather than eagerly in New/NewFromPool,
+	// so a store that never creates a table (or is only used for queries)
+	// never pays for it.
+	livePreloadOnce sync.Once
+
+	// liveColumns holds, for every table already on disk as of the one
+	// preload query, its live columns (name/type/nullable). CreateTable
+	// consults this before falling back to inspectLiveTable's per-table
+	// Atlas round trips: a cold boot that touches N distinct table names
+	// (e.g. ~549 on prod mainnet, reloaded from ~23.4k persisted dynamic
+	// children) now costs one query total instead of up to 6*N. Populated
+	// once and only read afterwards, so no separate mutex guards it --
+	// livePreloadOnce's Do provides the happens-before edge every reader
+	// needs. A nil map (preload never ran, or failed) is a valid "nothing
+	// known" state: every lookup degrades to a plain map miss.
+	liveColumns map[string][]types.Column
 }
 
 // newAtlasDriver wraps pool as a database/sql handle for atlas, which only
@@ -623,6 +642,19 @@ func (s *PostgresStore) GetAllCursors(ctx context.Context) (map[string]uint64, e
 }
 
 func (s *PostgresStore) CreateTable(ctx context.Context, sch *types.TableSchema) error {
+	_, err := s.CreateTableReport(ctx, sch)
+	return err
+}
+
+// CreateTableReport behaves exactly like CreateTable, but additionally
+// reports whether it actually touched the database -- ran CREATE/ALTER DDL,
+// or the slow reconcileSchema path ran even if it changed nothing -- versus
+// resolving purely from an in-process or preloaded cache hit. Engine.setup's
+// cold-boot loop uses this distinction to log real work at Info and no-op
+// repeats at Debug, since a single boot can call CreateTable ~130k times
+// (once per persisted dynamic child's schema) across only a few hundred
+// distinct tables.
+func (s *PostgresStore) CreateTableReport(ctx context.Context, sch *types.TableSchema) (changed bool, err error) {
 	// Shared/factory tables can get CreateTable called more than once for
 	// the same table name -- NOT via the auto-detected factory/discovery
 	// child-registration path (registerSharedChild/registerSharedDiscoveredChild
@@ -639,16 +671,90 @@ func (s *PostgresStore) CreateTable(ctx context.Context, sch *types.TableSchema)
 	// earlier child never saw, so a name-only cache hit isn't enough to skip
 	// reconciliation.
 	if known, exists := s.lookupSchema(sch.Name); exists && hasAllColumns(&known, sch) {
-		return nil
+		return false, nil
+	}
+
+	// This process hasn't seen sch.Name before (or saw it with fewer
+	// columns). Before paying for a per-table Atlas inspection, check the
+	// one-shot bulk preload of every live table's columns: on a cold boot
+	// this is almost always a hit, since ~all of the ~549 distinct tables
+	// were created by a previous run and already have every column any of
+	// today's dynamic children need (reconciliation only ever adds
+	// columns, never drops them).
+	s.preloadLiveColumns(ctx)
+	if live, ok := s.liveColumns[sch.Name]; ok && liveColumnsCoverSchema(live, sch) {
+		// Mirrors reconcileSchema's own ensureAggTable call so a table
+		// resolved via the preload fast path still gets its aggregation
+		// companion created on first touch. Cheap (one idempotent
+		// CREATE TABLE IF NOT EXISTS) relative to the 6-round-trip Atlas
+		// inspection this whole path exists to skip, and only paid once
+		// per aggregation table per process (subsequent calls hit the
+		// s.schemas cache above).
+		if err := s.ensureAggTable(ctx, sch); err != nil {
+			return false, err
+		}
+		s.mergeAndStoreSchema(*mergeLiveColumns(live, sch))
+		return false, nil
 	}
 
 	merged, err := s.reconcileSchema(ctx, sch)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	s.mergeAndStoreSchema(*merged)
-	return nil
+	return true, nil
+}
+
+// preloadLiveColumns runs the bulk information_schema query at most once per
+// store instance. Best-effort: a failure here (permissions, a transient
+// connection error) just leaves liveColumns nil, and every CreateTable call
+// falls back to the pre-existing per-table reconcileSchema path -- this
+// exists purely to shorten cold-boot latency, correctness never depends on
+// it succeeding.
+func (s *PostgresStore) preloadLiveColumns(ctx context.Context) {
+	s.livePreloadOnce.Do(func() {
+		cols, err := s.loadLiveColumns(ctx)
+		if err != nil {
+			return
+		}
+		s.liveColumns = cols
+	})
+}
+
+// loadLiveColumns queries information_schema.columns once for every column
+// of every table (and view-result table -- same relation kind to Postgres)
+// in the public schema, and groups the rows by table name. data_type is the
+// same raw string atlas's own inspection populates into schema.Column.Type.Raw
+// for non-domain types (ariga.io/atlas sql/postgres/inspect.go's columnsQuery
+// selects t1.data_type verbatim as Raw), so rawPostgresTypeToColumnType --
+// already used to translate that raw value in reconcile.go's mergeSchema --
+// applies unchanged here.
+func (s *PostgresStore) loadLiveColumns(ctx context.Context) (map[string][]types.Column, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT table_name, column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = $1
+		ORDER BY table_name, ordinal_position
+	`, atlasInspectSchema)
+	if err != nil {
+		return nil, fmt.Errorf("querying information_schema.columns: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string][]types.Column)
+	for rows.Next() {
+		var tableName, columnName, dataType, isNullable string
+		if err := rows.Scan(&tableName, &columnName, &dataType, &isNullable); err != nil {
+			return nil, fmt.Errorf("scanning information_schema row: %w", err)
+		}
+		result[tableName] = append(result[tableName], types.Column{
+			Name:     columnName,
+			Type:     rawPostgresTypeToColumnType(dataType),
+			Nullable: isNullable == "YES",
+		})
+	}
+	return result, rows.Err()
 }
 
 // isConcurrentCreateRace reports whether err is Postgres's own signature for
