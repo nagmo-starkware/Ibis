@@ -35,6 +35,81 @@ func hasAllColumns(known, incoming *types.TableSchema) bool {
 	return true
 }
 
+// liveColumnsCoverSchema reports whether live -- a table's columns as loaded
+// by the bulk information_schema preload -- already satisfies every column
+// incoming wants. Unlike hasAllColumns (which compares our internal Go-type
+// labels exactly, correct for two schemas that both went through this same
+// registration path), this compares by underlying Postgres storage type via
+// columnTypeToPostgres: information_schema only round-trips a raw SQL type
+// name (e.g. "bigint"), which rawPostgresTypeToColumnType collapses to a
+// single Go label ("int64") regardless of whether the schema that originally
+// created the column called it "int64" or "uint64" -- both already map to
+// the same BIGINT column via columnTypeToPostgres. Treating that as a
+// mismatch would make the preload fast path silently never fire for the
+// extremely common uint64 ABI fields (block_number, log_index, ...).
+//
+// Nullability must match isNotNullColumn's rule exactly, not merely be
+// "safely narrower" -- reconcileSchema's Atlas diff treats ANY live/desired
+// Null disagreement, in either direction, as an incompatible-schema error
+// (see reconcileSchema's toAdd loop: a ModifyColumn that isn't an AddColumn
+// or a Drop* is always refused, never silently accepted). A live table
+// whose nullability drifted from today's DDL-generation rule -- hand-edited,
+// seeded out of band, or built by an older code path -- must still go
+// through that same check via the slow path, not be waved through here.
+// TestCreateTableDoesNotSwallowRealUniqueViolation (postgres_test.go) is
+// exactly this: a "trader" unique-key table seeded via raw SQL without a
+// NOT NULL on block_number, which reconcileSchema must still refuse.
+func liveColumnsCoverSchema(live []types.Column, incoming *types.TableSchema) bool {
+	byName := make(map[string]types.Column, len(live))
+	for _, col := range live {
+		byName[col.Name] = col
+	}
+	for _, col := range incoming.Columns {
+		match, ok := byName[col.Name]
+		if !ok || columnTypeToPostgres(match.Type) != columnTypeToPostgres(col.Type) {
+			return false
+		}
+		// match.Nullable == isNotNullColumn(col) is the mismatch condition:
+		// isNotNullColumn(col) is the desired NOT-NULL-ness, so the desired
+		// Nullable is its negation, and match.Nullable must equal that
+		// negation to be covered.
+		if match.Nullable == isNotNullColumn(col) {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeLiveColumns combines sch's own declared columns with any extra
+// columns present on the live table but not described by sch, mirroring
+// mergeSchema's semantics so a preload-fast-path hit in CreateTableReport
+// caches a schema equivalent to what the slow reconcileSchema path would
+// have produced. sch's own columns keep their own declared Go-type label
+// (e.g. "uint64") rather than the coarser one loadLiveColumns inferred, for
+// the same reason mergeSchema below does: convertValue/convertScannedValue
+// key off of this cached type at query time, and only the declared type
+// round-trips through those correctly.
+func mergeLiveColumns(live []types.Column, sch *types.TableSchema) *types.TableSchema {
+	merged := *sch
+
+	seen := make(map[string]bool, len(sch.Columns))
+	for _, col := range sch.Columns {
+		seen[col.Name] = true
+	}
+
+	cols := make([]types.Column, len(sch.Columns))
+	copy(cols, sch.Columns)
+	for _, lc := range live {
+		if seen[lc.Name] {
+			continue
+		}
+		cols = append(cols, lc)
+	}
+
+	merged.Columns = cols
+	return &merged
+}
+
 // reconcileSchema brings the live table for sch up to date and returns the
 // schema to cache. Shared/factory tables are registered once per dynamic
 // child mapping to the same table, and those children's ABIs can differ --

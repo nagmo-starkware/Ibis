@@ -912,6 +912,29 @@ func (e *Engine) Run(ctx context.Context) error {
 	return err
 }
 
+// tableReporter is implemented by stores that can report whether a
+// CreateTable call actually touched the database -- ran DDL, or reconcile
+// added a column -- as opposed to resolving purely from a cache/preload
+// hit. Only PostgresStore implements it today; its cold boot reloads tens
+// of thousands of persisted dynamic children against a few hundred distinct
+// tables, so distinguishing real work from a no-op is what lets setup()
+// avoid drowning its log in repeats (see createTableReport's call sites).
+type tableReporter interface {
+	CreateTableReport(ctx context.Context, schema *types.TableSchema) (changed bool, err error)
+}
+
+// createTableReport calls store.CreateTable and additionally reports
+// whether the call actually touched the database. Stores that don't
+// implement tableReporter (memory, badger) report changed=true
+// unconditionally, preserving their existing always-Info logging -- they
+// have no cold-boot-scale call volume to worry about.
+func createTableReport(ctx context.Context, s store.Store, schema *types.TableSchema) (changed bool, err error) {
+	if r, ok := s.(tableReporter); ok {
+		return r.CreateTableReport(ctx, schema)
+	}
+	return true, s.CreateTable(ctx, schema)
+}
+
 // setup resolves ABIs, builds event registries and table schemas, and creates
 // tables in the store. Also loads persisted dynamic contracts.
 func (e *Engine) setup(ctx context.Context) error {
@@ -995,10 +1018,22 @@ func (e *Engine) setup(ctx context.Context) error {
 
 		// Create tables in store.
 		for _, schema := range schemas {
-			if err := e.store.CreateTable(ctx, schema); err != nil {
+			changed, err := createTableReport(ctx, e.store, schema)
+			if err != nil {
 				return fmt.Errorf("create table %s: %w", schema.Name, err)
 			}
-			e.logger.Info("created table",
+			// A cold boot reloads every persisted dynamic child and calls
+			// this once per schema -- tens of thousands of calls against a
+			// few hundred distinct tables. Only log at Info when this call
+			// actually touched the database (DDL ran, or reconcile added a
+			// column); a no-op cache/preload hit logs at Debug so a normal
+			// boot's log doesn't drown in ~130k identical "created table"
+			// lines for tables that already existed.
+			level, msg := slog.LevelDebug, "created table (no-op)"
+			if changed {
+				level, msg = slog.LevelInfo, "created table"
+			}
+			e.logger.Log(ctx, level, msg,
 				"name", schema.Name,
 				"type", schema.TableType,
 				"columns", len(schema.Columns),
@@ -1032,11 +1067,18 @@ func (e *Engine) setup(ctx context.Context) error {
 				break
 			}
 		}
-		// Create view table in store.
-		if err := e.store.CreateTable(ctx, vs); err != nil {
+		// Create view table in store. Same CreateTable path and the same
+		// cold-boot call volume as the event-table loop above, so apply the
+		// same Info-vs-Debug demotion on a no-op cache/preload hit.
+		changed, err := createTableReport(ctx, e.store, vs)
+		if err != nil {
 			return fmt.Errorf("create view table %s: %w", vs.Name, err)
 		}
-		e.logger.Info("created view table",
+		level, msg := slog.LevelDebug, "created view table (no-op)"
+		if changed {
+			level, msg = slog.LevelInfo, "created view table"
+		}
+		e.logger.Log(ctx, level, msg,
 			"name", vs.Name,
 			"type", vs.TableType,
 			"columns", len(vs.Columns),
