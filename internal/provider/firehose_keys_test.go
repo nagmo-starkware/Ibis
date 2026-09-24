@@ -1016,9 +1016,9 @@ func TestReadTipAndSeedWriterPendingIsBounded(t *testing.T) {
 	<-aInside
 	wg.Add(1)
 	go func() { defer wg.Done(); st.fillBehind(0) }()
-	time.Sleep(20 * time.Millisecond) // let fillBehind queue on the lock
+	waitWriterPending(t, st)
 	register(0xB2)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // B would have read by now if not blocked
 	if n := calls.Load(); n != 1 {
 		t.Fatalf("%d tip reads while A held the read lock and a writer waited; want 1", n)
 	}
@@ -1034,6 +1034,19 @@ func TestReadTipAndSeedWriterPendingIsBounded(t *testing.T) {
 	if got := st.cursor(newTestFelt(0xB2).String()); got != 1001 {
 		t.Errorf("queued registration's cursor = %d, want 1001", got)
 	}
+}
+
+// waitWriterPending returns once a writer is waiting on st.seedMu: with a
+// reader holding it, TryRLock fails only while a writer is queued.
+func waitWriterPending(t *testing.T, st *firehoseKeysStream) {
+	t.Helper()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		if !st.seedMu.TryRLock() {
+			return
+		}
+		st.seedMu.RUnlock()
+	}
+	t.Fatal("fillBehind never queued on seedMu")
 }
 
 // TestReadTipAndSeedKeysSubStartedConcurrently: the mid-read keys-sub start,
