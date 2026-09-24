@@ -759,7 +759,7 @@ func TestKeysStreamGapFillWaitsForInFlightSeed(t *testing.T) {
 	st.setFill(known.String(), ContractSubscription{Address: known})
 	st.setCursor(known.String(), 995, true)
 
-	st.seedMu.Lock() // a registration is between its tip read and its seed
+	st.seedMu.RLock() // a registration is between its tip read and its seed
 	type result struct {
 		resume uint64
 		err    error
@@ -771,14 +771,14 @@ func TestKeysStreamGapFillWaitsForInFlightSeed(t *testing.T) {
 	}()
 	select {
 	case r := <-done:
-		st.seedMu.Unlock()
+		st.seedMu.RUnlock()
 		t.Fatalf("resume %d decided while a seed was in flight", r.resume)
 	case <-time.After(100 * time.Millisecond):
 	}
 	late := newTestFelt(0x1A7E)
 	st.setFill(late.String(), ContractSubscription{Address: late})
 	st.setCursor(late.String(), 980, true)
-	st.seedMu.Unlock()
+	st.seedMu.RUnlock()
 
 	r := <-done
 	if r.err != nil {
@@ -818,6 +818,49 @@ func TestReadTipAndSeedHoldsSeedMu(t *testing.T) {
 	}
 	if got := st.cursor(addr.String()); got != 1001 {
 		t.Errorf("seeded cursor = %d, want 1001", got)
+	}
+}
+
+// TestReadTipAndSeedRegistrationsRunConcurrently: registrations share seedMu,
+// so one slow tip read does not queue every other registration behind it.
+func TestReadTipAndSeedRegistrationsRunConcurrently(t *testing.T) {
+	var inside, peak atomic.Int64
+	bothIn := make(chan struct{})
+	var once sync.Once
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			n := inside.Add(1)
+			defer inside.Add(-1)
+			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+			}
+			if n == 2 {
+				once.Do(func() { close(bothIn) })
+			}
+			select { // hold each read until both are inside at once
+			case <-bothIn:
+			case <-time.After(time.Second):
+			}
+			return uint64(1000), nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	sub.provider.tipIntervalNanos.Store(1) // every read goes to the RPC
+	sub.streamsMu.Lock()
+	sub.keysStream = newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	sub.streamsMu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, a := range []uint64{0xA1, 0xA2} {
+		wg.Add(1)
+		go func(a uint64) {
+			defer wg.Done()
+			_, _, _ = sub.readTipAndSeed(context.Background(), ContractSubscription{Address: newTestFelt(a)})
+		}(a)
+	}
+	wg.Wait()
+	if peak.Load() < 2 {
+		t.Fatal("the two registrations' tip reads never overlapped: they are serialized")
 	}
 }
 
