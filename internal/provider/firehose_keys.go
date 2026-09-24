@@ -361,9 +361,26 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 			return ctx.Err()
 		}
 
-		fromBlock := s.keysStreamGapFill(ctx, st)
+		fromBlock, err := s.keysStreamGapFill(ctx, st)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if err != nil {
+			// Subscribing anyway would resume from a block the node can no
+			// longer replay and write a permanent hole into the store. Back off
+			// and re-run the whole gap-fill instead. The stream stays
+			// not-live meanwhile, which /v1/catchup_status reports and a
+			// promote gate blocks on, rather than looking healthy while losing
+			// events.
+			s.logger.Error("firehose-keys gap-fill failed; not subscribing",
+				"stream", st.label, "error", err, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff = time.Duration(math.Min(float64(backoff)*2, float64(maxBackoff)))
+			continue
 		}
 
 		subInput := &rpc.EventSubscriptionInput{
@@ -413,21 +430,131 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 // keysStreamGapFill brings every contract in st's gap-fill set within
 // catchupThreshold of chain tip over HTTP, then returns the min cursor across
 // them to resume st's subscription from.
-func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) uint64 {
-	return s.keysStreamGapFillPass(ctx, st)
+//
+// The fan-out is REPEATED until the whole set sits within catchupThreshold of
+// the tip at the same time. One pass is not enough: the pass returns only when
+// its slowest contract finishes, and with thousands of fills sharing
+// maxConcurrentCatchup that wait can run for over an hour. Contracts that
+// finished early are stale by then, and the resume block handed to WSS is as
+// old as the slowest cursor -- far outside the node's replay window, so every
+// event in between is dropped silently and permanently. Repeating costs little:
+// each pass only covers the blocks produced during the previous one, so cursors
+// converge on the tip geometrically, and the resume lands inside the replay
+// window where the node can actually redeliver.
+// Returns an error rather than a usable resume block whenever it cannot get
+// the whole set to the tip. Every failure here would mean subscribing from a
+// block the node can no longer replay, i.e. writing a permanent hole into the
+// store -- so the caller must retry, never proceed.
+func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) (uint64, error) {
+	var prev uint64
+	var prevFills int
+	var regrowths int // consecutive passes excused from the guard by growth
+	for pass := 1; ; pass++ {
+		minLast, fills := s.keysStreamGapFillPass(ctx, st)
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+
+		// A tip we cannot read is not evidence of convergence. Treating it as
+		// such is how a resume block from an hour ago looks acceptable.
+		//
+		// Deliberately UNCACHED. This is the one read that decides whether it is
+		// safe to subscribe, and s.tipBlockNumber goes through CachedBlockNumber
+		// on this transport — which, when the RPC fails, returns the last cached
+		// tip with a nil error, however stale. A stale, low tip makes a lagging
+		// cursor look converged and hands WSS a resume block outside the replay
+		// window. One direct RPC per pass is negligible next to the pass itself.
+		tip, err := s.provider.BlockNumber(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("reading chain tip after gap-fill pass %d: %w", pass, err)
+		}
+
+		// Converged once the laggard is within the same threshold the pass
+		// itself stops at.
+		if minLast+catchupThreshold >= tip {
+			return minLast, nil
+		}
+
+		// No fixed pass cap: a pass only has to cover the blocks the previous
+		// one took, so the count needed is not knowable up front -- a first
+		// pass measured at 77 minutes in prod would blow any constant worth
+		// picking. Terminate on the property that actually matters instead:
+		// the GAP must shrink. A cursor that advances while the gap grows is
+		// catchup losing the race with the chain, and more passes cannot win
+		// it -- checking only that the cursor moved would spin forever there.
+		behind := tip - minLast
+		//
+		// ...but only when both passes covered the same set. addContractKeysFirehose
+		// registers children mid-flight, each seeded at its deploy block —
+		// potentially millions of blocks back. A pass that picks one up does more
+		// work, runs longer, and lets the early finishers go staler, so its gap
+		// can grow for an entirely healthy reason. Treating that as divergence
+		// would take down the keys-sub of an indexer that merely discovered a new
+		// option token. When the set grows, re-baseline instead of comparing.
+		if gapFillDiverging(pass, fills, prevFills, behind, prev) {
+			return 0, fmt.Errorf(
+				"gap-fill is not converging: %d blocks behind after pass %d (was %d, %d fills): "+
+					"catchup is not outrunning the chain", behind, pass, prev, fills)
+		}
+		// Growth is excused, but not silently. get_or_deploy is permissionless by
+		// design, so anyone can grow the set, and set growth that outpaces the
+		// passes keeps this loop re-baselining forever: the stream never goes
+		// live, catchup_complete stays false, and a promote gate blocks. That is
+		// the safe failure — nothing is reported current that is not — but it
+		// must be distinguishable from ordinary catch-up, hence a WARN with a
+		// consecutive count an operator can alert on.
+		if gapFillRegrew(pass, fills, prevFills, behind, prev) {
+			regrowths++
+			s.logger.Warn("firehose-keys gap-fill set grew mid-pass; re-baselining instead of failing",
+				"stream", st.label, "pass", pass, "fills", fills, "prev_fills", prevFills,
+				"behind", behind, "prev_behind", prev, "consecutive_regrowths", regrowths)
+		} else {
+			regrowths = 0
+		}
+		prev, prevFills = behind, fills
+
+		s.logger.Info("firehose-keys gap-fill still behind tip; repeating",
+			"stream", st.label, "pass", pass, "resume_block", minLast,
+			"tip", tip, "behind", tip-minLast)
+	}
 }
 
-// keysStreamGapFillPass runs one gap-fill fan-out over st's current fill set
-// and returns the min cursor across them. Mirrors firehoseGapFill, scoped to
-// one stream's own fills and own cursors.
-func (s *EventSubscriber) keysStreamGapFillPass(ctx context.Context, st *firehoseKeysStream) uint64 {
+// gapFillDiverging reports whether a COMPLETED gap-fill pass shows catchup
+// losing to the chain: the gap failed to shrink across two passes over a set
+// that did not grow. A set that shrank (a contract removed) does less work, so a
+// non-shrinking gap there is divergence too.
+//
+// Kept as a pure function so the comparison is table-tested directly. An
+// end-to-end test cannot reach this reliably: when catchup genuinely loses, it
+// loses INSIDE a pass (pollUntilCaughtUp is unbounded), so this guard only ever
+// sees the narrower finished-but-regressed case.
+func gapFillDiverging(pass, fills, prevFills int, behind, prevBehind uint64) bool {
+	return pass > 1 && fills <= prevFills && behind >= prevBehind
+}
+
+// gapFillRegrew reports the case gapFillDiverging deliberately excuses: the gap
+// did not shrink, but the set grew, which explains the extra work. The loop
+// re-baselines instead of failing, and logs it.
+func gapFillRegrew(pass, fills, prevFills int, behind, prevBehind uint64) bool {
+	return pass > 1 && fills > prevFills && behind >= prevBehind
+}
+
+// keysStreamGapFillPass runs one gap-fill fan-out over st's current fill set and
+// returns the min cursor across them, plus the size of the set it fanned out
+// over. Mirrors firehoseGapFill, scoped to one stream's own fills and own
+// cursors.
+//
+// The count is returned rather than re-read by the caller because the set is
+// mutable — addContractKeysFirehose registers children mid-flight — so a
+// separate snapshot could disagree with the one this pass actually used.
+func (s *EventSubscriber) keysStreamGapFillPass(ctx context.Context, st *firehoseKeysStream) (uint64, int) {
 	fills := st.snapshotFills()
 	if len(fills) == 0 {
 		bn, err := s.tipBlockNumber(ctx)
 		if err != nil {
-			return 0
+			return 0, 0
 		}
-		return bn
+		return bn, 0
 	}
 
 	var wg sync.WaitGroup
@@ -456,11 +583,11 @@ func (s *EventSubscriber) keysStreamGapFillPass(ctx context.Context, st *firehos
 	if minLast == math.MaxUint64 {
 		bn, err := s.tipBlockNumber(ctx)
 		if err != nil {
-			return 0
+			return 0, len(fills)
 		}
-		return bn
+		return bn, len(fills)
 	}
-	return minLast
+	return minLast, len(fills)
 }
 
 // processKeysStream reads one stream's session until it errors or ctx is

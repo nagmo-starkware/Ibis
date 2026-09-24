@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -400,5 +401,246 @@ func TestKeysFirehoseStartEndToEnd(t *testing.T) {
 	case e := <-events:
 		t.Errorf("unexpected extra event from %s @ block %d", e.ContractAddress, e.BlockNumber)
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestKeysStreamGapFillConvergesOnTip: a gap-fill pass returns only when its
+// SLOWEST fill finishes, and with a large fill set that wait outlasts the
+// node's WSS replay window. Fills that finished early are stale by then, so
+// resuming from the min cursor asks the node to replay blocks it no longer
+// offers -- every event in between is dropped silently and permanently. The
+// fan-out must repeat until the whole set is within catchupThreshold of the
+// CURRENT tip.
+func TestKeysStreamGapFillConvergesOnTip(t *testing.T) {
+	var tip atomic.Uint64
+	tip.Store(1000)
+	var getEventsCalls atomic.Int64
+
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return tip.Load(), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			// The chain advances while the slow fill grinds through its backlog,
+			// then settles so catchup can converge. The first call is exempt so
+			// the fast fill deterministically observes the starting tip and
+			// finishes before the chain moves.
+			if n := getEventsCalls.Add(1); n >= 2 && n <= 13 {
+				tip.Add(50)
+			}
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	// KeysFirehose implies sharedTipPoller, whose cache would mask the chain
+	// moving for 4x the tip interval. Expire it so every read is fresh.
+	sub.provider.tipIntervalNanos.Store(1)
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+
+	// fast: already within catchupThreshold of the tip, so it finishes at once
+	// and then sits idle inside the barrier while the chain moves out from under
+	// its cursor.
+	fast := newTestFelt(0xFA51)
+	st.setFill(fast.String(), ContractSubscription{Address: fast})
+	st.setCursor(fast.String(), 950, true)
+
+	// slow: a deep backlog, so it is what holds the barrier open.
+	slow := newTestFelt(0x5104)
+	st.setFill(slow.String(), ContractSubscription{Address: slow})
+	st.setCursor(slow.String(), 0, true)
+
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("keysStreamGapFill returned an error on a converging chain: %v", err)
+	}
+
+	final := tip.Load()
+	if resume+catchupThreshold < final {
+		t.Fatalf("resume block %d is %d behind tip %d; want within %d "+
+			"(a resume this old falls outside the WSS replay window and loses events)",
+			resume, final-resume, final, catchupThreshold)
+	}
+}
+
+// TestKeysStreamGapFillNeverReturnsAStaleResume: on any failure the caller must
+// get an error and a zero block, never a usable-looking resume. Handing back
+// the block reached so far is what the old code did on an unreadable tip, and
+// resuming from it subscribes past the node's replay window -- a permanent hole
+// in the store, written silently.
+func TestKeysStreamGapFillNeverReturnsAStaleResume(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return uint64(500_000), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	addr := newTestFelt(0xBEEF)
+	st.setFill(addr.String(), ContractSubscription{Address: addr})
+	st.setCursor(addr.String(), 1, true) // a long way behind: the pass will be mid-flight
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var resume uint64
+	var err error
+	go func() {
+		defer close(done)
+		resume, err = sub.keysStreamGapFill(ctx, st)
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("keysStreamGapFill did not return after cancellation")
+	}
+
+	if err == nil {
+		t.Fatalf("expected an error after cancellation, got resume=%d and nil", resume)
+	}
+	if resume != 0 {
+		t.Errorf("resume = %d on failure; must be 0 so no caller can subscribe with it", resume)
+	}
+}
+
+// TestKeysStreamGapFillToleratesFillSetGrowth: addContractKeysFirehose registers
+// children mid-flight, each seeded at its deploy block. A pass that picks one up
+// does more work, runs longer, and leaves the early finishers staler — so its
+// gap GROWS for an entirely healthy reason. The divergence guard must not read
+// that as "catchup is losing to the chain", or an indexer that merely discovered
+// a new option token would tear down its own keys-sub.
+func TestKeysStreamGapFillToleratesFillSetGrowth(t *testing.T) {
+	var tip atomic.Uint64
+	tip.Store(1000)
+	var calls atomic.Int64
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	late := newTestFelt(0x1A7E)
+
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return tip.Load(), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			n := calls.Add(1)
+			// A child is discovered while pass 1 is running. Pass 1 already took
+			// its snapshot, so the child first appears in pass 2 — at block 0.
+			if n == 3 {
+				st.setFill(late.String(), ContractSubscription{Address: late})
+				st.setCursor(late.String(), 0, true)
+			}
+			// The chain moves through passes 1 and 2, then settles so pass 3 can
+			// converge. The first call is exempt so the fast fill sees the start.
+			if n >= 2 && n <= 80 {
+				tip.Add(50)
+			}
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	sub.provider.tipIntervalNanos.Store(1) // serve every tip read fresh
+
+	fast := newTestFelt(0xFA51)
+	st.setFill(fast.String(), ContractSubscription{Address: fast})
+	st.setCursor(fast.String(), 950, true)
+	slow := newTestFelt(0x5104)
+	st.setFill(slow.String(), ContractSubscription{Address: slow})
+	st.setCursor(slow.String(), 0, true)
+
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("gap-fill failed after a child joined mid-flight — the set grew, so the "+
+			"larger gap is expected and must not count as divergence: %v", err)
+	}
+	if final := tip.Load(); resume+catchupThreshold < final {
+		t.Fatalf("resume block %d is %d behind tip %d; want within %d",
+			resume, final-resume, final, catchupThreshold)
+	}
+}
+
+// TestGapFillGuardDecisions pins the two comparisons that decide whether a
+// finished gap-fill pass is diverging (fail), regrew (excuse and log), or is
+// merely still catching up (repeat). A flipped comparison here would either let
+// a stream spin forever or take down a healthy one, and no end-to-end test can
+// catch it: when catchup genuinely loses to the chain it loses INSIDE a pass, so
+// this guard only ever sees the finished-but-regressed case.
+func TestGapFillGuardDecisions(t *testing.T) {
+	cases := []struct {
+		name              string
+		pass              int
+		fills, prevFills  int
+		behind, prevBehnd uint64
+		wantDiverging     bool
+		wantRegrew        bool
+	}{
+		{"first pass never diverges", 1, 5, 0, 10_000, 0, false, false},
+		{"stable set, gap shrank: catching up", 2, 5, 5, 400, 900, false, false},
+		{"stable set, gap grew: diverging", 2, 5, 5, 3000, 900, true, false},
+		{"stable set, gap equal: diverging (no progress)", 2, 5, 5, 900, 900, true, false},
+		{"set grew, gap grew: excused, logged", 2, 6, 5, 3000, 900, false, true},
+		{"set grew, gap shrank: plain catch-up", 2, 6, 5, 400, 900, false, false},
+		{"set shrank, gap grew: diverging (less work, still losing)", 3, 4, 5, 3000, 900, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := gapFillDiverging(c.pass, c.fills, c.prevFills, c.behind, c.prevBehnd); got != c.wantDiverging {
+				t.Errorf("gapFillDiverging = %v, want %v", got, c.wantDiverging)
+			}
+			if got := gapFillRegrew(c.pass, c.fills, c.prevFills, c.behind, c.prevBehnd); got != c.wantRegrew {
+				t.Errorf("gapFillRegrew = %v, want %v", got, c.wantRegrew)
+			}
+		})
+	}
+}
+
+// TestKeysStreamGapFillErrorsOnUnreadableTip: the convergence check is the one
+// read that decides it is safe to subscribe. If the tip cannot be read it must
+// fail — not fall back to a cached tip, which CachedBlockNumber hands back with
+// a nil error however stale it is, and a stale low tip makes a lagging cursor
+// look converged.
+func TestKeysStreamGapFillErrorsOnUnreadableTip(t *testing.T) {
+	var blockNumberCalls atomic.Int64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			// First read (inside the pass, via the cache) succeeds and primes it.
+			// Every later read — including the convergence check — fails.
+			if blockNumberCalls.Add(1) == 1 {
+				return uint64(1000), nil
+			}
+			return nil, errors.New("rpc unavailable")
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	addr := newTestFelt(0xBEEF)
+	st.setFill(addr.String(), ContractSubscription{Address: addr})
+	st.setCursor(addr.String(), 980, true) // within catchupThreshold of 1000
+
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err == nil {
+		t.Fatalf("expected an error when the tip cannot be read, got resume=%d — "+
+			"a cached tip must not stand in for the convergence check", resume)
+	}
+	if !strings.Contains(err.Error(), "reading chain tip") {
+		t.Errorf("error = %q; want the tip-read error", err)
+	}
+	if resume != 0 {
+		t.Errorf("resume = %d on failure; must be 0", resume)
 	}
 }
