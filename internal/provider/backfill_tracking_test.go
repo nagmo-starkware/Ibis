@@ -310,3 +310,80 @@ func TestAddContractKeysFirehoseLaggingTipSeedsAtResumeFloor(t *testing.T) {
 		t.Errorf("backfill reached block %d, want 999: blocks up to the floor must be covered", got)
 	}
 }
+
+// floorFixture is a keys-firehose subscriber whose keys-sub has resumed from
+// 1000, with getEvents recording the highest to_block a backfill asks for.
+func floorFixture(t *testing.T, blockNumber func() (interface{}, error)) (*EventSubscriber, *firehoseKeysStream, *atomic.Uint64, func()) {
+	t.Helper()
+	var maxTo atomic.Uint64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return blockNumber() },
+		"starknet_getEvents": func(params json.RawMessage) (interface{}, error) {
+			var p []struct {
+				ToBlock struct {
+					BlockNumber uint64 `json:"block_number"`
+				} `json:"to_block"`
+			}
+			if json.Unmarshal(params, &p) == nil && len(p) == 1 && p[0].ToBlock.BlockNumber > maxTo.Load() {
+				maxTo.Store(p[0].ToBlock.BlockNumber)
+			}
+			return chunkEvent(params), nil
+		},
+		"starknet_getBlockWithTxHashes": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"timestamp": 1, "block_number": 1, "block_hash": "0x1"}, nil
+		},
+	}
+	server := mockRPCServer(t, handlers)
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		server.Close()
+		t.Fatalf("New() error: %v", err)
+	}
+	sub := p.NewSubscriber(nil, make(chan RawEvent, 256), &SubscriberConfig{
+		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)},
+	})
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{sub.optionSelectors})
+	st.fillBehind(1000) // the keys-sub resumed from 1000
+	sub.streamsMu.Lock()
+	sub.keysStream = st
+	sub.streamsMu.Unlock()
+	return sub, st, &maxTo, func() { p.Close(); server.Close() }
+}
+
+// TestResumeFloorFollowsRollback: after a reorg rolls the keys-sub back, a new
+// contract is seeded from the post-reorg tip, not the pre-reorg floor.
+func TestResumeFloorFollowsRollback(t *testing.T) {
+	sub, st, maxTo, cleanup := floorFixture(t, func() (interface{}, error) { return uint64(820), nil })
+	defer cleanup()
+	sub.rollbackAllStreams(800)
+
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 700, Wildcard: true})
+	waitPending(t, sub, 0, 3*time.Second)
+
+	if got := st.cursor(addr.String()); got != 821 {
+		t.Errorf("cursor = %d, want 821 (post-reorg tip 820), not the stale floor 1000", got)
+	}
+	if got := maxTo.Load(); got != 820 {
+		t.Errorf("backfill reached %d, want 820", got)
+	}
+}
+
+// TestResumeFloorAppliesWithoutTip: with the tip unreadable, a contract whose
+// StartBlock is below the floor is still seeded at the floor and backfilled up
+// to it — WSS already resumed past StartBlock.
+func TestResumeFloorAppliesWithoutTip(t *testing.T) {
+	sub, st, maxTo, cleanup := floorFixture(t, func() (interface{}, error) { return nil, errors.New("rpc unavailable") })
+	defer cleanup()
+
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 900, Wildcard: true})
+	waitPending(t, sub, 0, 3*time.Second)
+
+	if got := st.cursor(addr.String()); got != 1000 {
+		t.Errorf("cursor = %d, want the resume floor 1000", got)
+	}
+	if got := maxTo.Load(); got != 999 {
+		t.Errorf("backfill reached %d, want 999", got)
+	}
+}

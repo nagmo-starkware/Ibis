@@ -126,8 +126,16 @@ func (st *firehoseKeysStream) cursor(addrHex string) uint64 {
 }
 
 // rollback moves every cursor on this stream that is at or past startBlock
-// back to startBlock, for reorg recovery.
+// back to startBlock, for reorg recovery -- and the resume floor with them, or
+// a contract registered after the reorg would be seeded past blocks the
+// session is about to redeliver.
 func (st *firehoseKeysStream) rollback(startBlock uint64) {
+	st.seedMu.Lock() // before mu, as in fillBehind
+	if st.resumeFloor > startBlock {
+		st.resumeFloor = startBlock
+	}
+	st.seedMu.Unlock()
+
 	st.mu.Lock()
 	for addr, c := range st.cursors {
 		if c > startBlock {
@@ -796,17 +804,9 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 	s.reserveBackfill()
 	s.trackContract(sub)
 
-	_, wssFrom, err := s.readTipAndSeed(ctx, sub)
-	if err != nil {
-		// No tip available: forward from StartBlock and skip backfill; the
-		// next gap-fill cycle (on stream reconnect) will reconcile.
-		if sub.ERC20 {
-			st := s.newChildTransferStream(ctx, sub, wssFrom)
-			s.startKeysStream(st.runCtx, st, nil)
-		}
-		s.releaseBackfill() // seeded at StartBlock: gap-fill covers the history
-		return
-	}
+	// With no tip, wssFrom is StartBlock (the next gap-fill covers the history)
+	// or the resume floor (the backfill below covers up to it).
+	_, wssFrom, _ := s.readTipAndSeed(ctx, sub)
 
 	if sub.ERC20 {
 		st := s.newChildTransferStream(ctx, sub, wssFrom)
@@ -820,7 +820,7 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 		s.launchReservedBackfill(ctx, backfillSub, sub.StartBlock, wssFrom-1)
 		return
 	}
-	s.releaseBackfill() // starts after the tip: nothing historical to fetch
+	s.releaseBackfill() // nothing below wssFrom to fetch
 }
 
 // readTipAndSeed reads the tip and seeds sub's keys-sub fill to forward from
@@ -846,8 +846,9 @@ func (s *EventSubscriber) readTipAndSeed(ctx context.Context, sub ContractSubscr
 			wssFrom = tip + 1
 		}
 		// A lagging replica's tip can sit below the block the keys-sub already
-		// resumed from, and it would never deliver the blocks in between.
-		if err == nil && keysStream != nil && keysStream.resumeFloor > wssFrom {
+		// resumed from, and it would never deliver the blocks in between. With
+		// no tip at all the same holds for StartBlock.
+		if keysStream != nil && keysStream.resumeFloor > wssFrom {
 			wssFrom = keysStream.resumeFloor
 		}
 		if keysStream != nil {
