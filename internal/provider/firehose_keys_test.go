@@ -904,11 +904,13 @@ func TestKeysStreamGapFillLogsRepeatedLateJoins(t *testing.T) {
 	var calls atomic.Int64
 	handlers := map[string]func(json.RawMessage) (interface{}, error){
 		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
-			// The first three passes each gain a contract seeded below the tip.
+			// The cache serves the pass's own reads after the first, so from call
+			// 2 on these are the per-pass convergence reads. Each of the first
+			// three calls adds a contract seeded lower than the one before.
 			if n := calls.Add(1); n <= 3 {
 				late := newTestFelt(0x1A70 + uint64(n))
 				st.setFill(late.String(), ContractSubscription{Address: late})
-				st.setCursor(late.String(), 980, true)
+				st.setCursor(late.String(), 980-10*uint64(n), true)
 			}
 			return uint64(1000), nil
 		},
@@ -927,8 +929,6 @@ func TestKeysStreamGapFillLogsRepeatedLateJoins(t *testing.T) {
 	sub := p.NewSubscriber(nil, make(chan RawEvent, 8), &SubscriberConfig{
 		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)},
 	})
-	sub.provider.tipIntervalNanos.Store(1) // every tip read reaches the handler
-
 	known := newTestFelt(0xFA51)
 	st.setFill(known.String(), ContractSubscription{Address: known})
 	st.setCursor(known.String(), 995, true)
@@ -937,11 +937,16 @@ func TestKeysStreamGapFillLogsRepeatedLateJoins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gap-fill errored: %v", err)
 	}
-	if resume > 980 {
-		t.Errorf("resume = %d, past the late contracts' cursor 980", resume)
+	if resume > 950 {
+		t.Errorf("resume = %d, past the lowest late contract's cursor 950", resume)
 	}
 	if !strings.Contains(logs.String(), "a contract joined mid-pass") {
 		t.Error("repeating for a late contract logged nothing")
+	}
+	for _, want := range []string{"consecutive_late_joins=1", "consecutive_late_joins=2"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("no %q: the repeat counter is not counting consecutive repeats", want)
+		}
 	}
 }
 
@@ -1071,6 +1076,44 @@ func TestReadTipAndSeedKeysSubStartedConcurrently(t *testing.T) {
 	}
 	if got := st.cursor(addr.String()); got != 1001 {
 		t.Fatalf("keys-sub cursor = %d, want 1001", got)
+	}
+}
+
+// TestAddContractKeysFirehoseNoTipSeedsERC20Child: the no-tip path also starts
+// an ERC20 child's own Transfer/Approval stream from StartBlock.
+func TestAddContractKeysFirehoseNoTipSeedsERC20Child(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return nil, errors.New("rpc unavailable")
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{sub.optionSelectors})
+	sub.streamsMu.Lock()
+	sub.keysStream = st
+	sub.streamsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 500, Wildcard: true, ERC20: true})
+
+	sub.streamsMu.Lock()
+	child := sub.addrStreams[addr.String()]
+	sub.streamsMu.Unlock()
+	if child == nil {
+		t.Fatal("no child Transfer/Approval stream was started")
+	}
+	if got := child.cursor(addr.String()); got != 500 {
+		t.Errorf("child cursor = %d, want StartBlock 500", got)
+	}
+	if got := st.cursor(addr.String()); got != 500 {
+		t.Errorf("keys-sub cursor = %d, want StartBlock 500", got)
+	}
+	if got := sub.BackfillsPending(); got != 0 {
+		t.Errorf("BackfillsPending = %d, want 0", got)
 	}
 }
 
