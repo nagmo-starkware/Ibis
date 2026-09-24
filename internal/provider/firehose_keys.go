@@ -213,8 +213,8 @@ func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
 	keysStream := s.keysStream
 	s.streamsMu.Unlock()
 	// Counted now, although it is launched only after the per-contract loop
-	// below — see reserveKeysStream for why that ordering matters.
-	s.reserveKeysStream()
+	// below — see reserveStream for why that ordering matters.
+	s.reserveStream()
 
 	var wg sync.WaitGroup
 	optionFamilyCount, tokenStreamCount, childStreamCount := 0, 0, 0
@@ -341,7 +341,7 @@ func (s *EventSubscriber) rollbackAllStreams(startBlock uint64) {
 	}
 }
 
-// reserveKeysStream counts a stream in streamsTotal BEFORE it is launched. Pair
+// reserveStream counts a stream in streamsTotal BEFORE it is launched. Pair
 // every call with exactly one launchReservedKeysStream.
 //
 // Counting must precede launching. Counting inside the goroutine left a window
@@ -352,8 +352,14 @@ func (s *EventSubscriber) rollbackAllStreams(startBlock uint64) {
 // contract loop (thousands of contracts in prod), so it is reserved as soon as
 // it is created, before any other stream exists. It also keeps total >= live as
 // an invariant: a stream is always counted before it can go live.
-func (s *EventSubscriber) reserveKeysStream() {
+func (s *EventSubscriber) reserveStream() {
 	s.streamsTotal.Add(1)
+}
+
+// releaseStream gives back a reservation taken by reserveStream, once the
+// stream it counted has stopped for good.
+func (s *EventSubscriber) releaseStream() {
+	s.streamsTotal.Add(-1)
 }
 
 // launchReservedKeysStream runs st's lifecycle in a goroutine and releases its
@@ -364,7 +370,7 @@ func (s *EventSubscriber) launchReservedKeysStream(ctx context.Context, st *fire
 		wg.Add(1)
 	}
 	go func() {
-		defer s.streamsTotal.Add(-1)
+		defer s.releaseStream()
 		if wg != nil {
 			defer wg.Done()
 		}
@@ -375,7 +381,7 @@ func (s *EventSubscriber) launchReservedKeysStream(ctx context.Context, st *fire
 // startKeysStream reserves and launches in one step, for streams that are
 // launched as soon as they are created.
 func (s *EventSubscriber) startKeysStream(ctx context.Context, st *firehoseKeysStream, wg *sync.WaitGroup) {
-	s.reserveKeysStream()
+	s.reserveStream()
 	s.launchReservedKeysStream(ctx, st, wg)
 }
 
