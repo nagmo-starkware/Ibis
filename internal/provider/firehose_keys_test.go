@@ -402,3 +402,61 @@ func TestKeysFirehoseStartEndToEnd(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 }
+
+// TestKeysStreamGapFillConvergesOnTip: a gap-fill pass returns only when its
+// SLOWEST fill finishes, and with a large fill set that wait outlasts the
+// node's WSS replay window. Fills that finished early are stale by then, so
+// resuming from the min cursor asks the node to replay blocks it no longer
+// offers -- every event in between is dropped silently and permanently. The
+// fan-out must repeat until the whole set is within catchupThreshold of the
+// CURRENT tip.
+func TestKeysStreamGapFillConvergesOnTip(t *testing.T) {
+	var tip atomic.Uint64
+	tip.Store(1000)
+	var getEventsCalls atomic.Int64
+
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return tip.Load(), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			// The chain advances while the slow fill grinds through its backlog,
+			// then settles so catchup can converge. The first call is exempt so
+			// the fast fill deterministically observes the starting tip and
+			// finishes before the chain moves.
+			if n := getEventsCalls.Add(1); n >= 2 && n <= 13 {
+				tip.Add(50)
+			}
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	// KeysFirehose implies sharedTipPoller, whose cache would mask the chain
+	// moving for 4x the tip interval. Expire it so every read is fresh.
+	sub.provider.tipIntervalNanos.Store(1)
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+
+	// fast: already within catchupThreshold of the tip, so it finishes at once
+	// and then sits idle inside the barrier while the chain moves out from under
+	// its cursor.
+	fast := newTestFelt(0xFA51)
+	st.setFill(fast.String(), ContractSubscription{Address: fast})
+	st.setCursor(fast.String(), 950, true)
+
+	// slow: a deep backlog, so it is what holds the barrier open.
+	slow := newTestFelt(0x5104)
+	st.setFill(slow.String(), ContractSubscription{Address: slow})
+	st.setCursor(slow.String(), 0, true)
+
+	resume := sub.keysStreamGapFill(context.Background(), st)
+
+	final := tip.Load()
+	if resume+catchupThreshold < final {
+		t.Fatalf("resume block %d is %d behind tip %d; want within %d "+
+			"(a resume this old falls outside the WSS replay window and loses events)",
+			resume, final-resume, final, catchupThreshold)
+	}
+}

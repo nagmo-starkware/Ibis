@@ -51,6 +51,13 @@ const (
 	// Blocks behind chain tip that triggers fast catchup polling.
 	catchupThreshold uint64 = 50
 
+	// maxGapFillPasses bounds how many times a firehose-keys stream repeats its
+	// gap-fill fan-out before giving up on converging. See keysStreamGapFill:
+	// each pass only has to cover the blocks produced during the previous one,
+	// so convergence is geometric and a handful of passes is generous. The bound
+	// exists so a chain moving faster than catchup can never spin forever.
+	maxGapFillPasses = 8
+
 	// Default number of blocks per polling query.
 	defaultBlocksPerQuery uint64 = 100
 

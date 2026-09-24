@@ -413,13 +413,50 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 // keysStreamGapFill brings every contract in st's gap-fill set within
 // catchupThreshold of chain tip over HTTP, then returns the min cursor across
 // them to resume st's subscription from.
+//
+// The fan-out is REPEATED until the whole set sits within catchupThreshold of
+// the tip at the same time. One pass is not enough: the pass returns only when
+// its slowest contract finishes, and with thousands of fills sharing
+// maxConcurrentCatchup that wait can run for over an hour. Contracts that
+// finished early are stale by then, and the resume block handed to WSS is as
+// old as the slowest cursor -- far outside the node's replay window, so every
+// event in between is dropped silently and permanently. Repeating costs little:
+// each pass only covers the blocks produced during the previous one, so cursors
+// converge on the tip geometrically, and the resume lands inside the replay
+// window where the node can actually redeliver.
 func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) uint64 {
-	return s.keysStreamGapFillPass(ctx, st)
+	var minLast uint64
+	for pass := 1; ; pass++ {
+		minLast = s.keysStreamGapFillPass(ctx, st)
+		if ctx.Err() != nil {
+			return minLast
+		}
+
+		// Converged once the laggard is within the same threshold the pass
+		// itself stops at. A tip we cannot read is not a reason to re-run.
+		tip, err := s.tipBlockNumber(ctx)
+		if err != nil || minLast+catchupThreshold >= tip {
+			return minLast
+		}
+
+		if pass >= maxGapFillPasses {
+			// Loud: resuming here means a known, unrecoverable hole rather than
+			// the silent one this loop exists to prevent.
+			s.logger.Error("firehose-keys gap-fill did not converge; resuming with a known gap",
+				"stream", st.label, "passes", pass, "resume_block", minLast,
+				"tip", tip, "behind", tip-minLast)
+			return minLast
+		}
+
+		s.logger.Info("firehose-keys gap-fill still behind tip; repeating",
+			"stream", st.label, "pass", pass, "resume_block", minLast,
+			"tip", tip, "behind", tip-minLast)
+	}
 }
 
-// keysStreamGapFillPass runs one gap-fill fan-out over st's current fill set
-// and returns the min cursor across them. Mirrors firehoseGapFill, scoped to
-// one stream's own fills and own cursors.
+// keysStreamGapFillPass runs one gap-fill fan-out over st's current fill set and
+// returns the min cursor across them. Mirrors firehoseGapFill, scoped to one
+// stream's own fills and own cursors.
 func (s *EventSubscriber) keysStreamGapFillPass(ctx context.Context, st *firehoseKeysStream) uint64 {
 	fills := st.snapshotFills()
 	if len(fills) == 0 {
