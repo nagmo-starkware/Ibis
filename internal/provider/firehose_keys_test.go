@@ -699,3 +699,211 @@ func TestTransportStatusTracksStreamLiveness(t *testing.T) {
 		}
 	}
 }
+
+// newLivenessSub builds the two-stream setup used by the counter tests: one
+// option-family contract (keys-sub only) and one static token (its own
+// address-sub), with the tip within catchupThreshold so gap-fill is immediate.
+func newLivenessSub(t *testing.T, blockNumber func() (interface{}, error)) (*EventSubscriber, func()) {
+	t.Helper()
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return blockNumber() },
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	server := mockRPCServer(t, handlers)
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		server.Close()
+		t.Fatalf("New() error: %v", err)
+	}
+	sub := p.NewSubscriber(
+		[]ContractSubscription{
+			{Address: newTestFelt(0xA), StartBlock: 100, Wildcard: true},
+			{Address: newTestFelt(0xB), StartBlock: 100, Wildcard: false},
+		},
+		make(chan RawEvent, 64),
+		&SubscriberConfig{KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}},
+	)
+	return sub, func() { p.Close(); server.Close() }
+}
+
+// TestTransportStatusNeverCompleteBeforeAllStreamsCounted: a stream must be
+// counted before it can go live. When the count was taken inside each
+// goroutine, the keys-sub — launched only after the per-contract loop — could
+// be uncounted while token streams were already live, reading as
+// live == total > 0 with the most important stream missing.
+func TestTransportStatusNeverCompleteBeforeAllStreamsCounted(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return uint64(120), nil },
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	server := mockRPCServer(t, handlers)
+	defer server.Close()
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer p.Close()
+
+	// Token stream FIRST, then a wide set of option-family contracts — the shape
+	// of prod, where the per-contract loop covers thousands of contracts and the
+	// keys-sub is launched only after it. That loop is the window: the token
+	// stream can go live long before the keys-sub would have counted itself.
+	contracts := []ContractSubscription{{Address: newTestFelt(0xB), StartBlock: 100, Wildcard: false}}
+	for i := uint64(0); i < 5000; i++ {
+		contracts = append(contracts, ContractSubscription{Address: newTestFelt(0x100000 + i), StartBlock: 100, Wildcard: true})
+	}
+	sub := p.NewSubscriber(contracts, make(chan RawEvent, 64),
+		&SubscriberConfig{KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}})
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go sub.Start(ctx)
+
+	const want = 2
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		live, total, complete := sub.TransportStatus()
+		if live > total {
+			t.Fatalf("live=%d > total=%d: a stream went live before it was counted", live, total)
+		}
+		if complete && total != want {
+			t.Fatalf("catchup_complete with total=%d, want %d: reported complete while a stream was still uncounted", total, want)
+		}
+		if complete {
+			return
+		}
+		time.Sleep(50 * time.Microsecond)
+	}
+	t.Fatal("streams never went live")
+}
+
+// TestTransportStatusDropsOnReconnect: a stream is live only while it holds a
+// session. When the session ends, catchup_complete must drop until the stream
+// has re-run its gap-fill and resubscribed — otherwise a reconnect loop would
+// look healthy to a promote gate.
+func TestTransportStatusDropsOnReconnect(t *testing.T) {
+	sub, cleanup := newLivenessSub(t, func() (interface{}, error) { return uint64(120), nil })
+	defer cleanup()
+
+	var keysDials atomic.Int64
+	steady := mockWSSDialerKeyed(nil, nil)
+	sub.dialWSS = func(ctx context.Context, wsURL string, in *rpc.EventSubscriptionInput) (*wssSession, error) {
+		if in.FromAddress == nil && keysDials.Add(1) == 1 {
+			// First keys-sub session drops shortly after connecting.
+			errCh := make(chan error, 1)
+			go func() { time.Sleep(200 * time.Millisecond); errCh <- errors.New("session dropped") }()
+			return &wssSession{
+				events: make(chan *rpc.EmittedEventWithFinalityStatus),
+				errs:   errCh,
+				reorgs: make(chan *client.ReorgEvent),
+				close:  func() {},
+			}, nil
+		}
+		return steady(ctx, wsURL, in)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	go sub.Start(ctx)
+
+	// live, then not-live with total unchanged, then live again.
+	stage := 0
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) && stage < 3 {
+		live, total, complete := sub.TransportStatus()
+		switch {
+		case stage == 0 && complete:
+			stage = 1
+		case stage == 1 && !complete:
+			if total != 2 {
+				t.Fatalf("total=%d during reconnect, want 2: a reconnecting stream is still a stream", total)
+			}
+			if live >= total {
+				t.Fatalf("live=%d total=%d during reconnect; the dropped stream must not count as live", live, total)
+			}
+			stage = 2
+		case stage == 2 && complete:
+			stage = 3
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if stage != 3 {
+		t.Fatalf("reached stage %d of 3 (0 live, 1 dropped, 2 recovered)", stage)
+	}
+}
+
+// TestTransportStatusNotLiveWhileGapFillFails: a stream whose gap-fill keeps
+// failing backs off and retries without subscribing. It must stay counted but
+// never read as live — this is the state that used to be invisible, and the one
+// a promote gate exists to block on.
+func TestTransportStatusNotLiveWhileGapFillFails(t *testing.T) {
+	var calls atomic.Int64
+	sub, cleanup := newLivenessSub(t, func() (interface{}, error) {
+		if calls.Add(1) == 1 {
+			return uint64(120), nil // primes the cache the passes read from
+		}
+		return nil, errors.New("rpc unavailable") // every convergence check fails
+	})
+	defer cleanup()
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go sub.Start(ctx)
+
+	sawBoth := false
+	for end := time.Now().Add(1500 * time.Millisecond); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+		live, total, complete := sub.TransportStatus()
+		if complete || live > 0 {
+			t.Fatalf("live=%d total=%d complete=%v while every gap-fill is failing; nothing may read as live", live, total, complete)
+		}
+		if total == 2 {
+			sawBoth = true
+		}
+	}
+	if !sawBoth {
+		t.Error("never saw both retrying streams counted in total")
+	}
+}
+
+// TestTransportStatusReleasesRemovedStream: removing a contract tears its stream
+// down, and its reservation must go with it — a leaked count would hold
+// catchup_complete false for good.
+func TestTransportStatusReleasesRemovedStream(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return uint64(500), nil },
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+	sub.streamsMu.Lock()
+	sub.keysStream = newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{sub.optionSelectors})
+	sub.streamsMu.Unlock()
+
+	child := newTestFelt(0xD)
+	sub.AddContract(context.Background(), ContractSubscription{
+		Address: child, StartBlock: 490, Wildcard: true, ERC20: true,
+	})
+	if _, total, _ := sub.TransportStatus(); total != 1 {
+		t.Fatalf("total=%d after adding an ERC20 child, want 1 (its Transfer stream)", total)
+	}
+
+	sub.RemoveContract(child.String())
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, total, _ := sub.TransportStatus(); total == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_, total, _ := sub.TransportStatus()
+	t.Fatalf("total=%d after RemoveContract, want 0: the removed stream's count leaked", total)
+}

@@ -212,6 +212,9 @@ func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
 	s.keysStream = newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{s.optionSelectors})
 	keysStream := s.keysStream
 	s.streamsMu.Unlock()
+	// Counted now, although it is launched only after the per-contract loop
+	// below — see reserveKeysStream for why that ordering matters.
+	s.reserveKeysStream()
 
 	var wg sync.WaitGroup
 	optionFamilyCount, tokenStreamCount, childStreamCount := 0, 0, 0
@@ -235,11 +238,7 @@ func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
 			optionFamilyCount++
 
 			st := s.newChildTransferStream(ctx, c, c.StartBlock)
-			wg.Add(1)
-			go func(st *firehoseKeysStream) {
-				defer wg.Done()
-				_ = s.runFirehoseKeysStream(st.runCtx, st)
-			}(st)
+			s.startKeysStream(st.runCtx, st, &wg)
 			childStreamCount++
 
 		default:
@@ -255,11 +254,7 @@ func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
 			s.addrCancels[addrHex] = cancel
 			s.streamsMu.Unlock()
 
-			wg.Add(1)
-			go func(st *firehoseKeysStream, sc context.Context) {
-				defer wg.Done()
-				_ = s.runFirehoseKeysStream(sc, st)
-			}(st, streamCtx)
+			s.startKeysStream(streamCtx, st, &wg)
 			tokenStreamCount++
 		}
 	}
@@ -274,11 +269,8 @@ func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
 
 	go s.reportTransportStatus(ctx)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_ = s.runFirehoseKeysStream(ctx, keysStream)
-	}()
+	// Reserved at creation, above — before any other stream existed.
+	s.launchReservedKeysStream(ctx, keysStream, &wg)
 
 	wg.Wait()
 	return ctx.Err()
@@ -349,6 +341,44 @@ func (s *EventSubscriber) rollbackAllStreams(startBlock uint64) {
 	}
 }
 
+// reserveKeysStream counts a stream in streamsTotal BEFORE it is launched. Pair
+// every call with exactly one launchReservedKeysStream.
+//
+// Counting must precede launching. Counting inside the goroutine left a window
+// where a launched-but-unscheduled stream contributed to neither counter, so a
+// few fast streams going live could read as live == total > 0 —
+// catchup_complete true — while slower streams had not counted themselves yet.
+// The keys-sub makes that window wide: it is launched only after the per-
+// contract loop (thousands of contracts in prod), so it is reserved as soon as
+// it is created, before any other stream exists. It also keeps total >= live as
+// an invariant: a stream is always counted before it can go live.
+func (s *EventSubscriber) reserveKeysStream() {
+	s.streamsTotal.Add(1)
+}
+
+// launchReservedKeysStream runs st's lifecycle in a goroutine and releases its
+// reservation when that lifecycle ends. wg may be nil for dynamically added
+// streams nobody waits on.
+func (s *EventSubscriber) launchReservedKeysStream(ctx context.Context, st *firehoseKeysStream, wg *sync.WaitGroup) {
+	if wg != nil {
+		wg.Add(1)
+	}
+	go func() {
+		defer s.streamsTotal.Add(-1)
+		if wg != nil {
+			defer wg.Done()
+		}
+		_ = s.runFirehoseKeysStream(ctx, st)
+	}()
+}
+
+// startKeysStream reserves and launches in one step, for streams that are
+// launched as soon as they are created.
+func (s *EventSubscriber) startKeysStream(ctx context.Context, st *firehoseKeysStream, wg *sync.WaitGroup) {
+	s.reserveKeysStream()
+	s.launchReservedKeysStream(ctx, st, wg)
+}
+
 // runFirehoseKeysStream is one stream's connection lifecycle, mirroring
 // runFirehoseWSS but scoped to a single stream: before each (re)connect it
 // HTTP-fills every contract in the stream's own responsibility set up to near
@@ -357,9 +387,6 @@ func (s *EventSubscriber) rollbackAllStreams(startBlock uint64) {
 // cursor across its fills, and forwards matching events until the session
 // drops.
 func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehoseKeysStream) error {
-	s.streamsTotal.Add(1)
-	defer s.streamsTotal.Add(-1)
-
 	backoff := minBackoff
 	for {
 		if ctx.Err() != nil {
@@ -719,7 +746,7 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 		}
 		if sub.ERC20 {
 			st := s.newChildTransferStream(ctx, sub, sub.StartBlock)
-			go func() { _ = s.runFirehoseKeysStream(st.runCtx, st) }()
+			s.startKeysStream(st.runCtx, st, nil)
 		}
 		return
 	}
@@ -738,7 +765,7 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 
 	if sub.ERC20 {
 		st := s.newChildTransferStream(ctx, sub, wssFrom)
-		go func() { _ = s.runFirehoseKeysStream(st.runCtx, st) }()
+		s.startKeysStream(st.runCtx, st, nil)
 	}
 
 	if sub.StartBlock <= tip {
