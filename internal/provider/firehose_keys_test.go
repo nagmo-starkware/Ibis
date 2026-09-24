@@ -647,7 +647,7 @@ func TestKeysStreamGapFillErrorsOnUnreadableTip(t *testing.T) {
 
 // TestKeysStreamGapFillEmptySetConverges: with nothing to fill, the pass's
 // cursor is just the cached tip. A stale cache must not read as divergence —
-// resume from the fresh tip instead.
+// resume from the cached tip, the one new contracts are seeded from.
 func TestKeysStreamGapFillEmptySetConverges(t *testing.T) {
 	var calls atomic.Int64
 	handlers := map[string]func(json.RawMessage) (interface{}, error){
@@ -667,8 +667,41 @@ func TestKeysStreamGapFillEmptySetConverges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty fill set errored: %v", err)
 	}
-	if resume != 5000 {
-		t.Errorf("resume = %d, want the fresh tip 5000", resume)
+	if resume != 1000 {
+		t.Errorf("resume = %d, want the cached tip 1000", resume)
+	}
+}
+
+// TestKeysStreamGapFillEmptySetFillsLateContract: a contract registered after
+// an empty pass took its snapshot must still be covered from its own cursor,
+// not skipped by resuming at a tip past it.
+func TestKeysStreamGapFillEmptySetFillsLateContract(t *testing.T) {
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	late := newTestFelt(0x1A7E)
+	var tipCalls atomic.Int64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			// Registered during the first pass's tip read, after its snapshot,
+			// seeded below that tip.
+			if tipCalls.Add(1) == 1 {
+				st.setFill(late.String(), ContractSubscription{Address: late})
+				st.setCursor(late.String(), 990, true)
+			}
+			return uint64(1000), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("gap-fill errored: %v", err)
+	}
+	if resume > 990 {
+		t.Fatalf("resume = %d, past the late contract's cursor 990: its blocks would be skipped", resume)
 	}
 }
 

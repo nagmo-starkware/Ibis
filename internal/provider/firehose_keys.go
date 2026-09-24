@@ -512,10 +512,19 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 			return 0, fmt.Errorf("reading chain tip after gap-fill pass %d: %w", pass, err)
 		}
 
-		// Nothing to fill: resume from this fresh tip. The pass read its tip
-		// from the cache, which can lag enough to look like divergence.
+		// Nothing to fill, so the guard below would only measure cache lag.
 		if fills == 0 {
-			return tip, nil
+			// A contract registered mid-pass missed the snapshot: fill it.
+			if len(st.snapshotFills()) > 0 {
+				prev, prevFills, regrowths, pass = 0, 0, 0, 0
+				continue
+			}
+			if minLast == 0 {
+				return 0, fmt.Errorf("no cached tip in gap-fill pass %d", pass)
+			}
+			// The cached tip, not the fresh one: contracts are seeded from the
+			// cache, so resuming past it could skip a just-seeded contract.
+			return min(minLast, tip), nil
 		}
 
 		// Converged once the laggard is within the same threshold the pass
