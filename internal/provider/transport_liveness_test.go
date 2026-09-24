@@ -175,3 +175,43 @@ func TestTransportStatusLoggedOnEveryTransport(t *testing.T) {
 		})
 	}
 }
+
+// TestLivenessPerContractReleasesRemovedStream: removing a contract on the
+// per-contract transport must release its stream. A leaked reservation would
+// pin catchup_complete false for the life of the process.
+func TestLivenessPerContractReleasesRemovedStream(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return uint64(120), nil },
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	server := mockRPCServer(t, handlers)
+	defer server.Close()
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer p.Close()
+	sub := p.NewSubscriber(nil, make(chan RawEvent, 64), &SubscriberConfig{})
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr := newTestFelt(0xA)
+	sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 100, Wildcard: true})
+
+	waitStreams := func(wantLive, wantTotal int64) {
+		t.Helper()
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			if live, total, _ := sub.TransportStatus(); live == wantLive && total == wantTotal {
+				return
+			}
+		}
+		live, total, _ := sub.TransportStatus()
+		t.Fatalf("live=%d total=%d, want %d/%d", live, total, wantLive, wantTotal)
+	}
+	waitStreams(1, 1)
+	sub.RemoveContract(addr.String())
+	waitStreams(0, 0)
+}
