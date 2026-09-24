@@ -412,9 +412,15 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 
 // keysStreamGapFill brings every contract in st's gap-fill set within
 // catchupThreshold of chain tip over HTTP, then returns the min cursor across
-// them to resume st's subscription from. Mirrors firehoseGapFill, scoped to
-// one stream's own fills and own cursors.
+// them to resume st's subscription from.
 func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) uint64 {
+	return s.keysStreamGapFillPass(ctx, st)
+}
+
+// keysStreamGapFillPass runs one gap-fill fan-out over st's current fill set
+// and returns the min cursor across them. Mirrors firehoseGapFill, scoped to
+// one stream's own fills and own cursors.
+func (s *EventSubscriber) keysStreamGapFillPass(ctx context.Context, st *firehoseKeysStream) uint64 {
 	fills := st.snapshotFills()
 	if len(fills) == 0 {
 		bn, err := s.tipBlockNumber(ctx)
