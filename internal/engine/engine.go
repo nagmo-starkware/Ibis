@@ -1470,6 +1470,16 @@ func (e *Engine) TransportStatus() (live, total int64, complete bool) {
 	return e.subscriber.TransportStatus()
 }
 
+// BackfillsPending proxies how many dynamically added contracts are still
+// backfilling. Informational — TransportStatus's complete flag already
+// accounts for them.
+func (e *Engine) BackfillsPending() int64 {
+	if e.subscriber == nil {
+		return 0
+	}
+	return e.subscriber.BackfillsPending()
+}
+
 func (e *Engine) ViewStatuses() []ViewStatus {
 	if e.poller == nil {
 		return nil

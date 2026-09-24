@@ -277,6 +277,14 @@ type EventSubscriber struct {
 	streamsTotal atomic.Int64
 	streamsLive  atomic.Int64
 
+	// backfillsPending counts dynamically added contracts whose historical
+	// backfill has not completed. A contract discovered after startup is
+	// seeded at tip+1 and backfilled separately, so without this it reads as
+	// current while its history is still missing — or has failed to load.
+	backfillsPending atomic.Int64
+	backfillMu       sync.Mutex
+	backfills        map[string]*trackedBackfill // by address hex
+
 	// sem bounds the number of goroutines that can execute RPC-heavy catchup or
 	// HTTP-polling iterations concurrently. See maxConcurrentCatchup.
 	sem chan struct{}
@@ -498,6 +506,10 @@ func (s *EventSubscriber) AddContract(ctx context.Context, sub ContractSubscript
 
 // RemoveContract stops the subscription for a contract by its address hex string.
 func (s *EventSubscriber) RemoveContract(addressHex string) {
+	// A removed contract's history no longer matters, and a backfill left
+	// retrying for it would hold catchup_complete false for good.
+	s.cancelBackfill(addressHex)
+
 	if s.sharedFirehose {
 		s.removeSink(addressHex)
 		return
@@ -533,7 +545,101 @@ func (s *EventSubscriber) RemoveContract(addressHex string) {
 // different packages, with nothing to keep them honest.
 func (s *EventSubscriber) TransportStatus() (live, total int64, complete bool) {
 	live, total = s.streamsLive.Load(), s.streamsTotal.Load()
-	return live, total, total > 0 && live == total
+	pending := s.backfillsPending.Load()
+	return live, total, total > 0 && live == total && pending == 0
+}
+
+// trackedBackfill is one in-flight dynamic backfill. Its identity (the pointer)
+// lets a finishing backfill clear its own entry without removing a newer one
+// that superseded it for the same address.
+type trackedBackfill struct {
+	cancel context.CancelFunc
+}
+
+// BackfillsPending reports how many dynamic backfills have not yet completed.
+// Informational: TransportStatus's complete flag already accounts for them and
+// is the value to gate on. The two are separate reads, so they can disagree for
+// an instant as a backfill finishes.
+func (s *EventSubscriber) BackfillsPending() int64 {
+	return s.backfillsPending.Load()
+}
+
+// reserveBackfill counts a backfill as pending. It must be called BEFORE the
+// contract becomes visible as covered — before it is tracked or its cursor is
+// seeded at tip+1 — or there is a window where it reads as current with its
+// history still missing. Pair with exactly one launchReservedBackfill or
+// releaseBackfill.
+func (s *EventSubscriber) reserveBackfill() {
+	s.backfillsPending.Add(1)
+}
+
+// releaseBackfill gives back a reservation that turned out not to need a
+// backfill (no tip available, or nothing before the tip to fetch).
+func (s *EventSubscriber) releaseBackfill() {
+	s.backfillsPending.Add(-1)
+}
+
+// launchReservedBackfill backfills [from, to] for sub in the background and
+// keeps it counted as pending until it succeeds, is cancelled, or the contract
+// is removed. A failed attempt is retried with capped backoff, RESUMING at the
+// chunk that failed: backfillFrom reports where it stopped, and restarting
+// from `from` would re-deliver chunks the engine already has.
+func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub ContractSubscription, from, to uint64) {
+	addrHex := sub.Address.String()
+	bctx, cancel := context.WithCancel(ctx)
+	tb := &trackedBackfill{cancel: cancel}
+
+	s.backfillMu.Lock()
+	if s.backfills == nil {
+		s.backfills = make(map[string]*trackedBackfill)
+	}
+	if prev := s.backfills[addrHex]; prev != nil {
+		prev.cancel() // a re-add supersedes the earlier attempt
+	}
+	s.backfills[addrHex] = tb
+	s.backfillMu.Unlock()
+
+	go func() {
+		defer s.releaseBackfill()
+		defer func() {
+			s.backfillMu.Lock()
+			if s.backfills[addrHex] == tb {
+				delete(s.backfills, addrHex)
+			}
+			s.backfillMu.Unlock()
+			cancel()
+		}()
+
+		next := from
+		backoff := minBackoff
+		for attempt := 1; ; attempt++ {
+			var err error
+			next, err = s.backfillFrom(bctx, sub, next, to)
+			if err == nil || bctx.Err() != nil {
+				return
+			}
+			s.logger.Error("backfill failed; retrying from where it stopped",
+				"contract", sub.Address, "attempt", attempt, "resume_from", next,
+				"to", to, "backoff", backoff, "error", err)
+			select {
+			case <-bctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = time.Duration(math.Min(float64(backoff)*2, float64(maxBackoff)))
+		}
+	}()
+}
+
+// cancelBackfill stops any in-flight backfill for addrHex. Its goroutine then
+// releases the pending count on its way out.
+func (s *EventSubscriber) cancelBackfill(addrHex string) {
+	s.backfillMu.Lock()
+	tb := s.backfills[addrHex]
+	s.backfillMu.Unlock()
+	if tb != nil {
+		tb.cancel()
+	}
 }
 
 // streamLiveness is one stream's contribution to streamsLive. Streams that flip
@@ -1050,12 +1156,21 @@ func (s *EventSubscriber) resolveTimestamps(ctx context.Context, events []RawEve
 // and sends them to the events channel. Uses configurable block-range chunking
 // (default: 100 blocks per query) with continuation token pagination.
 func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscription, fromBlock, toBlock uint64) error {
+	_, err := s.backfillFrom(ctx, contract, fromBlock, toBlock)
+	return err
+}
+
+// backfillFrom is Backfill, additionally returning the first block it did NOT
+// fully deliver — toBlock+1 on success. Chunks before that point have already
+// been sent to the engine, so a caller retrying after a failure must resume
+// there: restarting from fromBlock would re-deliver them as duplicates.
+func (s *EventSubscriber) backfillFrom(ctx context.Context, contract ContractSubscription, fromBlock, toBlock uint64) (uint64, error) {
 	logger := s.logger.With("contract", contract.Address, "action", "backfill")
 	logger.Info("starting backfill", "from", fromBlock, "to", toBlock)
 
 	for current := fromBlock; current <= toBlock; {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return current, ctx.Err()
 		}
 
 		end := current + s.blocksPerQuery - 1
@@ -1073,7 +1188,7 @@ func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscri
 		})
 		cancel()
 		if err != nil {
-			return fmt.Errorf("backfill events [%d, %d]: %w", current, end, err)
+			return current, fmt.Errorf("backfill events [%d, %d]: %w", current, end, err)
 		}
 
 		// Enrich events with block timestamps.
@@ -1085,7 +1200,7 @@ func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscri
 			select {
 			case s.events <- evt:
 			case <-ctx.Done():
-				return ctx.Err()
+				return current, ctx.Err()
 			}
 		}
 
@@ -1094,5 +1209,5 @@ func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscri
 	}
 
 	logger.Info("backfill complete", "from", fromBlock, "to", toBlock)
-	return nil
+	return toBlock + 1, nil
 }
