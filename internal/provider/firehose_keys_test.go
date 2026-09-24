@@ -451,12 +451,63 @@ func TestKeysStreamGapFillConvergesOnTip(t *testing.T) {
 	st.setFill(slow.String(), ContractSubscription{Address: slow})
 	st.setCursor(slow.String(), 0, true)
 
-	resume := sub.keysStreamGapFill(context.Background(), st)
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("keysStreamGapFill returned an error on a converging chain: %v", err)
+	}
 
 	final := tip.Load()
 	if resume+catchupThreshold < final {
 		t.Fatalf("resume block %d is %d behind tip %d; want within %d "+
 			"(a resume this old falls outside the WSS replay window and loses events)",
 			resume, final-resume, final, catchupThreshold)
+	}
+}
+
+// TestKeysStreamGapFillNeverReturnsAStaleResume: on any failure the caller must
+// get an error and a zero block, never a usable-looking resume. Handing back
+// the block reached so far is what the old code did on an unreadable tip, and
+// resuming from it subscribes past the node's replay window -- a permanent hole
+// in the store, written silently.
+func TestKeysStreamGapFillNeverReturnsAStaleResume(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return uint64(500_000), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	addr := newTestFelt(0xBEEF)
+	st.setFill(addr.String(), ContractSubscription{Address: addr})
+	st.setCursor(addr.String(), 1, true) // a long way behind: the pass will be mid-flight
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var resume uint64
+	var err error
+	go func() {
+		defer close(done)
+		resume, err = sub.keysStreamGapFill(ctx, st)
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("keysStreamGapFill did not return after cancellation")
+	}
+
+	if err == nil {
+		t.Fatalf("expected an error after cancellation, got resume=%d and nil", resume)
+	}
+	if resume != 0 {
+		t.Errorf("resume = %d on failure; must be 0 so no caller can subscribe with it", resume)
 	}
 }

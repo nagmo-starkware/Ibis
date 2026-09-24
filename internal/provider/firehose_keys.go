@@ -361,9 +361,26 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 			return ctx.Err()
 		}
 
-		fromBlock := s.keysStreamGapFill(ctx, st)
+		fromBlock, err := s.keysStreamGapFill(ctx, st)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if err != nil {
+			// Subscribing anyway would resume from a block the node can no
+			// longer replay and write a permanent hole into the store. Back off
+			// and re-run the whole gap-fill instead. The stream stays
+			// not-live meanwhile, which /v1/catchup_status reports and a
+			// promote gate blocks on, rather than looking healthy while losing
+			// events.
+			s.logger.Error("firehose-keys gap-fill failed; not subscribing",
+				"stream", st.label, "error", err, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff = time.Duration(math.Min(float64(backoff)*2, float64(maxBackoff)))
+			continue
 		}
 
 		subInput := &rpc.EventSubscriptionInput{
@@ -424,29 +441,45 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 // each pass only covers the blocks produced during the previous one, so cursors
 // converge on the tip geometrically, and the resume lands inside the replay
 // window where the node can actually redeliver.
-func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) uint64 {
-	var minLast uint64
+// Returns an error rather than a usable resume block whenever it cannot get
+// the whole set to the tip. Every failure here would mean subscribing from a
+// block the node can no longer replay, i.e. writing a permanent hole into the
+// store -- so the caller must retry, never proceed.
+func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) (uint64, error) {
+	var prev uint64
 	for pass := 1; ; pass++ {
-		minLast = s.keysStreamGapFillPass(ctx, st)
+		minLast := s.keysStreamGapFillPass(ctx, st)
 		if ctx.Err() != nil {
-			return minLast
+			return 0, ctx.Err()
+		}
+
+		// A tip we cannot read is not evidence of convergence. Treating it as
+		// such is how a resume block from an hour ago looks acceptable.
+		tip, err := s.tipBlockNumber(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("reading chain tip after gap-fill pass %d: %w", pass, err)
 		}
 
 		// Converged once the laggard is within the same threshold the pass
-		// itself stops at. A tip we cannot read is not a reason to re-run.
-		tip, err := s.tipBlockNumber(ctx)
-		if err != nil || minLast+catchupThreshold >= tip {
-			return minLast
+		// itself stops at.
+		if minLast+catchupThreshold >= tip {
+			return minLast, nil
 		}
 
-		if pass >= maxGapFillPasses {
-			// Loud: resuming here means a known, unrecoverable hole rather than
-			// the silent one this loop exists to prevent.
-			s.logger.Error("firehose-keys gap-fill did not converge; resuming with a known gap",
-				"stream", st.label, "passes", pass, "resume_block", minLast,
-				"tip", tip, "behind", tip-minLast)
-			return minLast
+		// No fixed pass cap: a pass only has to cover the blocks the previous
+		// one took, so the count needed is not knowable up front -- a first
+		// pass measured at 77 minutes in prod would blow any constant worth
+		// picking. Terminate on the property that actually matters instead:
+		// the GAP must shrink. A cursor that advances while the gap grows is
+		// catchup losing the race with the chain, and more passes cannot win
+		// it -- checking only that the cursor moved would spin forever there.
+		behind := tip - minLast
+		if pass > 1 && behind >= prev {
+			return 0, fmt.Errorf(
+				"gap-fill is not converging: %d blocks behind after pass %d (was %d): "+
+					"catchup is not outrunning the chain", behind, pass, prev)
 		}
+		prev = behind
 
 		s.logger.Info("firehose-keys gap-fill still behind tip; repeating",
 			"stream", st.label, "pass", pass, "resume_block", minLast,
