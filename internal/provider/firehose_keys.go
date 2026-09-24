@@ -512,6 +512,12 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 			return 0, fmt.Errorf("reading chain tip after gap-fill pass %d: %w", pass, err)
 		}
 
+		// Nothing to fill: resume from this fresh tip. The pass read its tip
+		// from the cache, which can lag enough to look like divergence.
+		if fills == 0 {
+			return tip, nil
+		}
+
 		// Converged once the laggard is within the same threshold the pass
 		// itself stops at.
 		if minLast+catchupThreshold >= tip {

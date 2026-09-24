@@ -645,6 +645,33 @@ func TestKeysStreamGapFillErrorsOnUnreadableTip(t *testing.T) {
 	}
 }
 
+// TestKeysStreamGapFillEmptySetConverges: with nothing to fill, the pass's
+// cursor is just the cached tip. A stale cache must not read as divergence —
+// resume from the fresh tip instead.
+func TestKeysStreamGapFillEmptySetConverges(t *testing.T) {
+	var calls atomic.Int64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			// The first read primes the cache at 1000; the chain is really at 5000.
+			if calls.Add(1) == 1 {
+				return uint64(1000), nil
+			}
+			return uint64(5000), nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("empty fill set errored: %v", err)
+	}
+	if resume != 5000 {
+		t.Errorf("resume = %d, want the fresh tip 5000", resume)
+	}
+}
+
 // TestTransportStatusTracksStreamLiveness: readiness and cursor numbers both
 // report healthy while a stream is still gap-filling, which is how a standby
 // gets promoted before it is current. TransportStatus must distinguish the two:
