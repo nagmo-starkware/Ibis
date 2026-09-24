@@ -260,3 +260,53 @@ func TestBackfillSharedFirehoseHoldsCatchupIncomplete(t *testing.T) {
 		t.Fatal("catchup_complete still false after the backfill finished")
 	}
 }
+
+// TestAddContractKeysFirehoseLaggingTipSeedsAtResumeFloor: a registration whose
+// tip read hits a lagging replica must not seed below the block the keys-sub
+// already resumed from; its backfill covers the difference instead.
+func TestAddContractKeysFirehoseLaggingTipSeedsAtResumeFloor(t *testing.T) {
+	var maxTo atomic.Uint64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return uint64(970), nil },
+		"starknet_getEvents": func(params json.RawMessage) (interface{}, error) {
+			var p []struct {
+				ToBlock struct {
+					BlockNumber uint64 `json:"block_number"`
+				} `json:"to_block"`
+			}
+			if json.Unmarshal(params, &p) == nil && len(p) == 1 && p[0].ToBlock.BlockNumber > maxTo.Load() {
+				maxTo.Store(p[0].ToBlock.BlockNumber)
+			}
+			return chunkEvent(params), nil
+		},
+		"starknet_getBlockWithTxHashes": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"timestamp": 1, "block_number": 1, "block_hash": "0x1"}, nil
+		},
+	}
+	server := mockRPCServer(t, handlers)
+	defer server.Close()
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer p.Close()
+	sub := p.NewSubscriber(nil, make(chan RawEvent, 256), &SubscriberConfig{
+		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)},
+	})
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{sub.optionSelectors})
+	st.fillBehind(1000) // the keys-sub resumed from 1000
+	sub.streamsMu.Lock()
+	sub.keysStream = st
+	sub.streamsMu.Unlock()
+
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 900, Wildcard: true})
+	waitPending(t, sub, 0, 3*time.Second)
+
+	if got := st.cursor(addr.String()); got != 1000 {
+		t.Errorf("cursor = %d, want the resume floor 1000 (lagging tip 970)", got)
+	}
+	if got := maxTo.Load(); got != 999 {
+		t.Errorf("backfill reached block %d, want 999: blocks up to the floor must be covered", got)
+	}
+}
