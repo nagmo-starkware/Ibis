@@ -267,8 +267,6 @@ func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
 		"child_transfer_streams", childStreamCount,
 	)
 
-	go s.reportTransportStatus(ctx)
-
 	// Reserved at creation, above — before any other stream existed.
 	s.launchReservedKeysStream(ctx, keysStream, &wg)
 

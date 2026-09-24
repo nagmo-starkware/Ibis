@@ -1,8 +1,12 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,5 +107,71 @@ func TestLivenessPollerNotLiveWhileBehind(t *testing.T) {
 	}
 	if !sawCounted {
 		t.Error("the backfilling pollers were never counted in total")
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe to write from the subscriber's goroutines.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+// TestTransportStatusLoggedOnEveryTransport: the periodic "transport status"
+// line used to start only on firehose-keys, so a rollback via IBIS_TRANSPORT
+// silently lost it.
+func TestTransportStatusLoggedOnEveryTransport(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *SubscriberConfig
+	}{
+		{"firehose-keys", &SubscriberConfig{KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}}},
+		{"shared firehose", &SubscriberConfig{SharedFirehose: true}},
+		{"per-contract", &SubscriberConfig{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			handlers := map[string]func(json.RawMessage) (interface{}, error){
+				"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return uint64(120), nil },
+				"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+					return map[string]interface{}{"events": []interface{}{}}, nil
+				},
+			}
+			server := mockRPCServer(t, handlers)
+			defer server.Close()
+			var logs syncBuffer
+			p, err := New(context.Background(), server.URL, slog.New(slog.NewTextHandler(&logs, nil)))
+			if err != nil {
+				t.Fatalf("New() error: %v", err)
+			}
+			defer p.Close()
+			sub := p.NewSubscriber(
+				[]ContractSubscription{{Address: newTestFelt(0xA), StartBlock: 100, Wildcard: true}},
+				make(chan RawEvent, 64), c.cfg)
+			sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+			sub.statusInterval = 10 * time.Millisecond
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go sub.Start(ctx)
+
+			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+				if strings.Contains(logs.String(), "transport status") {
+					return
+				}
+			}
+			t.Fatal(`no "transport status" log line on this transport`)
+		})
 	}
 }
