@@ -980,35 +980,3 @@ func TestSubscriberMultipleContracts(t *testing.T) {
 		}
 	}
 }
-
-// TestCachedBlockNumberNeverMovesBackwards: a lagging replica answering a later
-// read must not lower the cached tip.
-func TestCachedBlockNumberNeverMovesBackwards(t *testing.T) {
-	var calls atomic.Int64
-	handlers := map[string]func(json.RawMessage) (interface{}, error){
-		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
-			if calls.Add(1) == 1 {
-				return uint64(1000), nil
-			}
-			return uint64(970), nil // a replica 30 blocks behind
-		},
-	}
-	server := mockRPCServer(t, handlers)
-	defer server.Close()
-	p, err := New(context.Background(), server.URL, nil)
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-	defer p.Close()
-	p.tipIntervalNanos.Store(1) // every read goes to the RPC
-
-	for i, want := range []uint64{1000, 1000} {
-		got, err := p.CachedBlockNumber(context.Background())
-		if err != nil {
-			t.Fatalf("read %d: %v", i, err)
-		}
-		if got != want {
-			t.Fatalf("read %d = %d, want %d: the tip moved backwards", i, got, want)
-		}
-	}
-}

@@ -136,7 +136,8 @@ func (p *StarknetProvider) StartTipPoller(ctx context.Context, interval time.Dur
 	// Prime synchronously so subscribers never observe a zero tip at startup.
 	rpcCtx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
 	if bn, err := p.httpRPC.BlockNumber(rpcCtx); err == nil {
-		p.recordTip(bn)
+		p.tipBlock.Store(bn)
+		p.tipUpdated.Store(time.Now().UnixNano())
 	} else if ctx.Err() == nil {
 		p.logger.Warn("tip poller: initial block number fetch failed", "error", err)
 	}
@@ -159,7 +160,8 @@ func (p *StarknetProvider) StartTipPoller(ctx context.Context, interval time.Dur
 					}
 					continue
 				}
-				p.recordTip(bn)
+				p.tipBlock.Store(bn)
+				p.tipUpdated.Store(time.Now().UnixNano())
 			}
 		}
 	}()
@@ -188,20 +190,9 @@ func (p *StarknetProvider) CachedBlockNumber(ctx context.Context) (uint64, error
 		}
 		return 0, err
 	}
-	return p.recordTip(fresh), nil
-}
-
-// recordTip caches bn as the tip unless it is behind the one held, and returns
-// the cached value. A lagging replica behind a load-balanced endpoint must not
-// move the tip backwards: fillBehind relies on a later read never being lower.
-func (p *StarknetProvider) recordTip(bn uint64) uint64 {
-	for old := p.tipBlock.Load(); bn > old; old = p.tipBlock.Load() {
-		if p.tipBlock.CompareAndSwap(old, bn) {
-			break
-		}
-	}
+	p.tipBlock.Store(fresh)
 	p.tipUpdated.Store(time.Now().UnixNano())
-	return p.tipBlock.Load()
+	return fresh, nil
 }
 
 // GetBlockTimestamp returns the Unix timestamp for a block, using a cache
