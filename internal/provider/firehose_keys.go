@@ -789,14 +789,15 @@ func (s *EventSubscriber) forwardStream(ctx context.Context, st *firehoseKeysStr
 // design doc comment above):
 //   - always added to the shared tracked set;
 //   - added to the (already-running) keys-sub's fill set with its cursor
-//     seeded at tip+1 — non-ERC20 children need nothing more, their events
-//     were always going to arrive on the shared keys-sub;
+//     seeded at wssFrom: tip+1, or the keys-sub's resume floor if higher —
+//     non-ERC20 children need nothing more, their events were always going
+//     to arrive on the shared keys-sub;
 //   - if ERC20 (an OptionToken child), ALSO gets its own new Transfer/Approval
-//     address-sub stream, launched now;
-//   - history [StartBlock, tip] is backfilled once over HTTP with NO key
+//     address-sub stream from wssFrom, launched now;
+//   - history [StartBlock, wssFrom-1] is backfilled once over HTTP with NO key
 //     filter — covering BOTH event classes in a single fetch — so future
-//     events split cleanly at tip between the keys-sub and (if ERC20) the new
-//     address-sub, with no gap and no overlap.
+//     events split cleanly at wssFrom between the keys-sub and (if ERC20) the
+//     new address-sub, with no gap and no overlap.
 func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub ContractSubscription) {
 	// Reserved before the contract is tracked or seeded, so it can never read
 	// as current before its history is in. Handed to the backfill below, or

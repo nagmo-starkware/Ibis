@@ -1049,6 +1049,67 @@ func waitWriterPending(t *testing.T, st *firehoseKeysStream) {
 	t.Fatal("fillBehind never queued on seedMu")
 }
 
+// TestRollbackWaitsForInFlightSeedAndLowersEveryFloor: a reorg's rollback is a
+// second seedMu writer. It queues behind a registration's slow tip read
+// without deadlocking, then lowers the floor of every stream, not only the
+// keys-sub's.
+func TestRollbackWaitsForInFlightSeedAndLowersEveryFloor(t *testing.T) {
+	release := make(chan struct{})
+	inRead := make(chan struct{})
+	var first atomic.Bool
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			if first.CompareAndSwap(false, true) {
+				close(inRead)
+				<-release
+			}
+			return uint64(1000), nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	sub.provider.tipIntervalNanos.Store(1)
+
+	keys := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	keys.fillBehind(1000)
+	token := newFirehoseKeysStream("token", newTestFelt(0x70C), [][]*felt.Felt{{newTestFelt(0x1)}})
+	token.fillBehind(1000)
+	sub.streamsMu.Lock()
+	sub.keysStream = keys
+	sub.addrStreams[newTestFelt(0x70C).String()] = token
+	sub.streamsMu.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _, _ = sub.readTipAndSeed(context.Background(), ContractSubscription{Address: newTestFelt(0xA1)})
+	}()
+	<-inRead
+	go func() { defer wg.Done(); sub.rollbackAllStreams(800) }()
+	waitWriterPending(t, keys)
+
+	unblock()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rollback or the registration still blocked after the tip read returned")
+	}
+	for _, st := range []*firehoseKeysStream{keys, token} {
+		st.seedMu.RLock()
+		floor := st.resumeFloor
+		st.seedMu.RUnlock()
+		if floor != 800 {
+			t.Errorf("%s resume floor = %d after rollback to 800", st.label, floor)
+		}
+	}
+}
+
 // TestReadTipAndSeedKeysSubStartedConcurrently: the mid-read keys-sub start,
 // driven from a separate goroutine as startKeysFirehose would.
 func TestReadTipAndSeedKeysSubStartedConcurrently(t *testing.T) {
