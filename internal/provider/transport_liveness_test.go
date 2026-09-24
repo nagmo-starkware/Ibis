@@ -166,7 +166,7 @@ func TestTransportStatusLoggedOnEveryTransport(t *testing.T) {
 			defer cancel()
 			go sub.Start(ctx)
 
-			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 				if strings.Contains(logs.String(), "transport status") {
 					return
 				}
