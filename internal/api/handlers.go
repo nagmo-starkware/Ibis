@@ -186,9 +186,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // the second to decide whether to flip a slot, and an operator reads the first
 // to understand why it did.
 type transportStatus struct {
-	StreamsLive     int64 `json:"streams_live"`
-	StreamsTotal    int64 `json:"streams_total"`
-	CatchupComplete bool  `json:"catchup_complete"`
+	StreamsLive  int64 `json:"streams_live"`
+	StreamsTotal int64 `json:"streams_total"`
+	// BackfillsPending explains a false catchup_complete when every stream is
+	// live: a contract discovered after startup whose history is still loading
+	// (or retrying). Informational — gate on catchup_complete.
+	BackfillsPending int64 `json:"backfills_pending"`
+	CatchupComplete  bool  `json:"catchup_complete"`
 }
 
 // transportStatus reads stream liveness from the engine. With no engine wired
@@ -200,9 +204,10 @@ func (s *Server) transportStatus() transportStatus {
 	}
 	live, total, complete := s.engine.TransportStatus()
 	return transportStatus{
-		StreamsLive:     live,
-		StreamsTotal:    total,
-		CatchupComplete: complete,
+		StreamsLive:      live,
+		StreamsTotal:     total,
+		BackfillsPending: s.engine.BackfillsPending(),
+		CatchupComplete:  complete,
 	}
 }
 

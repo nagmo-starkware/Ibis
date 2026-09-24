@@ -282,11 +282,14 @@ func (s *EventSubscriber) forwardIfTracked(ctx context.Context, evt *rpc.Emitted
 // through the shared subscription. The two ranges partition cleanly at the tip
 // captured now, so there is no overlap (dup) and no gap.
 func (s *EventSubscriber) addContractFirehose(ctx context.Context, sub ContractSubscription) {
+	// Reserved before the sink exists — see reserveBackfill.
+	s.reserveBackfill()
 	tip, err := s.tipBlockNumber(ctx)
 	if err != nil {
 		// No tip available: fall back to forwarding from StartBlock and skip
 		// backfill; gap-fill on the next reconnect will reconcile.
 		s.addSink(sub, sub.StartBlock)
+		s.releaseBackfill()
 		return
 	}
 
@@ -298,10 +301,8 @@ func (s *EventSubscriber) addContractFirehose(ctx context.Context, sub ContractS
 	s.addSink(sub, wssFrom)
 
 	if sub.StartBlock <= tip {
-		go func() {
-			if err := s.Backfill(ctx, sub, sub.StartBlock, tip); err != nil && ctx.Err() == nil {
-				s.logger.Error("firehose backfill failed", "contract", sub.Address, "error", err)
-			}
-		}()
+		s.launchReservedBackfill(ctx, sub, sub.StartBlock, tip)
+		return
 	}
+	s.releaseBackfill()
 }

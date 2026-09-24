@@ -737,6 +737,10 @@ func (s *EventSubscriber) forwardStream(ctx context.Context, st *firehoseKeysStr
 //     events split cleanly at tip between the keys-sub and (if ERC20) the new
 //     address-sub, with no gap and no overlap.
 func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub ContractSubscription) {
+	// Reserved before the contract is tracked or seeded, so it can never read
+	// as current before its history is in. Handed to the backfill below, or
+	// released if none is needed.
+	s.reserveBackfill()
 	s.trackContract(sub)
 	addrHex := sub.Address.String()
 
@@ -754,6 +758,7 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 			st := s.newChildTransferStream(ctx, sub, sub.StartBlock)
 			s.startKeysStream(st.runCtx, st, nil)
 		}
+		s.releaseBackfill() // seeded at StartBlock: gap-fill covers the history
 		return
 	}
 
@@ -775,14 +780,12 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 	}
 
 	if sub.StartBlock <= tip {
-		go func() {
-			backfillSub := sub
-			backfillSub.Keys = nil // no filter: one fetch covers both event classes
-			if err := s.Backfill(ctx, backfillSub, sub.StartBlock, tip); err != nil && ctx.Err() == nil {
-				s.logger.Error("firehose-keys backfill failed", "contract", sub.Address, "error", err)
-			}
-		}()
+		backfillSub := sub
+		backfillSub.Keys = nil // no filter: one fetch covers both event classes
+		s.launchReservedBackfill(ctx, backfillSub, sub.StartBlock, tip)
+		return
 	}
+	s.releaseBackfill() // starts after the tip: nothing historical to fetch
 }
 
 // removeContractKeysFirehose freezes a contract on the firehose-keys
