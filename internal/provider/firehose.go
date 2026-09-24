@@ -75,6 +75,13 @@ func (s *EventSubscriber) startFirehose(ctx context.Context) error {
 // down), then opens one empty-filter subscription resumed from the min sink
 // cursor and forwards matching events until the session drops.
 func (s *EventSubscriber) runFirehoseWSS(ctx context.Context) error {
+	// The whole transport is one stream. Reserved before its first gap-fill,
+	// so it is counted before it could possibly go live.
+	s.reserveStream()
+	defer s.releaseStream()
+	live := &streamLiveness{s: s}
+	defer live.set(false)
+
 	backoff := minBackoff
 	for {
 		if ctx.Err() != nil {
@@ -109,7 +116,9 @@ func (s *EventSubscriber) runFirehoseWSS(ctx context.Context) error {
 		backoff = minBackoff
 		s.logger.Info("firehose WSS active", "from_block", fromBlock, "tracked", len(s.router))
 
+		live.set(true)
 		err = s.processFirehose(ctx, session)
+		live.set(false)
 		session.close()
 		if ctx.Err() != nil {
 			return ctx.Err()

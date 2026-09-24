@@ -445,8 +445,10 @@ func (s *EventSubscriber) Start(ctx context.Context) error {
 		s.cancels[addrHex] = cancel
 		s.mu.Unlock()
 
+		s.reserveStream()
 		go func(c ContractSubscription, cCtx context.Context) {
 			defer wg.Done()
+			defer s.releaseStream()
 			if err := s.subscribeContract(cCtx, c); err != nil && ctx.Err() == nil {
 				errCh <- fmt.Errorf("contract %s: %w", c.Address, err)
 			}
@@ -482,7 +484,9 @@ func (s *EventSubscriber) AddContract(ctx context.Context, sub ContractSubscript
 	s.cancels[addrHex] = cancel
 	s.mu.Unlock()
 
+	s.reserveStream()
 	go func() {
+		defer s.releaseStream()
 		if err := s.subscribeContract(contractCtx, sub); err != nil && ctx.Err() == nil {
 			s.logger.Error("dynamic contract subscription failed",
 				"contract", sub.Address,
@@ -532,6 +536,28 @@ func (s *EventSubscriber) TransportStatus() (live, total int64, complete bool) {
 	return live, total, total > 0 && live == total
 }
 
+// streamLiveness is one stream's contribution to streamsLive. Streams that flip
+// between live and not-live — a session dropping, a poller falling behind —
+// adjust the shared counter exactly once per transition, however often set is
+// called. Each is owned by a single goroutine, so it needs no lock of its own.
+// A nil *streamLiveness is a no-op.
+type streamLiveness struct {
+	s  *EventSubscriber
+	on bool
+}
+
+func (l *streamLiveness) set(live bool) {
+	if l == nil || live == l.on {
+		return
+	}
+	l.on = live
+	if live {
+		l.s.streamsLive.Add(1)
+	} else {
+		l.s.streamsLive.Add(-1)
+	}
+}
+
 // reportTransportStatus logs stream liveness on a fixed interval until ctx is
 // canceled. The blue/green slots run with internal-only ingress, so a standby's
 // /v1/status is unreachable from CI or an operator's shell -- this log line is
@@ -566,8 +592,13 @@ func (s *EventSubscriber) subscribeContract(ctx context.Context, contract Contra
 	logger := s.logger.With("contract", contract.Address)
 	lastBlock := contract.StartBlock
 
+	// One liveness for the whole lifecycle — the WSS path and the polling
+	// fallback are the same stream, so a fallback must not double-count it.
+	live := &streamLiveness{s: s}
+	defer live.set(false)
+
 	if s.forcePolling {
-		return s.pollEvents(ctx, contract, &lastBlock, logger)
+		return s.pollEvents(ctx, contract, &lastBlock, logger, live)
 	}
 
 	if s.catchupWithPolling {
@@ -577,10 +608,10 @@ func (s *EventSubscriber) subscribeContract(ctx context.Context, contract Contra
 		logger.Info("catchup complete, switching to WSS", "last_block", lastBlock)
 	}
 
-	err := s.subscribeWSS(ctx, contract, &lastBlock, logger)
+	err := s.subscribeWSS(ctx, contract, &lastBlock, logger, live)
 	if err != nil && ctx.Err() == nil {
 		logger.Warn("WSS subscription failed, falling back to polling", "error", err)
-		return s.pollEvents(ctx, contract, &lastBlock, logger)
+		return s.pollEvents(ctx, contract, &lastBlock, logger, live)
 	}
 
 	return err
@@ -697,7 +728,7 @@ func (s *EventSubscriber) catchupIteration(ctx context.Context, contract Contrac
 // exponential backoff (1s → 30s). Falls back to polling after maxWSSDialFailures
 // consecutive dial failures or maxWSSSessionFailures consecutive session failures
 // (sessions that connect but drop without processing any events).
-func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSubscription, lastBlock *uint64, logger *slog.Logger) error {
+func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSubscription, lastBlock *uint64, logger *slog.Logger, live *streamLiveness) error {
 	backoff := minBackoff
 	consecutiveDialFails := 0
 	consecutiveSessionFails := 0
@@ -746,8 +777,11 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 
 		logger.Info("WSS subscription active", "from_block", *lastBlock)
 
-		// Process events until session error.
+		// Process events until session error. Live only for the session's
+		// duration: the reconnect backoff below reads as not-live.
+		live.set(true)
 		eventsProcessed, err := s.processWSSEvents(ctx, session, lastBlock, logger)
+		live.set(false)
 		session.close()
 
 		if ctx.Err() != nil {
@@ -864,7 +898,7 @@ func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSess
 
 // pollEvents implements the HTTP polling fallback with adaptive timing:
 // 100ms when catching up, 2s at chain tip.
-func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubscription, lastBlock *uint64, logger *slog.Logger) error {
+func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubscription, lastBlock *uint64, logger *slog.Logger, live *streamLiveness) error {
 	logger.Info("starting polling fallback", "from_block", *lastBlock)
 
 	for {
@@ -887,6 +921,8 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 		latestBlock, err := s.tipBlockNumber(rpcCtx)
 		cancel()
 		if err != nil {
+			// A poller that cannot read the tip cannot show it is current.
+			live.set(false)
 			<-s.sem
 			logger.Warn("failed to get block number", "error", err)
 			select {
@@ -897,6 +933,12 @@ func (s *EventSubscriber) pollEvents(ctx context.Context, contract ContractSubsc
 				continue
 			}
 		}
+
+		// A poller holds no session, so "live" means following the tip: within
+		// the same threshold the catch-up phase stops at. Without this, polling
+		// transports (force_polling, or a WSS fallback) could never read as
+		// caught up, and a promote gate would block on them forever.
+		live.set(*lastBlock+catchupThreshold >= latestBlock)
 
 		// At chain tip — release and wait before polling again.
 		if *lastBlock > latestBlock {
