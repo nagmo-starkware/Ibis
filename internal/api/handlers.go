@@ -180,6 +180,29 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// handleCatchupStatus answers "is this instance streaming, or still
+// backfilling?" and nothing else. It exists separately from /v1/status because
+// a promote gate has to poll it: /v1/status serialises every contract, which on
+// a large deployment is ~10MB per request, while this reads only in-memory
+// counters and touches no store. Exempt from the ready gate, so a slot that is
+// still starting up answers instead of 503-ing -- a gate cannot distinguish
+// "not caught up" from "unreachable" if the endpoint stays silent.
+//
+// Always 200: "still catching up" is a valid, healthy answer. Callers gate on
+// catchup_complete rather than on the status code.
+func (s *Server) handleCatchupStatus(w http.ResponseWriter, _ *http.Request) {
+	var live, total int64
+	if s.engine != nil {
+		live, total = s.engine.TransportStatus()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ready":            s.ready.Load(),
+		"streams_live":     live,
+		"streams_total":    total,
+		"catchup_complete": total > 0 && live == total,
+	})
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	cursors, err := s.store.GetAllCursors(r.Context())
 	if err != nil {
