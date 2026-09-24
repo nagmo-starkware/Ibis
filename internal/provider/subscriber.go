@@ -1050,12 +1050,21 @@ func (s *EventSubscriber) resolveTimestamps(ctx context.Context, events []RawEve
 // and sends them to the events channel. Uses configurable block-range chunking
 // (default: 100 blocks per query) with continuation token pagination.
 func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscription, fromBlock, toBlock uint64) error {
+	_, err := s.backfillFrom(ctx, contract, fromBlock, toBlock)
+	return err
+}
+
+// backfillFrom is Backfill, additionally returning the first block it did NOT
+// fully deliver — toBlock+1 on success. Chunks before that point have already
+// been sent to the engine, so a caller retrying after a failure must resume
+// there: restarting from fromBlock would re-deliver them as duplicates.
+func (s *EventSubscriber) backfillFrom(ctx context.Context, contract ContractSubscription, fromBlock, toBlock uint64) (uint64, error) {
 	logger := s.logger.With("contract", contract.Address, "action", "backfill")
 	logger.Info("starting backfill", "from", fromBlock, "to", toBlock)
 
 	for current := fromBlock; current <= toBlock; {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return current, ctx.Err()
 		}
 
 		end := current + s.blocksPerQuery - 1
@@ -1073,7 +1082,7 @@ func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscri
 		})
 		cancel()
 		if err != nil {
-			return fmt.Errorf("backfill events [%d, %d]: %w", current, end, err)
+			return current, fmt.Errorf("backfill events [%d, %d]: %w", current, end, err)
 		}
 
 		// Enrich events with block timestamps.
@@ -1085,7 +1094,7 @@ func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscri
 			select {
 			case s.events <- evt:
 			case <-ctx.Done():
-				return ctx.Err()
+				return current, ctx.Err()
 			}
 		}
 
@@ -1094,5 +1103,5 @@ func (s *EventSubscriber) Backfill(ctx context.Context, contract ContractSubscri
 	}
 
 	logger.Info("backfill complete", "from", fromBlock, "to", toBlock)
-	return nil
+	return toBlock + 1, nil
 }
