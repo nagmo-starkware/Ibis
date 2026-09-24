@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -892,6 +893,55 @@ func TestReadTipAndSeedSeedsKeysSubStartedMidRead(t *testing.T) {
 	}
 	if got := st.cursor(addr.String()); got != 1001 {
 		t.Fatalf("keys-sub cursor = %d, want 1001: the late-started stream was never seeded", got)
+	}
+}
+
+// TestKeysStreamGapFillLogsRepeatedLateJoins: contracts joining on pass after
+// pass keep the gap-fill repeating. It must end once they stop, and say so
+// while they don't, since the stream is not live meanwhile.
+func TestKeysStreamGapFillLogsRepeatedLateJoins(t *testing.T) {
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	var calls atomic.Int64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			// The first three passes each gain a contract seeded below the tip.
+			if n := calls.Add(1); n <= 3 {
+				late := newTestFelt(0x1A70 + uint64(n))
+				st.setFill(late.String(), ContractSubscription{Address: late})
+				st.setCursor(late.String(), 980, true)
+			}
+			return uint64(1000), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	server := mockRPCServer(t, handlers)
+	defer server.Close()
+	var logs syncBuffer
+	p, err := New(context.Background(), server.URL, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer p.Close()
+	sub := p.NewSubscriber(nil, make(chan RawEvent, 8), &SubscriberConfig{
+		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)},
+	})
+	sub.provider.tipIntervalNanos.Store(1) // every tip read reaches the handler
+
+	known := newTestFelt(0xFA51)
+	st.setFill(known.String(), ContractSubscription{Address: known})
+	st.setCursor(known.String(), 995, true)
+
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("gap-fill errored: %v", err)
+	}
+	if resume > 980 {
+		t.Errorf("resume = %d, past the late contracts' cursor 980", resume)
+	}
+	if !strings.Contains(logs.String(), "a contract joined mid-pass") {
+		t.Error("repeating for a late contract logged nothing")
 	}
 }
 
