@@ -217,6 +217,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]any{
+		// NOTE: this is the MIN cursor across contracts that have indexed at
+		// least one event, so it is pinned by the most dormant contract and
+		// barely moves. It is a data-floor, NOT a catch-up signal — read
+		// "transport" below to tell whether this instance is actually current.
 		"current_block": globalCursor,
 		// Alias of current_block. promote-ibis.sh's parity check reads this
 		// name; the field never existed, so every promote silently fell through
@@ -224,6 +228,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"indexed_block_number": globalCursor,
 		"ready":                s.ready.Load(),
 		"contracts":            contracts,
+	}
+
+	// Stream liveness: the signal a blue/green promote gate needs. live < total
+	// means some stream is still gap-filling, so the contracts it covers are
+	// stale even though the instance is ready and serving.
+	if s.engine != nil {
+		live, total, complete := s.engine.TransportStatus()
+		resp["transport"] = map[string]any{
+			"streams_live":     live,
+			"streams_total":    total,
+			"catchup_complete": complete,
+		}
 	}
 
 	// Add factory summary: child count, synced count, backfilling count.

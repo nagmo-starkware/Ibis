@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NethermindEth/juno/core/felt"
@@ -50,6 +51,12 @@ const (
 
 	// Blocks behind chain tip that triggers fast catchup polling.
 	catchupThreshold uint64 = 50
+
+	// transportStatusInterval is how often stream liveness is logged. See
+	// reportTransportStatus: on a standby slot this log is the only way to
+	// observe catch-up, so it has to be frequent enough to be useful to a
+	// promote gate without being chatty.
+	transportStatusInterval = 30 * time.Second
 
 	// Default number of blocks per polling query.
 	defaultBlocksPerQuery uint64 = 100
@@ -261,6 +268,14 @@ type EventSubscriber struct {
 
 	// dialWSS creates a WSS session. Override in tests.
 	dialWSS wssDialer
+
+	// streamsTotal counts running firehose-keys stream goroutines; streamsLive
+	// counts those currently holding a WSS subscription. A stream is NOT live
+	// while it is gap-filling, so live < total means some contracts are still
+	// backfilling and are not current -- the one fact a health check cannot
+	// otherwise see, since the process serves traffic happily throughout.
+	streamsTotal atomic.Int64
+	streamsLive  atomic.Int64
 
 	// sem bounds the number of goroutines that can execute RPC-heavy catchup or
 	// HTTP-polling iterations concurrently. See maxConcurrentCatchup.
@@ -503,6 +518,41 @@ func (s *EventSubscriber) RemoveContract(addressHex string) {
 // tipBlockNumber returns the current chain tip: from the provider's shared cache
 // when the tip poller is enabled (one RPC per interval, shared across contracts),
 // otherwise a direct per-poll BlockNumber call (legacy per-contract behavior).
+// TransportStatus reports how many firehose-keys streams are running and how
+// many currently hold a live WSS subscription. live == total means every
+// stream has finished gap-fill and is receiving events in real time. Anything
+// less means at least one stream is still backfilling, so the contracts it
+// covers are stale no matter how healthy the process looks from outside.
+// complete is computed HERE and nowhere else. It is the single fact a promote
+// gate blocks on, and it was previously spelled out independently by the log
+// reporter below and by the API layer — two copies that must agree forever, in
+// different packages, with nothing to keep them honest.
+func (s *EventSubscriber) TransportStatus() (live, total int64, complete bool) {
+	live, total = s.streamsLive.Load(), s.streamsTotal.Load()
+	return live, total, total > 0 && live == total
+}
+
+// reportTransportStatus logs stream liveness on a fixed interval until ctx is
+// canceled. The blue/green slots run with internal-only ingress, so a standby's
+// /v1/status is unreachable from CI or an operator's shell -- this log line is
+// the only catch-up signal readable off a slot that is not yet serving.
+func (s *EventSubscriber) reportTransportStatus(ctx context.Context) {
+	ticker := time.NewTicker(transportStatusInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			live, total, complete := s.TransportStatus()
+			s.logger.Info("transport status",
+				"streams_live", live,
+				"streams_total", total,
+				"catchup_complete", complete)
+		}
+	}
+}
+
 func (s *EventSubscriber) tipBlockNumber(ctx context.Context) (uint64, error) {
 	if s.sharedTipPoller {
 		return s.provider.CachedBlockNumber(ctx)
