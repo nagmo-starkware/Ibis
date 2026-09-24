@@ -234,11 +234,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// means some stream is still gap-filling, so the contracts it covers are
 	// stale even though the instance is ready and serving.
 	if s.engine != nil {
-		live, total := s.engine.TransportStatus()
+		live, total, complete := s.engine.TransportStatus()
 		resp["transport"] = map[string]any{
 			"streams_live":     live,
 			"streams_total":    total,
-			"catchup_complete": total > 0 && live == total,
+			"catchup_complete": complete,
 		}
 	}
 

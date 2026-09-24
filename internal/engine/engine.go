@@ -1463,9 +1463,9 @@ func (e *Engine) InjectContractForTest(cc *config.ContractConfig, schemas map[st
 // TransportStatus proxies the subscriber's stream liveness to the API, so
 // /v1/status can answer "is this instance actually streaming, or still
 // backfilling?" — a question no readiness flag or cursor number can answer.
-func (e *Engine) TransportStatus() (live, total int64) {
+func (e *Engine) TransportStatus() (live, total int64, complete bool) {
 	if e.subscriber == nil {
-		return 0, 0
+		return 0, 0, false
 	}
 	return e.subscriber.TransportStatus()
 }

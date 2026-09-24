@@ -675,8 +675,8 @@ func TestTransportStatusTracksStreamLiveness(t *testing.T) {
 	)
 	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
 
-	if live, total := sub.TransportStatus(); live != 0 || total != 0 {
-		t.Fatalf("before start: live=%d total=%d, want 0/0", live, total)
+	if live, total, complete := sub.TransportStatus(); live != 0 || total != 0 || complete {
+		t.Fatalf("before start: live=%d total=%d complete=%v, want 0/0/false", live, total, complete)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -687,8 +687,8 @@ func TestTransportStatusTracksStreamLiveness(t *testing.T) {
 	const wantStreams = 2
 	deadline := time.After(2 * time.Second)
 	for {
-		live, total := sub.TransportStatus()
-		if total == wantStreams && live == wantStreams {
+		live, total, complete := sub.TransportStatus()
+		if total == wantStreams && live == wantStreams && complete {
 			break
 		}
 		select {

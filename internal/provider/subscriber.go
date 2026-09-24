@@ -523,8 +523,13 @@ func (s *EventSubscriber) RemoveContract(addressHex string) {
 // stream has finished gap-fill and is receiving events in real time. Anything
 // less means at least one stream is still backfilling, so the contracts it
 // covers are stale no matter how healthy the process looks from outside.
-func (s *EventSubscriber) TransportStatus() (live, total int64) {
-	return s.streamsLive.Load(), s.streamsTotal.Load()
+// complete is computed HERE and nowhere else. It is the single fact a promote
+// gate blocks on, and it was previously spelled out independently by the log
+// reporter below and by the API layer — two copies that must agree forever, in
+// different packages, with nothing to keep them honest.
+func (s *EventSubscriber) TransportStatus() (live, total int64, complete bool) {
+	live, total = s.streamsLive.Load(), s.streamsTotal.Load()
+	return live, total, total > 0 && live == total
 }
 
 // reportTransportStatus logs stream liveness on a fixed interval until ctx is
@@ -539,11 +544,11 @@ func (s *EventSubscriber) reportTransportStatus(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			live, total := s.TransportStatus()
+			live, total, complete := s.TransportStatus()
 			s.logger.Info("transport status",
 				"streams_live", live,
 				"streams_total", total,
-				"catchup_complete", total > 0 && live == total)
+				"catchup_complete", complete)
 		}
 	}
 }
