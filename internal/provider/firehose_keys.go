@@ -447,8 +447,9 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 // store -- so the caller must retry, never proceed.
 func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) (uint64, error) {
 	var prev uint64
+	var prevFills int
 	for pass := 1; ; pass++ {
-		minLast := s.keysStreamGapFillPass(ctx, st)
+		minLast, fills := s.keysStreamGapFillPass(ctx, st)
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
@@ -474,12 +475,20 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 		// catchup losing the race with the chain, and more passes cannot win
 		// it -- checking only that the cursor moved would spin forever there.
 		behind := tip - minLast
-		if pass > 1 && behind >= prev {
+		//
+		// ...but only when both passes covered the same set. addContractKeysFirehose
+		// registers children mid-flight, each seeded at its deploy block —
+		// potentially millions of blocks back. A pass that picks one up does more
+		// work, runs longer, and lets the early finishers go staler, so its gap
+		// can grow for an entirely healthy reason. Treating that as divergence
+		// would take down the keys-sub of an indexer that merely discovered a new
+		// option token. When the set grows, re-baseline instead of comparing.
+		if pass > 1 && fills <= prevFills && behind >= prev {
 			return 0, fmt.Errorf(
-				"gap-fill is not converging: %d blocks behind after pass %d (was %d): "+
-					"catchup is not outrunning the chain", behind, pass, prev)
+				"gap-fill is not converging: %d blocks behind after pass %d (was %d, %d fills): "+
+					"catchup is not outrunning the chain", behind, pass, prev, fills)
 		}
-		prev = behind
+		prev, prevFills = behind, fills
 
 		s.logger.Info("firehose-keys gap-fill still behind tip; repeating",
 			"stream", st.label, "pass", pass, "resume_block", minLast,
@@ -488,16 +497,21 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 }
 
 // keysStreamGapFillPass runs one gap-fill fan-out over st's current fill set and
-// returns the min cursor across them. Mirrors firehoseGapFill, scoped to one
-// stream's own fills and own cursors.
-func (s *EventSubscriber) keysStreamGapFillPass(ctx context.Context, st *firehoseKeysStream) uint64 {
+// returns the min cursor across them, plus the size of the set it fanned out
+// over. Mirrors firehoseGapFill, scoped to one stream's own fills and own
+// cursors.
+//
+// The count is returned rather than re-read by the caller because the set is
+// mutable — addContractKeysFirehose registers children mid-flight — so a
+// separate snapshot could disagree with the one this pass actually used.
+func (s *EventSubscriber) keysStreamGapFillPass(ctx context.Context, st *firehoseKeysStream) (uint64, int) {
 	fills := st.snapshotFills()
 	if len(fills) == 0 {
 		bn, err := s.tipBlockNumber(ctx)
 		if err != nil {
-			return 0
+			return 0, 0
 		}
-		return bn
+		return bn, 0
 	}
 
 	var wg sync.WaitGroup
@@ -526,11 +540,11 @@ func (s *EventSubscriber) keysStreamGapFillPass(ctx context.Context, st *firehos
 	if minLast == math.MaxUint64 {
 		bn, err := s.tipBlockNumber(ctx)
 		if err != nil {
-			return 0
+			return 0, len(fills)
 		}
-		return bn
+		return bn, len(fills)
 	}
-	return minLast
+	return minLast, len(fills)
 }
 
 // processKeysStream reads one stream's session until it errors or ctx is

@@ -511,3 +511,59 @@ func TestKeysStreamGapFillNeverReturnsAStaleResume(t *testing.T) {
 		t.Errorf("resume = %d on failure; must be 0 so no caller can subscribe with it", resume)
 	}
 }
+
+// TestKeysStreamGapFillToleratesFillSetGrowth: addContractKeysFirehose registers
+// children mid-flight, each seeded at its deploy block. A pass that picks one up
+// does more work, runs longer, and leaves the early finishers staler — so its
+// gap GROWS for an entirely healthy reason. The divergence guard must not read
+// that as "catchup is losing to the chain", or an indexer that merely discovered
+// a new option token would tear down its own keys-sub.
+func TestKeysStreamGapFillToleratesFillSetGrowth(t *testing.T) {
+	var tip atomic.Uint64
+	tip.Store(1000)
+	var calls atomic.Int64
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	late := newTestFelt(0x1A7E)
+
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			return tip.Load(), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			n := calls.Add(1)
+			// A child is discovered while pass 1 is running. Pass 1 already took
+			// its snapshot, so the child first appears in pass 2 — at block 0.
+			if n == 3 {
+				st.setFill(late.String(), ContractSubscription{Address: late})
+				st.setCursor(late.String(), 0, true)
+			}
+			// The chain moves through passes 1 and 2, then settles so pass 3 can
+			// converge. The first call is exempt so the fast fill sees the start.
+			if n >= 2 && n <= 80 {
+				tip.Add(50)
+			}
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	sub.provider.tipIntervalNanos.Store(1) // serve every tip read fresh
+
+	fast := newTestFelt(0xFA51)
+	st.setFill(fast.String(), ContractSubscription{Address: fast})
+	st.setCursor(fast.String(), 950, true)
+	slow := newTestFelt(0x5104)
+	st.setFill(slow.String(), ContractSubscription{Address: slow})
+	st.setCursor(slow.String(), 0, true)
+
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("gap-fill failed after a child joined mid-flight — the set grew, so the "+
+			"larger gap is expected and must not count as divergence: %v", err)
+	}
+	if final := tip.Load(); resume+catchupThreshold < final {
+		t.Fatalf("resume block %d is %d behind tip %d; want within %d",
+			resume, final-resume, final, catchupThreshold)
+	}
+}

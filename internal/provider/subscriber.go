@@ -51,7 +51,6 @@ const (
 	// Blocks behind chain tip that triggers fast catchup polling.
 	catchupThreshold uint64 = 50
 
-
 	// Default number of blocks per polling query.
 	defaultBlocksPerQuery uint64 = 100
 
