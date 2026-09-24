@@ -448,6 +448,7 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) (uint64, error) {
 	var prev uint64
 	var prevFills int
+	var regrowths int // consecutive passes excused from the guard by growth
 	for pass := 1; ; pass++ {
 		minLast, fills := s.keysStreamGapFillPass(ctx, st)
 		if ctx.Err() != nil {
@@ -456,7 +457,14 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 
 		// A tip we cannot read is not evidence of convergence. Treating it as
 		// such is how a resume block from an hour ago looks acceptable.
-		tip, err := s.tipBlockNumber(ctx)
+		//
+		// Deliberately UNCACHED. This is the one read that decides whether it is
+		// safe to subscribe, and s.tipBlockNumber goes through CachedBlockNumber
+		// on this transport — which, when the RPC fails, returns the last cached
+		// tip with a nil error, however stale. A stale, low tip makes a lagging
+		// cursor look converged and hands WSS a resume block outside the replay
+		// window. One direct RPC per pass is negligible next to the pass itself.
+		tip, err := s.provider.BlockNumber(ctx)
 		if err != nil {
 			return 0, fmt.Errorf("reading chain tip after gap-fill pass %d: %w", pass, err)
 		}
@@ -483,10 +491,25 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 		// can grow for an entirely healthy reason. Treating that as divergence
 		// would take down the keys-sub of an indexer that merely discovered a new
 		// option token. When the set grows, re-baseline instead of comparing.
-		if pass > 1 && fills <= prevFills && behind >= prev {
+		if gapFillDiverging(pass, fills, prevFills, behind, prev) {
 			return 0, fmt.Errorf(
 				"gap-fill is not converging: %d blocks behind after pass %d (was %d, %d fills): "+
 					"catchup is not outrunning the chain", behind, pass, prev, fills)
+		}
+		// Growth is excused, but not silently. get_or_deploy is permissionless by
+		// design, so anyone can grow the set, and set growth that outpaces the
+		// passes keeps this loop re-baselining forever: the stream never goes
+		// live, catchup_complete stays false, and a promote gate blocks. That is
+		// the safe failure — nothing is reported current that is not — but it
+		// must be distinguishable from ordinary catch-up, hence a WARN with a
+		// consecutive count an operator can alert on.
+		if gapFillRegrew(pass, fills, prevFills, behind, prev) {
+			regrowths++
+			s.logger.Warn("firehose-keys gap-fill set grew mid-pass; re-baselining instead of failing",
+				"stream", st.label, "pass", pass, "fills", fills, "prev_fills", prevFills,
+				"behind", behind, "prev_behind", prev, "consecutive_regrowths", regrowths)
+		} else {
+			regrowths = 0
 		}
 		prev, prevFills = behind, fills
 
@@ -494,6 +517,26 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 			"stream", st.label, "pass", pass, "resume_block", minLast,
 			"tip", tip, "behind", tip-minLast)
 	}
+}
+
+// gapFillDiverging reports whether a COMPLETED gap-fill pass shows catchup
+// losing to the chain: the gap failed to shrink across two passes over a set
+// that did not grow. A set that shrank (a contract removed) does less work, so a
+// non-shrinking gap there is divergence too.
+//
+// Kept as a pure function so the comparison is table-tested directly. An
+// end-to-end test cannot reach this reliably: when catchup genuinely loses, it
+// loses INSIDE a pass (pollUntilCaughtUp is unbounded), so this guard only ever
+// sees the narrower finished-but-regressed case.
+func gapFillDiverging(pass, fills, prevFills int, behind, prevBehind uint64) bool {
+	return pass > 1 && fills <= prevFills && behind >= prevBehind
+}
+
+// gapFillRegrew reports the case gapFillDiverging deliberately excuses: the gap
+// did not shrink, but the set grew, which explains the extra work. The loop
+// re-baselines instead of failing, and logs it.
+func gapFillRegrew(pass, fills, prevFills int, behind, prevBehind uint64) bool {
+	return pass > 1 && fills > prevFills && behind >= prevBehind
 }
 
 // keysStreamGapFillPass runs one gap-fill fan-out over st's current fill set and
