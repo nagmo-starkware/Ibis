@@ -122,7 +122,8 @@ func (s *Server) Start(ctx context.Context) error {
 // from "unreachable" if the endpoint answers.
 func (s *Server) readyGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.ready.Load() && r.URL.Path != "/v1/health" && r.URL.Path != "/v1/status" {
+		if !s.ready.Load() && r.URL.Path != "/v1/health" && r.URL.Path != "/v1/status" &&
+			r.URL.Path != "/v1/catchup_status" {
 			writeError(w, http.StatusServiceUnavailable, "indexer is still starting up")
 			return
 		}
@@ -134,6 +135,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// System endpoints.
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("GET /v1/status", s.handleStatus)
+	mux.HandleFunc("GET /v1/catchup_status", s.handleCatchupStatus)
 
 	// Admin endpoints for dynamic contract management.
 	mux.HandleFunc("POST /v1/admin/contracts", s.adminAuth(s.handleAdminRegisterContract))

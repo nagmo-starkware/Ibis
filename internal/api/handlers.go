@@ -180,6 +180,54 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// transportStatus is the stream-liveness view, served both nested under
+// "transport" by /v1/status and flat by /v1/catchup_status. Defined once
+// because the two must agree on what "caught up" means: a promote gate reads
+// the second to decide whether to flip a slot, and an operator reads the first
+// to understand why it did.
+type transportStatus struct {
+	StreamsLive     int64 `json:"streams_live"`
+	StreamsTotal    int64 `json:"streams_total"`
+	CatchupComplete bool  `json:"catchup_complete"`
+}
+
+// transportStatus reads stream liveness from the engine. With no engine wired
+// it reports zero streams, which is NOT caught up — an instance that is not
+// indexing must never satisfy a gate.
+func (s *Server) transportStatus() transportStatus {
+	if s.engine == nil {
+		return transportStatus{}
+	}
+	live, total, complete := s.engine.TransportStatus()
+	return transportStatus{
+		StreamsLive:     live,
+		StreamsTotal:    total,
+		CatchupComplete: complete,
+	}
+}
+
+// handleCatchupStatus answers "is this instance streaming, or still
+// backfilling?" and nothing else. It exists separately from /v1/status because
+// a promote gate has to poll it: /v1/status serialises every contract, which on
+// a large deployment is ~10MB per request, while this reads only in-memory
+// counters and touches no store. Exempt from the ready gate, so a slot that is
+// still starting up answers instead of 503-ing -- a gate cannot distinguish
+// "not caught up" from "unreachable" if the endpoint stays silent.
+//
+// Always 200: "still catching up" is a valid, healthy answer. Callers gate on
+// catchup_complete rather than on the status code.
+func (s *Server) handleCatchupStatus(w http.ResponseWriter, _ *http.Request) {
+	// Embedded, so the liveness fields sit flat alongside "ready" rather than
+	// nested — this is the probe payload, not a report.
+	writeJSON(w, http.StatusOK, struct {
+		Ready bool `json:"ready"`
+		transportStatus
+	}{
+		Ready:           s.ready.Load(),
+		transportStatus: s.transportStatus(),
+	})
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	cursors, err := s.store.GetAllCursors(r.Context())
 	if err != nil {
@@ -233,14 +281,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// Stream liveness: the signal a blue/green promote gate needs. live < total
 	// means some stream is still gap-filling, so the contracts it covers are
 	// stale even though the instance is ready and serving.
-	if s.engine != nil {
-		live, total, complete := s.engine.TransportStatus()
-		resp["transport"] = map[string]any{
-			"streams_live":     live,
-			"streams_total":    total,
-			"catchup_complete": complete,
-		}
-	}
+	resp["transport"] = s.transportStatus()
 
 	// Add factory summary: child count, synced count, backfilling count.
 	if s.engine != nil {
