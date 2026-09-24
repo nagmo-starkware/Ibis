@@ -272,6 +272,8 @@ func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
 		"child_transfer_streams", childStreamCount,
 	)
 
+	go s.reportTransportStatus(ctx)
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -355,6 +357,9 @@ func (s *EventSubscriber) rollbackAllStreams(startBlock uint64) {
 // cursor across its fills, and forwards matching events until the session
 // drops.
 func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehoseKeysStream) error {
+	s.streamsTotal.Add(1)
+	defer s.streamsTotal.Add(-1)
+
 	backoff := minBackoff
 	for {
 		if ctx.Err() != nil {
@@ -410,7 +415,12 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 		backoff = minBackoff
 		s.logger.Info("firehose-keys WSS active", "stream", st.label, "from_block", fromBlock)
 
+		// Live only for the duration of the session: gap-fill above and the
+		// reconnect backoff below both count as not-live, which is exactly
+		// what a promote gate needs to distinguish from "serving fine".
+		s.streamsLive.Add(1)
 		err = s.processKeysStream(ctx, st, session)
+		s.streamsLive.Add(-1)
 		session.close()
 		if ctx.Err() != nil {
 			return ctx.Err()

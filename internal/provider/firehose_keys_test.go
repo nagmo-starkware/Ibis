@@ -644,3 +644,58 @@ func TestKeysStreamGapFillErrorsOnUnreadableTip(t *testing.T) {
 		t.Errorf("resume = %d on failure; must be 0", resume)
 	}
 }
+
+// TestTransportStatusTracksStreamLiveness: readiness and cursor numbers both
+// report healthy while a stream is still gap-filling, which is how a standby
+// gets promoted before it is current. TransportStatus must distinguish the two:
+// a stream counts as live only once it holds a WSS subscription.
+func TestTransportStatusTracksStreamLiveness(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return 120, nil },
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	server := mockRPCServer(t, handlers)
+	defer server.Close()
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer p.Close()
+
+	events := make(chan RawEvent, 64)
+	sub := p.NewSubscriber(
+		[]ContractSubscription{
+			{Address: newTestFelt(0xA), StartBlock: 100, Wildcard: true},  // keys-sub only
+			{Address: newTestFelt(0xB), StartBlock: 100, Wildcard: false}, // its own address-sub
+		},
+		events,
+		&SubscriberConfig{KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}},
+	)
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+
+	if live, total := sub.TransportStatus(); live != 0 || total != 0 {
+		t.Fatalf("before start: live=%d total=%d, want 0/0", live, total)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go sub.Start(ctx)
+
+	// keys-sub + one address-sub for the static token.
+	const wantStreams = 2
+	deadline := time.After(2 * time.Second)
+	for {
+		live, total := sub.TransportStatus()
+		if total == wantStreams && live == wantStreams {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("streams never went live: live=%d total=%d, want %d/%d",
+				live, total, wantStreams, wantStreams)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
