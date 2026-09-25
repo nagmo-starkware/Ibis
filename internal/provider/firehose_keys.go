@@ -91,7 +91,8 @@ type firehoseKeysStream struct {
 	fills   map[string]ContractSubscription
 
 	// seedMu makes a new fill's tip read + seed atomic with fillBehind.
-	seedMu sync.Mutex
+	// Registrations share it (read lock); fillBehind takes it exclusively.
+	seedMu sync.RWMutex
 }
 
 func newFirehoseKeysStream(label string, address *felt.Felt, keys [][]*felt.Felt) *firehoseKeysStream {
@@ -809,16 +810,18 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 // readTipAndSeed reads the tip and seeds sub's keys-sub fill to forward from
 // just past it (from StartBlock if later, or if the tip is unreadable).
 func (s *EventSubscriber) readTipAndSeed(ctx context.Context, sub ContractSubscription) (tip, wssFrom uint64, err error) {
-	s.streamsMu.Lock()
-	keysStream := s.keysStream
-	s.streamsMu.Unlock()
+	keysStream := s.currentKeysStream()
 	if keysStream != nil {
 		// See fillBehind: the tip read and the seed must land together.
-		keysStream.seedMu.Lock()
-		defer keysStream.seedMu.Unlock()
+		keysStream.seedMu.RLock()
+		defer keysStream.seedMu.RUnlock()
 	}
 
-	tip, err = s.tipBlockNumber(ctx)
+	// Bounded: fillBehind waits on this read while it holds seedMu.
+	tctx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
+	tip, err = s.tipBlockNumber(tctx)
+	cancel()
+
 	wssFrom = sub.StartBlock
 	if err == nil && tip+1 > wssFrom {
 		wssFrom = tip + 1
@@ -827,6 +830,12 @@ func (s *EventSubscriber) readTipAndSeed(ctx context.Context, sub ContractSubscr
 		s.seedKeysStreamFill(keysStream, sub.Address.String(), sub, wssFrom)
 	}
 	return tip, wssFrom, err
+}
+
+func (s *EventSubscriber) currentKeysStream() *firehoseKeysStream {
+	s.streamsMu.Lock()
+	defer s.streamsMu.Unlock()
+	return s.keysStream
 }
 
 // removeContractKeysFirehose freezes a contract on the firehose-keys
