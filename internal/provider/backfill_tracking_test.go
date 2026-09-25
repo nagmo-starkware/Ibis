@@ -16,19 +16,9 @@ import (
 // chunkEvent is one event at the first block of a getEvents query's range, so
 // every chunk a backfill fetches yields exactly one identifiable event.
 func chunkEvent(params json.RawMessage) map[string]interface{} {
-	// Positional JSON-RPC params: [{"from_block":{"block_number":N}, ...}].
-	var p []struct {
-		FromBlock struct {
-			BlockNumber uint64 `json:"block_number"`
-		} `json:"from_block"`
-	}
-	var from uint64
-	if json.Unmarshal(params, &p) == nil && len(p) == 1 {
-		from = p[0].FromBlock.BlockNumber
-	}
 	return map[string]interface{}{
 		"events": []map[string]interface{}{{
-			"block_number":     from,
+			"block_number":     fromBlockOf(params),
 			"block_hash":       "0x1",
 			"transaction_hash": "0x2",
 			"from_address":     "0xc0ffee",
@@ -36,6 +26,20 @@ func chunkEvent(params json.RawMessage) map[string]interface{} {
 			"data":             []string{"0x5"},
 		}},
 	}
+}
+
+// fromBlockOf reads from_block out of a getEvents query's params.
+func fromBlockOf(params json.RawMessage) uint64 {
+	// Positional JSON-RPC params: [{"from_block":{"block_number":N}, ...}].
+	var p []struct {
+		FromBlock struct {
+			BlockNumber uint64 `json:"block_number"`
+		} `json:"from_block"`
+	}
+	if json.Unmarshal(params, &p) == nil && len(p) == 1 {
+		return p[0].FromBlock.BlockNumber
+	}
+	return 0
 }
 
 func newBackfillSub(t *testing.T, getEvents func(json.RawMessage) (interface{}, error)) (*EventSubscriber, chan RawEvent, func()) {
@@ -169,4 +173,46 @@ func TestBackfillCancelledOnRemoval(t *testing.T) {
 
 	sub.RemoveContract(addr.String())
 	waitPending(t, sub, 0, 3*time.Second)
+}
+
+// TestBackfillReAddSupersedesInFlight: re-adding a contract cancels its earlier
+// backfill, and that attempt's cleanup must not delete the newer entry — else
+// RemoveContract could no longer cancel it. Each attempt releases exactly once.
+func TestBackfillReAddSupersedesInFlight(t *testing.T) {
+	release := make(chan struct{})
+	sub, _, cleanup := newBackfillSub(t, func(params json.RawMessage) (interface{}, error) {
+		if fromBlockOf(params) < 500 {
+			return nil, errors.New("rpc down") // first attempt retries until cancelled
+		}
+		<-release // hold the second attempt in flight
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+	// Unblock the held handler even on failure, or cleanup's server.Close hangs.
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+
+	addr := newTestFelt(0xC0FFEE)
+	sub.reserveBackfill()
+	sub.launchReservedBackfill(context.Background(), ContractSubscription{Address: addr}, 0, 350)
+	sub.reserveBackfill()
+	sub.launchReservedBackfill(context.Background(), ContractSubscription{Address: addr}, 500, 550)
+
+	// The superseded attempt exits and releases; the second is still running.
+	waitPending(t, sub, 1, 3*time.Second)
+	sub.backfillMu.Lock()
+	tracked := sub.backfills[addr.String()] != nil
+	sub.backfillMu.Unlock()
+	if !tracked {
+		t.Fatal("superseded backfill's cleanup deleted the newer entry")
+	}
+
+	unblock()
+	waitPending(t, sub, 0, 3*time.Second)
+	sub.backfillMu.Lock()
+	defer sub.backfillMu.Unlock()
+	if n := len(sub.backfills); n != 0 {
+		t.Errorf("%d backfill entries left after both attempts finished", n)
+	}
 }

@@ -76,7 +76,7 @@ func TestCatchupStatusAnswersWhileNotReady(t *testing.T) {
 	}
 
 	body := getJSON(t, ts, "/v1/catchup_status")
-	for _, k := range []string{"ready", "streams_live", "streams_total", "catchup_complete"} {
+	for _, k := range []string{"ready", "streams_live", "streams_total", "backfills_pending", "catchup_complete"} {
 		if _, ok := body[k]; !ok {
 			t.Errorf("catchup_status must expose %q - the promote gate reads it", k)
 		}
