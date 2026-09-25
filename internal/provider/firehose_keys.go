@@ -373,15 +373,19 @@ func (s *EventSubscriber) rollbackAllStreams(startBlock uint64) {
 	// Taken before listing the streams: a registration creates its ERC20
 	// child under the keys-sub's read lock, so the list either includes that
 	// child or the registration has not read its tip yet.
+	// Held only for the listing and the keys-sub's own rollback; the other
+	// streams don't need it.
 	ks := s.currentKeysStream()
 	if ks != nil {
 		ks.seedMu.Lock()
-		defer ks.seedMu.Unlock()
 	}
-	for _, st := range s.allKeysFirehoseStreams() {
-		if st == ks {
-			st.rollbackSeedLocked(startBlock)
-		} else {
+	streams := s.allKeysFirehoseStreams()
+	if ks != nil {
+		ks.rollbackSeedLocked(startBlock)
+		ks.seedMu.Unlock()
+	}
+	for _, st := range streams {
+		if st != ks {
 			st.rollback(startBlock)
 		}
 	}
