@@ -454,3 +454,49 @@ func TestBackfillRetriesPastLaggingReplicaHead(t *testing.T) {
 		t.Fatal("the refused range was never delivered: the backfill gave up instead of retrying")
 	}
 }
+
+// TestResumeFloorAfterRollbackBindsLaggingTip: once a reorg lowers the floor,
+// the lowered floor still applies to a registration whose tip read lags it.
+func TestResumeFloorAfterRollbackBindsLaggingTip(t *testing.T) {
+	sub, st, maxTo, cleanup := floorFixture(t, func() (interface{}, error) { return uint64(750), nil })
+	defer cleanup()
+	sub.rollbackAllStreams(800)
+
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 700, Wildcard: true})
+	waitPending(t, sub, 0, 3*time.Second)
+
+	if got := st.cursor(addr.String()); got != 800 {
+		t.Errorf("cursor = %d, want the lowered floor 800 (lagging tip 750)", got)
+	}
+	if got := maxTo.Load(); got != 799 {
+		t.Errorf("backfill reached %d, want 799", got)
+	}
+}
+
+// TestResumeFloorSeedsERC20ChildWithoutTip: with the tip unreadable, an ERC20
+// child's own stream still starts at the floor alongside its keys-sub fill.
+func TestResumeFloorSeedsERC20ChildWithoutTip(t *testing.T) {
+	sub, st, maxTo, cleanup := floorFixture(t, func() (interface{}, error) { return nil, errors.New("rpc unavailable") })
+	defer cleanup()
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 900, Wildcard: true, ERC20: true})
+	waitPending(t, sub, 0, 3*time.Second)
+
+	sub.streamsMu.Lock()
+	child := sub.addrStreams[addr.String()]
+	sub.streamsMu.Unlock()
+	if child == nil {
+		t.Fatal("no child Transfer/Approval stream was started")
+	}
+	if c, k := child.cursor(addr.String()), st.cursor(addr.String()); c != 1000 || k != 1000 {
+		t.Errorf("child cursor %d, keys-sub cursor %d; want both at the floor 1000", c, k)
+	}
+	if got := maxTo.Load(); got != 999 {
+		t.Errorf("backfill reached %d, want 999", got)
+	}
+}
