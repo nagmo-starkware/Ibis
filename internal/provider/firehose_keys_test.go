@@ -864,6 +864,37 @@ func TestReadTipAndSeedRegistrationsRunConcurrently(t *testing.T) {
 	}
 }
 
+// TestReadTipAndSeedSeedsKeysSubStartedMidRead: a registration that finds no
+// keys-sub, but sees one appear during its tip read, still seeds it — nothing
+// else would add it to that stream's fill set.
+func TestReadTipAndSeedSeedsKeysSubStartedMidRead(t *testing.T) {
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	var sub *EventSubscriber
+	var first atomic.Bool
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			if first.CompareAndSwap(false, true) { // the transport starts now
+				sub.streamsMu.Lock()
+				sub.keysStream = st
+				sub.streamsMu.Unlock()
+			}
+			return uint64(1000), nil
+		},
+	}
+	var cleanup func()
+	sub, _, cleanup = newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	sub.provider.tipIntervalNanos.Store(1)
+
+	addr := newTestFelt(0x1A7E)
+	if _, _, err := sub.readTipAndSeed(context.Background(), ContractSubscription{Address: addr}); err != nil {
+		t.Fatalf("readTipAndSeed: %v", err)
+	}
+	if got := st.cursor(addr.String()); got != 1001 {
+		t.Fatalf("keys-sub cursor = %d, want 1001: the late-started stream was never seeded", got)
+	}
+}
+
 // TestTransportStatusTracksStreamLiveness: readiness and cursor numbers both
 // report healthy while a stream is still gap-filling, which is how a standby
 // gets promoted before it is current. TransportStatus must distinguish the two:
