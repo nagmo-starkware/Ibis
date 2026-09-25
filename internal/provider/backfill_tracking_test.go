@@ -44,6 +44,13 @@ func fromBlockOf(params json.RawMessage) uint64 {
 
 func newBackfillSub(t *testing.T, getEvents func(json.RawMessage) (interface{}, error)) (*EventSubscriber, chan RawEvent, func()) {
 	t.Helper()
+	return newBackfillSubWith(t, &SubscriberConfig{
+		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)},
+	}, getEvents)
+}
+
+func newBackfillSubWith(t *testing.T, cfg *SubscriberConfig, getEvents func(json.RawMessage) (interface{}, error)) (*EventSubscriber, chan RawEvent, func()) {
+	t.Helper()
 	handlers := map[string]func(json.RawMessage) (interface{}, error){
 		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return uint64(1000), nil },
 		"starknet_getEvents":   getEvents,
@@ -59,9 +66,7 @@ func newBackfillSub(t *testing.T, getEvents func(json.RawMessage) (interface{}, 
 		t.Fatalf("New() error: %v", err)
 	}
 	events := make(chan RawEvent, 256)
-	sub := p.NewSubscriber(nil, events, &SubscriberConfig{
-		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)},
-	})
+	sub := p.NewSubscriber(nil, events, cfg)
 	return sub, events, func() { p.Close(); server.Close() }
 }
 
@@ -88,6 +93,10 @@ func TestBackfillHoldsCatchupIncompleteUntilDone(t *testing.T) {
 		return chunkEvent(params), nil
 	})
 	defer cleanup()
+	// Unblock the held handler even on failure, or cleanup's server.Close hangs.
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
 
 	// Pretend every stream is already live, so pending is the only variable.
 	sub.streamsTotal.Store(1)
@@ -106,7 +115,7 @@ func TestBackfillHoldsCatchupIncompleteUntilDone(t *testing.T) {
 		t.Fatalf("BackfillsPending = %d, want 1", got)
 	}
 
-	close(release)
+	unblock()
 	waitPending(t, sub, 0, 3*time.Second)
 	if _, _, complete := sub.TransportStatus(); !complete {
 		t.Fatal("catchup_complete still false after the backfill finished")
@@ -214,5 +223,40 @@ func TestBackfillReAddSupersedesInFlight(t *testing.T) {
 	defer sub.backfillMu.Unlock()
 	if n := len(sub.backfills); n != 0 {
 		t.Errorf("%d backfill entries left after both attempts finished", n)
+	}
+}
+
+// TestBackfillSharedFirehoseHoldsCatchupIncomplete: the shared-firehose
+// transport adds contracts through its own path, which must reserve and
+// release the pending count the same way.
+func TestBackfillSharedFirehoseHoldsCatchupIncomplete(t *testing.T) {
+	release := make(chan struct{})
+	sub, _, cleanup := newBackfillSubWith(t, &SubscriberConfig{SharedFirehose: true},
+		func(params json.RawMessage) (interface{}, error) {
+			<-release // hold the backfill in flight
+			return chunkEvent(params), nil
+		})
+	defer cleanup()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+
+	// The one shared stream is live, so pending is the only variable.
+	sub.streamsTotal.Store(1)
+	sub.streamsLive.Store(1)
+
+	// Tip is 1000, so [900, 1000] is backfilled.
+	sub.AddContract(context.Background(), ContractSubscription{Address: newTestFelt(0xC0FFEE), StartBlock: 900})
+	if got := sub.BackfillsPending(); got != 1 {
+		t.Fatalf("BackfillsPending = %d, want 1 while the backfill is in flight", got)
+	}
+	if _, _, complete := sub.TransportStatus(); complete {
+		t.Fatal("catchup_complete true while a dynamic backfill is in flight")
+	}
+
+	unblock()
+	waitPending(t, sub, 0, 3*time.Second)
+	if _, _, complete := sub.TransportStatus(); !complete {
+		t.Fatal("catchup_complete still false after the backfill finished")
 	}
 }
