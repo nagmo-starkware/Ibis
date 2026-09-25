@@ -1110,6 +1110,73 @@ func TestRollbackWaitsForInFlightSeedAndLowersEveryFloor(t *testing.T) {
 	}
 }
 
+// TestRollbackReachesERC20ChildRegisteredMidReorg: a reorg's rollback racing an
+// ERC20 registration must roll back the child stream it creates. It used to be
+// created after the seed's lock was released, so a rollback that had already
+// listed the streams missed it and left its cursor past the reorg.
+func TestRollbackReachesERC20ChildRegisteredMidReorg(t *testing.T) {
+	release := make(chan struct{})
+	inRead := make(chan struct{})
+	var first atomic.Bool
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			if first.CompareAndSwap(false, true) {
+				close(inRead)
+				<-release
+			}
+			return uint64(1000), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	sub.provider.tipIntervalNanos.Store(1)
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+	keys := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{sub.optionSelectors})
+	sub.streamsMu.Lock()
+	sub.keysStream = keys
+	sub.streamsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr := newTestFelt(0x1A7E)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 1500, Wildcard: true, ERC20: true})
+	}()
+	<-inRead
+	go func() { defer wg.Done(); sub.rollbackAllStreams(800) }()
+	waitWriterPending(t, keys)
+
+	unblock()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the registration or the rollback is still blocked")
+	}
+	sub.streamsMu.Lock()
+	child := sub.addrStreams[addr.String()]
+	sub.streamsMu.Unlock()
+	if child == nil {
+		t.Fatal("no child Transfer/Approval stream was started")
+	}
+	if got := child.cursor(addr.String()); got != 800 {
+		t.Errorf("child cursor = %d, want 800: the rollback missed the child", got)
+	}
+	if got := keys.cursor(addr.String()); got != 800 {
+		t.Errorf("keys-sub cursor = %d, want 800", got)
+	}
+}
+
 // TestReadTipAndSeedKeysSubStartedConcurrently: the mid-read keys-sub start,
 // driven from a separate goroutine as startKeysFirehose would.
 func TestReadTipAndSeedKeysSubStartedConcurrently(t *testing.T) {
