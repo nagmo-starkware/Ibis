@@ -145,6 +145,18 @@ func (st *firehoseKeysStream) removeFill(addrHex string) {
 	st.fillsMu.Unlock()
 }
 
+// fillBehind reports whether any fill's cursor is below block. After a pass,
+// only a fill registered past its snapshot can be: resuming at block would
+// skip its blocks in between.
+func (st *firehoseKeysStream) fillBehind(block uint64) bool {
+	for _, sub := range st.snapshotFills() {
+		if st.cursor(sub.Address.String()) < block {
+			return true
+		}
+	}
+	return false
+}
+
 // snapshotFills returns a shallow copy of the current fill set for iteration
 // without holding the lock across RPC calls.
 func (st *firehoseKeysStream) snapshotFills() []ContractSubscription {
@@ -512,10 +524,29 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 			return 0, fmt.Errorf("reading chain tip after gap-fill pass %d: %w", pass, err)
 		}
 
+		// Nothing to fill, so the guard below would only measure cache lag.
+		if fills == 0 {
+			if minLast == 0 {
+				return 0, fmt.Errorf("no cached tip in gap-fill pass %d", pass)
+			}
+			// The cached tip, not the fresh one: contracts are seeded from the
+			// cache, so resuming past it could skip a just-seeded contract.
+			resume := min(minLast, tip)
+			if !st.fillBehind(resume) {
+				return resume, nil
+			}
+			prev, prevFills = 0, 0
+			continue
+		}
+
 		// Converged once the laggard is within the same threshold the pass
-		// itself stops at.
+		// itself stops at -- unless a contract joined after the snapshot.
 		if minLast+catchupThreshold >= tip {
-			return minLast, nil
+			if !st.fillBehind(minLast) {
+				return minLast, nil
+			}
+			prev, prevFills = tip-minLast, fills
+			continue
 		}
 
 		// No fixed pass cap: a pass only has to cover the blocks the previous

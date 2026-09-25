@@ -645,6 +645,102 @@ func TestKeysStreamGapFillErrorsOnUnreadableTip(t *testing.T) {
 	}
 }
 
+// TestKeysStreamGapFillEmptySetConverges: with nothing to fill, the pass's
+// cursor is just the cached tip. A stale cache must not read as divergence —
+// resume from the cached tip, the one new contracts are seeded from.
+func TestKeysStreamGapFillEmptySetConverges(t *testing.T) {
+	var calls atomic.Int64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			// The first read primes the cache at 1000; the chain is really at 5000.
+			if calls.Add(1) == 1 {
+				return uint64(1000), nil
+			}
+			return uint64(5000), nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("empty fill set errored: %v", err)
+	}
+	if resume != 1000 {
+		t.Errorf("resume = %d, want the cached tip 1000", resume)
+	}
+}
+
+// TestKeysStreamGapFillEmptySetFillsLateContract: a contract registered after
+// an empty pass took its snapshot must still be covered from its own cursor,
+// not skipped by resuming at a tip past it.
+func TestKeysStreamGapFillEmptySetFillsLateContract(t *testing.T) {
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	late := newTestFelt(0x1A7E)
+	var tipCalls atomic.Int64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			// Registered during the first pass's tip read, after its snapshot,
+			// seeded below that tip.
+			if tipCalls.Add(1) == 1 {
+				st.setFill(late.String(), ContractSubscription{Address: late})
+				st.setCursor(late.String(), 990, true)
+			}
+			return uint64(1000), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("gap-fill errored: %v", err)
+	}
+	if resume > 990 {
+		t.Fatalf("resume = %d, past the late contract's cursor 990: its blocks would be skipped", resume)
+	}
+}
+
+// TestKeysStreamGapFillConvergedCoversLateContract: the same for a non-empty
+// set that converges on its first pass — a contract that joined after the
+// snapshot must not be left behind the resume block.
+func TestKeysStreamGapFillConvergedCoversLateContract(t *testing.T) {
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	late := newTestFelt(0x1A7E)
+	var tipCalls atomic.Int64
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			// The first read is inside the pass, after its snapshot.
+			if tipCalls.Add(1) == 1 {
+				st.setFill(late.String(), ContractSubscription{Address: late})
+				st.setCursor(late.String(), 980, true)
+			}
+			return uint64(1000), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	known := newTestFelt(0xFA51)
+	st.setFill(known.String(), ContractSubscription{Address: known})
+	st.setCursor(known.String(), 995, true)
+
+	resume, err := sub.keysStreamGapFill(context.Background(), st)
+	if err != nil {
+		t.Fatalf("gap-fill errored: %v", err)
+	}
+	if resume > 980 {
+		t.Fatalf("resume = %d, past the late contract's cursor 980: its blocks would be skipped", resume)
+	}
+}
+
 // TestTransportStatusTracksStreamLiveness: readiness and cursor numbers both
 // report healthy while a stream is still gap-filling, which is how a standby
 // gets promoted before it is current. TransportStatus must distinguish the two:
