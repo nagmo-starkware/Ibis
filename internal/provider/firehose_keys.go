@@ -773,36 +773,17 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 	// released if none is needed.
 	s.reserveBackfill()
 	s.trackContract(sub)
-	addrHex := sub.Address.String()
 
-	tip, err := s.tipBlockNumber(ctx)
+	tip, wssFrom, err := s.readTipAndSeed(ctx, sub)
 	if err != nil {
 		// No tip available: forward from StartBlock and skip backfill; the
 		// next gap-fill cycle (on stream reconnect) will reconcile.
-		s.streamsMu.Lock()
-		keysStream := s.keysStream
-		s.streamsMu.Unlock()
-		if keysStream != nil {
-			s.seedKeysStreamFill(keysStream, addrHex, sub, sub.StartBlock)
-		}
 		if sub.ERC20 {
-			st := s.newChildTransferStream(ctx, sub, sub.StartBlock)
+			st := s.newChildTransferStream(ctx, sub, wssFrom)
 			s.startKeysStream(st.runCtx, st, nil)
 		}
 		s.releaseBackfill() // seeded at StartBlock: gap-fill covers the history
 		return
-	}
-
-	wssFrom := tip + 1
-	if sub.StartBlock > wssFrom {
-		wssFrom = sub.StartBlock
-	}
-
-	s.streamsMu.Lock()
-	keysStream := s.keysStream
-	s.streamsMu.Unlock()
-	if keysStream != nil {
-		s.seedKeysStreamFill(keysStream, addrHex, sub, wssFrom)
 	}
 
 	if sub.ERC20 {
@@ -817,6 +798,24 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 		return
 	}
 	s.releaseBackfill() // starts after the tip: nothing historical to fetch
+}
+
+// readTipAndSeed reads the tip and seeds sub's keys-sub fill to forward from
+// just past it (from StartBlock if later, or if the tip is unreadable).
+func (s *EventSubscriber) readTipAndSeed(ctx context.Context, sub ContractSubscription) (tip, wssFrom uint64, err error) {
+	s.streamsMu.Lock()
+	keysStream := s.keysStream
+	s.streamsMu.Unlock()
+
+	tip, err = s.tipBlockNumber(ctx)
+	wssFrom = sub.StartBlock
+	if err == nil && tip+1 > wssFrom {
+		wssFrom = tip + 1
+	}
+	if keysStream != nil {
+		s.seedKeysStreamFill(keysStream, sub.Address.String(), sub, wssFrom)
+	}
+	return tip, wssFrom, err
 }
 
 // removeContractKeysFirehose freezes a contract on the firehose-keys
