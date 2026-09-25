@@ -515,6 +515,14 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 	var prev uint64
 	var prevFills int
 	var regrowths int // consecutive passes excused from the guard by growth
+	var lateJoins int // consecutive passes repeated for a contract that joined mid-pass
+	// Each repeat needs a new registration, so this ends once they stop; the
+	// count makes a sustained stream of them visible.
+	repeatForLateJoin := func(pass int, resume uint64) {
+		lateJoins++
+		s.logger.Info("firehose-keys gap-fill: a contract joined mid-pass; repeating before resuming",
+			"stream", st.label, "pass", pass, "resume_block", resume, "consecutive_late_joins", lateJoins)
+	}
 	for pass := 1; ; pass++ {
 		minLast, fills := s.keysStreamGapFillPass(ctx, st)
 		if ctx.Err() != nil {
@@ -546,6 +554,7 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 			if !st.fillBehind(resume) {
 				return resume, nil
 			}
+			repeatForLateJoin(pass, resume)
 			prev, prevFills = 0, 0
 			continue
 		}
@@ -556,6 +565,7 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 			if !st.fillBehind(minLast) {
 				return minLast, nil
 			}
+			repeatForLateJoin(pass, minLast)
 			prev, prevFills = tip-minLast, fills
 			continue
 		}
@@ -568,6 +578,7 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 		// catchup losing the race with the chain, and more passes cannot win
 		// it -- checking only that the cursor moved would spin forever there.
 		behind := tip - minLast
+		lateJoins = 0
 		//
 		// ...but only when both passes covered the same set. addContractKeysFirehose
 		// registers children mid-flight, each seeded at its deploy block —
