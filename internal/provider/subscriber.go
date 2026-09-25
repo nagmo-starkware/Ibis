@@ -52,10 +52,7 @@ const (
 	// Blocks behind chain tip that triggers fast catchup polling.
 	catchupThreshold uint64 = 50
 
-	// transportStatusInterval is how often stream liveness is logged. See
-	// reportTransportStatus: on a standby slot this log is the only way to
-	// observe catch-up, so it has to be frequent enough to be useful to a
-	// promote gate without being chatty.
+	// transportStatusInterval is how often stream liveness is logged.
 	transportStatusInterval = 30 * time.Second
 
 	// Default number of blocks per polling query.
@@ -263,6 +260,7 @@ type EventSubscriber struct {
 	keysFirehose        bool
 	optionSelectors     []*felt.Felt
 	sharedTipPoller     bool
+	statusInterval      time.Duration // transportStatusInterval; tests shorten it
 	tipPollInterval     time.Duration
 	catchupPollInterval time.Duration
 
@@ -399,6 +397,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		sharedTipPoller:     sharedTipPoller,
 		tipPollInterval:     tipInterval,
 		catchupPollInterval: catchupInterval,
+		statusInterval:      transportStatusInterval,
 		dialWSS:             defaultWSSDialer,
 		sem:                 make(chan struct{}, maxConcurrent),
 		cancels:             make(map[string]context.CancelFunc),
@@ -429,6 +428,9 @@ func (s *EventSubscriber) SetReorgChan(ch chan<- ReorgNotification) {
 // Start begins event subscription for all contracts. Blocks until ctx is canceled.
 // Each contract gets its own goroutine with independent WSS/polling lifecycle.
 func (s *EventSubscriber) Start(ctx context.Context) error {
+	// Before the transport branch, so every transport logs it.
+	go s.reportTransportStatus(ctx)
+
 	if s.sharedFirehose {
 		return s.startFirehose(ctx)
 	}
@@ -665,11 +667,9 @@ func (l *streamLiveness) set(live bool) {
 }
 
 // reportTransportStatus logs stream liveness on a fixed interval until ctx is
-// canceled. The blue/green slots run with internal-only ingress, so a standby's
-// /v1/status is unreachable from CI or an operator's shell -- this log line is
-// the only catch-up signal readable off a slot that is not yet serving.
+// canceled: the same numbers /v1/catchup_status serves, readable from logs.
 func (s *EventSubscriber) reportTransportStatus(ctx context.Context) {
-	ticker := time.NewTicker(transportStatusInterval)
+	ticker := time.NewTicker(s.statusInterval)
 	defer ticker.Stop()
 	for {
 		select {
