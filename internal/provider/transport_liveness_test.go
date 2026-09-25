@@ -215,3 +215,38 @@ func TestLivenessPerContractReleasesRemovedStream(t *testing.T) {
 	sub.RemoveContract(addr.String())
 	waitStreams(0, 0)
 }
+
+// TestStatusIntervalDefault: every other test shortens statusInterval, so pin
+// the production default — a zero value would panic NewTicker at Start.
+func TestStatusIntervalDefault(t *testing.T) {
+	server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){})
+	defer server.Close()
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer p.Close()
+	sub := p.NewSubscriber(nil, make(chan RawEvent, 1), &SubscriberConfig{})
+	if sub.statusInterval != transportStatusInterval {
+		t.Fatalf("statusInterval = %v, want %v", sub.statusInterval, transportStatusInterval)
+	}
+}
+
+// TestStreamLivenessCountsTransitionsOnce: set adjusts streamsLive once per
+// transition however often it is called, and a nil receiver is a no-op.
+func TestStreamLivenessCountsTransitionsOnce(t *testing.T) {
+	s := &EventSubscriber{}
+	l := &streamLiveness{s: s}
+	for _, step := range []struct {
+		live bool
+		want int64
+	}{{true, 1}, {true, 1}, {false, 0}, {false, 0}, {true, 1}} {
+		l.set(step.live)
+		if got := s.streamsLive.Load(); got != step.want {
+			t.Fatalf("after set(%v): streamsLive = %d, want %d", step.live, got, step.want)
+		}
+	}
+	var nilL *streamLiveness
+	nilL.set(true)
+	nilL.set(false)
+}

@@ -85,4 +85,10 @@ func TestEngineProxiesTransportStatus(t *testing.T) {
 			t.Fatalf("BackfillsPending = %d after the backfill finished, want 0", e.BackfillsPending())
 		}
 	}
+	live, total, complete = e.TransportStatus()
+	wantLive, wantTotal, wantComplete = e.subscriber.TransportStatus()
+	if live != wantLive || total != wantTotal || complete != wantComplete {
+		t.Fatalf("after the backfill: TransportStatus = %d/%d/%v, subscriber says %d/%d/%v",
+			live, total, complete, wantLive, wantTotal, wantComplete)
+	}
 }
