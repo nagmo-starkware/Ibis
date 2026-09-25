@@ -972,6 +972,108 @@ func TestAddContractKeysFirehoseNoTipSeedsAtStartBlock(t *testing.T) {
 	}
 }
 
+// TestReadTipAndSeedWriterPendingIsBounded: with a registration mid-read and
+// fillBehind waiting for it, a second registration queues behind the writer.
+// All three must finish once the first read returns — nothing deadlocks.
+func TestReadTipAndSeedWriterPendingIsBounded(t *testing.T) {
+	releaseA := make(chan struct{})
+	var calls atomic.Int64
+	aInside := make(chan struct{})
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			if calls.Add(1) == 1 {
+				close(aInside)
+				<-releaseA // registration A's slow tip read
+			}
+			return uint64(1000), nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	var once sync.Once
+	release := func() { once.Do(func() { close(releaseA) }) }
+	defer release() // before cleanup's server.Close
+	sub.provider.tipIntervalNanos.Store(1)
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	sub.streamsMu.Lock()
+	sub.keysStream = st
+	sub.streamsMu.Unlock()
+
+	var wg sync.WaitGroup
+	register := func(a uint64) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = sub.readTipAndSeed(context.Background(), ContractSubscription{Address: newTestFelt(a)})
+		}()
+	}
+	register(0xA1)
+	<-aInside
+	wg.Add(1)
+	go func() { defer wg.Done(); st.fillBehind(0) }()
+	time.Sleep(20 * time.Millisecond) // let fillBehind queue on the lock
+	register(0xB2)
+	time.Sleep(20 * time.Millisecond)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("%d tip reads while A held the read lock and a writer waited; want 1", n)
+	}
+
+	release()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("registrations or fillBehind still blocked after the slow read returned")
+	}
+	if got := st.cursor(newTestFelt(0xB2).String()); got != 1001 {
+		t.Errorf("queued registration's cursor = %d, want 1001", got)
+	}
+}
+
+// TestReadTipAndSeedKeysSubStartedConcurrently: the mid-read keys-sub start,
+// driven from a separate goroutine as startKeysFirehose would.
+func TestReadTipAndSeedKeysSubStartedConcurrently(t *testing.T) {
+	inRead := make(chan struct{})
+	proceed := make(chan struct{})
+	var first atomic.Bool
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			if first.CompareAndSwap(false, true) {
+				close(inRead)
+				<-proceed
+			}
+			return uint64(1000), nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(proceed) }) }
+	defer unblock()
+	sub.provider.tipIntervalNanos.Store(1)
+
+	addr := newTestFelt(0x1A7E)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := sub.readTipAndSeed(context.Background(), ContractSubscription{Address: addr})
+		done <- err
+	}()
+	<-inRead
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	sub.streamsMu.Lock()
+	sub.keysStream = st // the transport starts while the read is in flight
+	sub.streamsMu.Unlock()
+	unblock()
+
+	if err := <-done; err != nil {
+		t.Fatalf("readTipAndSeed: %v", err)
+	}
+	if got := st.cursor(addr.String()); got != 1001 {
+		t.Fatalf("keys-sub cursor = %d, want 1001", got)
+	}
+}
+
 // TestTransportStatusTracksStreamLiveness: readiness and cursor numbers both
 // report healthy while a stream is still gap-filling, which is how a standby
 // gets promoted before it is current. TransportStatus must distinguish the two:
