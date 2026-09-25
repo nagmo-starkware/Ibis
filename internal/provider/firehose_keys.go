@@ -89,6 +89,9 @@ type firehoseKeysStream struct {
 
 	fillsMu sync.Mutex
 	fills   map[string]ContractSubscription
+
+	// seedMu makes a new fill's tip read + seed atomic with fillBehind.
+	seedMu sync.Mutex
 }
 
 func newFirehoseKeysStream(label string, address *felt.Felt, keys [][]*felt.Felt) *firehoseKeysStream {
@@ -147,8 +150,11 @@ func (st *firehoseKeysStream) removeFill(addrHex string) {
 
 // fillBehind reports whether any fill's cursor is below block. After a pass,
 // only a fill registered past its snapshot can be: resuming at block would
-// skip its blocks in between.
+// skip its blocks in between. Under seedMu, a fill this misses reads its tip
+// afterwards, so it is seeded no lower than block.
 func (st *firehoseKeysStream) fillBehind(block uint64) bool {
+	st.seedMu.Lock()
+	defer st.seedMu.Unlock()
 	for _, sub := range st.snapshotFills() {
 		if st.cursor(sub.Address.String()) < block {
 			return true
@@ -806,6 +812,11 @@ func (s *EventSubscriber) readTipAndSeed(ctx context.Context, sub ContractSubscr
 	s.streamsMu.Lock()
 	keysStream := s.keysStream
 	s.streamsMu.Unlock()
+	if keysStream != nil {
+		// See fillBehind: the tip read and the seed must land together.
+		keysStream.seedMu.Lock()
+		defer keysStream.seedMu.Unlock()
+	}
 
 	tip, err = s.tipBlockNumber(ctx)
 	wssFrom = sub.StartBlock

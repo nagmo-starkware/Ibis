@@ -741,6 +741,86 @@ func TestKeysStreamGapFillConvergedCoversLateContract(t *testing.T) {
 	}
 }
 
+// TestKeysStreamGapFillWaitsForInFlightSeed: a contract mid-registration
+// (tip read, not yet seeded) holds seedMu, so the resume decision waits for it
+// instead of resuming past its cursor.
+func TestKeysStreamGapFillWaitsForInFlightSeed(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return uint64(1000), nil },
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	known := newTestFelt(0xFA51)
+	st.setFill(known.String(), ContractSubscription{Address: known})
+	st.setCursor(known.String(), 995, true)
+
+	st.seedMu.Lock() // a registration is between its tip read and its seed
+	type result struct {
+		resume uint64
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		r, err := sub.keysStreamGapFill(context.Background(), st)
+		done <- result{r, err}
+	}()
+	select {
+	case r := <-done:
+		st.seedMu.Unlock()
+		t.Fatalf("resume %d decided while a seed was in flight", r.resume)
+	case <-time.After(100 * time.Millisecond):
+	}
+	late := newTestFelt(0x1A7E)
+	st.setFill(late.String(), ContractSubscription{Address: late})
+	st.setCursor(late.String(), 980, true)
+	st.seedMu.Unlock()
+
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("gap-fill errored: %v", r.err)
+	}
+	if r.resume > 980 {
+		t.Fatalf("resume = %d, past the just-seeded cursor 980", r.resume)
+	}
+}
+
+// TestReadTipAndSeedHoldsSeedMu: the add path's tip read must happen under
+// seedMu, or a resume decision can slip in between it and the seed.
+func TestReadTipAndSeedHoldsSeedMu(t *testing.T) {
+	st := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	var unguarded atomic.Bool
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			if st.seedMu.TryLock() {
+				unguarded.Store(true)
+				st.seedMu.Unlock()
+			}
+			return uint64(1000), nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	sub.streamsMu.Lock()
+	sub.keysStream = st
+	sub.streamsMu.Unlock()
+
+	addr := newTestFelt(0x1A7E)
+	if _, _, err := sub.readTipAndSeed(context.Background(), ContractSubscription{Address: addr}); err != nil {
+		t.Fatalf("readTipAndSeed: %v", err)
+	}
+	if unguarded.Load() {
+		t.Fatal("tip read ran without seedMu held")
+	}
+	if got := st.cursor(addr.String()); got != 1001 {
+		t.Errorf("seeded cursor = %d, want 1001", got)
+	}
+}
+
 // TestTransportStatusTracksStreamLiveness: readiness and cursor numbers both
 // report healthy while a stream is still gap-filling, which is how a standby
 // gets promoted before it is current. TransportStatus must distinguish the two:
