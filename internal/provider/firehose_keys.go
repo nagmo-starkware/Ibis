@@ -93,6 +93,9 @@ type firehoseKeysStream struct {
 	// seedMu makes a new fill's tip read + seed atomic with fillBehind.
 	// Registrations share it (read lock); fillBehind takes it exclusively.
 	seedMu sync.RWMutex
+	// resumeFloor is the last resume block fillBehind committed to, under
+	// seedMu. A fill seeded after it must not start below it.
+	resumeFloor uint64
 }
 
 func newFirehoseKeysStream(label string, address *felt.Felt, keys [][]*felt.Felt) *firehoseKeysStream {
@@ -151,8 +154,8 @@ func (st *firehoseKeysStream) removeFill(addrHex string) {
 
 // fillBehind reports whether any fill's cursor is below block. After a pass,
 // only a fill registered past its snapshot can be: resuming at block would
-// skip its blocks in between. Under seedMu, a fill this misses reads its tip
-// afterwards, so it is seeded no lower than block.
+// skip its blocks in between. If none is, block becomes the resume floor, so
+// a fill this misses is seeded no lower than it (see readTipAndSeed).
 func (st *firehoseKeysStream) fillBehind(block uint64) bool {
 	st.seedMu.Lock()
 	defer st.seedMu.Unlock()
@@ -161,6 +164,7 @@ func (st *firehoseKeysStream) fillBehind(block uint64) bool {
 			return true
 		}
 	}
+	st.resumeFloor = block
 	return false
 }
 
@@ -781,7 +785,7 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 	s.reserveBackfill()
 	s.trackContract(sub)
 
-	tip, wssFrom, err := s.readTipAndSeed(ctx, sub)
+	_, wssFrom, err := s.readTipAndSeed(ctx, sub)
 	if err != nil {
 		// No tip available: forward from StartBlock and skip backfill; the
 		// next gap-fill cycle (on stream reconnect) will reconcile.
@@ -798,10 +802,11 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 		s.startKeysStream(st.runCtx, st, nil)
 	}
 
-	if sub.StartBlock <= tip {
+	// Up to wssFrom, not tip: the resume floor can put wssFrom past the tip.
+	if sub.StartBlock < wssFrom {
 		backfillSub := sub
 		backfillSub.Keys = nil // no filter: one fetch covers both event classes
-		s.launchReservedBackfill(ctx, backfillSub, sub.StartBlock, tip)
+		s.launchReservedBackfill(ctx, backfillSub, sub.StartBlock, wssFrom-1)
 		return
 	}
 	s.releaseBackfill() // starts after the tip: nothing historical to fetch
@@ -828,6 +833,11 @@ func (s *EventSubscriber) readTipAndSeed(ctx context.Context, sub ContractSubscr
 		wssFrom = sub.StartBlock
 		if err == nil && tip+1 > wssFrom {
 			wssFrom = tip + 1
+		}
+		// A lagging replica's tip can sit below the block the keys-sub already
+		// resumed from, and it would never deliver the blocks in between.
+		if err == nil && keysStream != nil && keysStream.resumeFloor > wssFrom {
+			wssFrom = keysStream.resumeFloor
 		}
 		if keysStream != nil {
 			s.seedKeysStreamFill(keysStream, sub.Address.String(), sub, wssFrom)
