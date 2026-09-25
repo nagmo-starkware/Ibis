@@ -131,10 +131,15 @@ func (st *firehoseKeysStream) cursor(addrHex string) uint64 {
 // session is about to redeliver.
 func (st *firehoseKeysStream) rollback(startBlock uint64) {
 	st.seedMu.Lock() // before mu, as in fillBehind
+	defer st.seedMu.Unlock()
+	st.rollbackSeedLocked(startBlock)
+}
+
+// rollbackSeedLocked is rollback for a caller already holding seedMu.
+func (st *firehoseKeysStream) rollbackSeedLocked(startBlock uint64) {
 	if st.resumeFloor > startBlock {
 		st.resumeFloor = startBlock
 	}
-	st.seedMu.Unlock()
 
 	st.mu.Lock()
 	for addr, c := range st.cursors {
@@ -365,8 +370,20 @@ func (s *EventSubscriber) allKeysFirehoseStreams() []*firehoseKeysStream {
 // that haven't seen it yet on their own WSS session) must reprocess the
 // orphaned range.
 func (s *EventSubscriber) rollbackAllStreams(startBlock uint64) {
+	// Taken before listing the streams: a registration creates its ERC20
+	// child under the keys-sub's read lock, so the list either includes that
+	// child or the registration has not read its tip yet.
+	ks := s.currentKeysStream()
+	if ks != nil {
+		ks.seedMu.Lock()
+		defer ks.seedMu.Unlock()
+	}
 	for _, st := range s.allKeysFirehoseStreams() {
-		st.rollback(startBlock)
+		if st == ks {
+			st.rollbackSeedLocked(startBlock)
+		} else {
+			st.rollback(startBlock)
+		}
 	}
 }
 
@@ -807,12 +824,15 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 
 	// With no tip, wssFrom is StartBlock (the next gap-fill covers the history)
 	// or the resume floor (the backfill below covers up to it).
-	_, wssFrom, _ := s.readTipAndSeed(ctx, sub)
-
+	var childFrom func(wssFrom uint64)
 	if sub.ERC20 {
-		st := s.newChildTransferStream(ctx, sub, wssFrom)
-		s.startKeysStream(st.runCtx, st, nil)
+		// Inside the seed's lock, so a reorg rollback cannot miss the child.
+		childFrom = func(wssFrom uint64) {
+			st := s.newChildTransferStream(ctx, sub, wssFrom)
+			s.startKeysStream(st.runCtx, st, nil)
+		}
 	}
+	_, wssFrom, _ := s.seedFromTip(ctx, sub, childFrom)
 
 	// Up to wssFrom, not tip: the resume floor can put wssFrom past the tip.
 	if sub.StartBlock < wssFrom {
@@ -827,6 +847,12 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 // readTipAndSeed reads the tip and seeds sub's keys-sub fill to forward from
 // just past it (from StartBlock if later, or if the tip is unreadable).
 func (s *EventSubscriber) readTipAndSeed(ctx context.Context, sub ContractSubscription) (tip, wssFrom uint64, err error) {
+	return s.seedFromTip(ctx, sub, nil)
+}
+
+// seedFromTip is readTipAndSeed, also running then(wssFrom), if non-nil,
+// before the keys-sub's lock is released.
+func (s *EventSubscriber) seedFromTip(ctx context.Context, sub ContractSubscription, then func(wssFrom uint64)) (tip, wssFrom uint64, err error) {
 	for {
 		keysStream := s.currentKeysStream()
 		if keysStream != nil {
@@ -854,6 +880,11 @@ func (s *EventSubscriber) readTipAndSeed(ctx context.Context, sub ContractSubscr
 		}
 		if keysStream != nil {
 			s.seedKeysStreamFill(keysStream, sub.Address.String(), sub, wssFrom)
+		}
+		if then != nil {
+			then(wssFrom)
+		}
+		if keysStream != nil {
 			keysStream.seedMu.RUnlock()
 		}
 		return tip, wssFrom, err
