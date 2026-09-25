@@ -500,3 +500,32 @@ func TestResumeFloorSeedsERC20ChildWithoutTip(t *testing.T) {
 		t.Errorf("backfill reached %d, want 999", got)
 	}
 }
+
+// TestResumeFloorAfterRollbackSeedsERC20ChildAtFloor: all three together — a
+// rollback-lowered floor, a readable tip lagging below it, and an ERC20 child.
+// The child's stream and its keys-sub fill both start at the lowered floor.
+func TestResumeFloorAfterRollbackSeedsERC20ChildAtFloor(t *testing.T) {
+	sub, st, maxTo, cleanup := floorFixture(t, func() (interface{}, error) { return uint64(750), nil })
+	defer cleanup()
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+	sub.rollbackAllStreams(800)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 700, Wildcard: true, ERC20: true})
+	waitPending(t, sub, 0, 3*time.Second)
+
+	sub.streamsMu.Lock()
+	child := sub.addrStreams[addr.String()]
+	sub.streamsMu.Unlock()
+	if child == nil {
+		t.Fatal("no child Transfer/Approval stream was started")
+	}
+	if c, k := child.cursor(addr.String()), st.cursor(addr.String()); c != 800 || k != 800 {
+		t.Errorf("child cursor %d, keys-sub cursor %d; want both at the lowered floor 800", c, k)
+	}
+	if got := maxTo.Load(); got != 799 {
+		t.Errorf("backfill reached %d, want 799", got)
+	}
+}
