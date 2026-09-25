@@ -1203,6 +1203,95 @@ func TestRollbackReleasesKeysSubBeforeOtherStreams(t *testing.T) {
 	<-done
 }
 
+// TestAddContractERC20ChildCreatedOnceAcrossMidReadRetry: when the keys-sub
+// starts during an ERC20 registration's tip read, the step is redone under its
+// lock — and the child stream is still created exactly once, seeded there.
+func TestAddContractERC20ChildCreatedOnceAcrossMidReadRetry(t *testing.T) {
+	inRead := make(chan struct{})
+	proceed := make(chan struct{})
+	var first atomic.Bool
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
+			if first.CompareAndSwap(false, true) {
+				close(inRead)
+				<-proceed
+			}
+			return uint64(1000), nil
+		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(proceed) }) }
+	defer unblock()
+	sub.provider.tipIntervalNanos.Store(1)
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+
+	var created atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr := newTestFelt(0x1A7E)
+	done := make(chan struct{})
+	go func() {
+		sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 1500, Wildcard: true, ERC20: true})
+		close(done)
+	}()
+	<-inRead
+	keys := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{sub.optionSelectors})
+	sub.streamsMu.Lock()
+	sub.keysStream = keys // the transport starts mid-read
+	sub.streamsMu.Unlock()
+	unblock()
+	<-done
+
+	sub.streamsMu.Lock()
+	for a := range sub.addrStreams {
+		if a == addr.String() {
+			created.Add(1)
+		}
+	}
+	child := sub.addrStreams[addr.String()]
+	sub.streamsMu.Unlock()
+	if child == nil || created.Load() != 1 {
+		t.Fatalf("child streams for the contract = %d, want exactly 1", created.Load())
+	}
+	if got := keys.cursor(addr.String()); got != 1500 {
+		t.Errorf("keys-sub cursor = %d, want 1500: the retry never seeded the late keys-sub", got)
+	}
+}
+
+// TestAddContractERC20ChildWithoutKeysSub: with no keys-sub at all, an ERC20
+// registration still creates its child stream, seeded as before.
+func TestAddContractERC20ChildWithoutKeysSub(t *testing.T) {
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return uint64(1000), nil },
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	sub, _, cleanup := newKeysFirehoseSub(t, handlers)
+	defer cleanup()
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 1500, Wildcard: true, ERC20: true})
+
+	sub.streamsMu.Lock()
+	child := sub.addrStreams[addr.String()]
+	sub.streamsMu.Unlock()
+	if child == nil {
+		t.Fatal("no child Transfer/Approval stream without a keys-sub")
+	}
+	if got := child.cursor(addr.String()); got != 1500 {
+		t.Errorf("child cursor = %d, want 1500", got)
+	}
+}
+
 // TestReadTipAndSeedKeysSubStartedConcurrently: the mid-read keys-sub start,
 // driven from a separate goroutine as startKeysFirehose would.
 func TestReadTipAndSeedKeysSubStartedConcurrently(t *testing.T) {
