@@ -387,3 +387,70 @@ func TestResumeFloorAppliesWithoutTip(t *testing.T) {
 		t.Errorf("backfill reached %d, want 999", got)
 	}
 }
+
+// TestResumeFloorSeedsERC20ChildAtFloor: an ERC20 child's own Transfer/Approval
+// stream starts where its keys-sub fill does, so the one shared backfill up to
+// floor-1 covers both event classes without a gap.
+func TestResumeFloorSeedsERC20ChildAtFloor(t *testing.T) {
+	sub, st, maxTo, cleanup := floorFixture(t, func() (interface{}, error) { return uint64(970), nil })
+	defer cleanup()
+	sub.dialWSS = mockWSSDialerKeyed(nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := newTestFelt(0x1A7E)
+	sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 900, Wildcard: true, ERC20: true})
+	waitPending(t, sub, 0, 3*time.Second)
+
+	sub.streamsMu.Lock()
+	child := sub.addrStreams[addr.String()]
+	sub.streamsMu.Unlock()
+	if child == nil {
+		t.Fatal("no child Transfer/Approval stream was started")
+	}
+	if c, k := child.cursor(addr.String()), st.cursor(addr.String()); c != 1000 || k != 1000 {
+		t.Errorf("child cursor %d, keys-sub cursor %d; want both at the floor 1000", c, k)
+	}
+	if got := maxTo.Load(); got != 999 {
+		t.Errorf("backfill reached %d, want 999", got)
+	}
+}
+
+// TestBackfillRetriesPastLaggingReplicaHead: a backfill up to the floor can hit
+// a replica that has not produced those blocks yet. It must keep retrying and
+// finish once the replica catches up, not give up or skip the tail.
+func TestBackfillRetriesPastLaggingReplicaHead(t *testing.T) {
+	var head atomic.Uint64
+	head.Store(950)
+	var refused atomic.Bool
+	sub, events, cleanup := newBackfillSub(t, func(params json.RawMessage) (interface{}, error) {
+		var p []struct {
+			ToBlock struct {
+				BlockNumber uint64 `json:"block_number"`
+			} `json:"to_block"`
+		}
+		if json.Unmarshal(params, &p) == nil && len(p) == 1 && p[0].ToBlock.BlockNumber > head.Load() {
+			refused.Store(true)
+			head.Store(1000) // caught up by the retry
+			return nil, errors.New("block not found")
+		}
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+
+	sub.reserveBackfill()
+	sub.launchReservedBackfill(context.Background(), ContractSubscription{Address: newTestFelt(0xC0FFEE)}, 900, 999)
+	waitPending(t, sub, 0, 5*time.Second) // retry backoff is minBackoff (1s)
+	if !refused.Load() {
+		t.Fatal("the replica never refused a block past its head; the test is not exercising a retry")
+	}
+	// [900, 999] is one chunk, so exactly one event, at 900, once it lands.
+	select {
+	case e := <-events:
+		if e.BlockNumber != 900 {
+			t.Errorf("delivered block %d, want 900", e.BlockNumber)
+		}
+	default:
+		t.Fatal("the refused range was never delivered: the backfill gave up instead of retrying")
+	}
+}
