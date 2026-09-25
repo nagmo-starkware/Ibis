@@ -391,6 +391,8 @@ func (s *EventSubscriber) startKeysStream(ctx context.Context, st *firehoseKeysS
 // cursor across its fills, and forwards matching events until the session
 // drops.
 func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehoseKeysStream) error {
+	live := &streamLiveness{s: s}
+	defer live.set(false)
 	backoff := minBackoff
 	for {
 		if ctx.Err() != nil {
@@ -449,9 +451,9 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 		// Live only for the duration of the session: gap-fill above and the
 		// reconnect backoff below both count as not-live, which is exactly
 		// what a promote gate needs to distinguish from "serving fine".
-		s.streamsLive.Add(1)
+		live.set(true)
 		err = s.processKeysStream(ctx, st, session)
-		s.streamsLive.Add(-1)
+		live.set(false)
 		session.close()
 		if ctx.Err() != nil {
 			return ctx.Err()
