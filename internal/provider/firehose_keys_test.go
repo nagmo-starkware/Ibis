@@ -1177,6 +1177,32 @@ func TestRollbackReachesERC20ChildRegisteredMidReorg(t *testing.T) {
 	}
 }
 
+// TestRollbackReleasesKeysSubBeforeOtherStreams: the keys-sub's write lock
+// covers the listing and its own rollback only, so a registration is not held
+// up while every other stream rolls back.
+func TestRollbackReleasesKeysSubBeforeOtherStreams(t *testing.T) {
+	sub, _, cleanup := newKeysFirehoseSub(t, nil)
+	defer cleanup()
+	keys := newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{{newTestFelt(0x999)}})
+	token := newFirehoseKeysStream("token", newTestFelt(0x70C), [][]*felt.Felt{{newTestFelt(0x1)}})
+	sub.streamsMu.Lock()
+	sub.keysStream = keys
+	sub.addrStreams[newTestFelt(0x70C).String()] = token
+	sub.streamsMu.Unlock()
+
+	token.seedMu.RLock() // another stream's rollback is stuck behind a reader
+	done := make(chan struct{})
+	go func() { sub.rollbackAllStreams(800); close(done) }()
+	waitWriterPending(t, token) // the rollback has reached the token stream
+	if !keys.seedMu.TryRLock() {
+		token.seedMu.RUnlock()
+		t.Fatal("the keys-sub's lock is still held while another stream rolls back")
+	}
+	keys.seedMu.RUnlock()
+	token.seedMu.RUnlock()
+	<-done
+}
+
 // TestReadTipAndSeedKeysSubStartedConcurrently: the mid-read keys-sub start,
 // driven from a separate goroutine as startKeysFirehose would.
 func TestReadTipAndSeedKeysSubStartedConcurrently(t *testing.T) {
