@@ -377,6 +377,7 @@ func (e *Engine) registerSharedDiscoveredChild(ctx context.Context, dc *config.D
 	}
 
 	cc.Dynamic = true
+	e.markBackfill(cc)
 
 	registry := abi.NewEventRegistry(contractABI)
 
@@ -450,7 +451,7 @@ func (e *Engine) registerSharedDiscoveredChild(ctx context.Context, dc *config.D
 			}
 		}
 
-		e.subscriber.AddContract(e.runCtx, sub)
+		e.addSubscription(sub)
 	}
 
 	// Start view polling for this contract if it has views configured.

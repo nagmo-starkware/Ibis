@@ -243,11 +243,6 @@ type SubscriberConfig struct {
 	// SharedFirehose. When false, the subscriber uses direct per-poll BlockNumber
 	// (legacy behavior).
 	SharedTipPoller bool
-
-	// OnBackfillDone, if set, is called (from the backfill goroutine, holding
-	// no subscriber lock) with a contract's address hex after its backfill
-	// completes successfully. Not called for cancelled backfills.
-	OnBackfillDone func(addressHex string)
 }
 
 // EventSubscriber manages per-contract event subscriptions with automatic
@@ -287,7 +282,6 @@ type EventSubscriber struct {
 	backfillsPending atomic.Int64
 	backfillMu       sync.Mutex
 	backfills        map[string]*trackedBackfill // by address hex
-	onBackfillDone   func(addressHex string)
 
 	// sem bounds the number of goroutines that can execute RPC-heavy catchup or
 	// HTTP-polling iterations concurrently. See maxConcurrentCatchup.
@@ -415,9 +409,6 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		dialSharedWS: func(ctx context.Context, wsURL string) (*rpc.WsProvider, error) {
 			return rpc.NewWebsocketProvider(ctx, wsURL)
 		},
-	}
-	if cfg != nil {
-		sub.onBackfillDone = cfg.OnBackfillDone
 	}
 	// Firehose-keys multiplexes all address-subs onto one shared socket (see
 	// multiplexKeysDialer); other transports keep the one-socket-per-dial
@@ -600,9 +591,15 @@ func (s *EventSubscriber) BackfillTarget(addressHex string) (to uint64, ok bool)
 	return 0, false
 }
 
+// ToTip, as a backfill's `to`, means the chain tip, read by the backfill itself
+// (retried like its fetches) rather than by the caller.
+const ToTip = math.MaxUint64
+
 // BackfillBackground fetches [from, to] for sub over HTTP with no live stream,
-// in the background, counted as pending until it succeeds (retried until then). Transport-independent: it only needs the provider
-// and the events channel. Used to finish the history of a frozen contract.
+// in the background, counted as pending until it succeeds (retried until then).
+// Transport-independent: it only needs the provider and the events channel.
+// Used to finish a contract's history after a restart or a freeze. On success
+// it sends a BackfillDone event after the last backfill event.
 func (s *EventSubscriber) BackfillBackground(ctx context.Context, sub ContractSubscription, from, to uint64) {
 	s.reserveBackfill()
 	s.launchReservedBackfill(ctx, sub, from, to)
@@ -653,7 +650,6 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 
 	go func() {
 		defer s.releaseBackfill()
-		succeeded := false
 		defer func() {
 			s.backfillMu.Lock()
 			if s.backfills[addrHex] == tb {
@@ -661,20 +657,29 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 			}
 			s.backfillMu.Unlock()
 			cancel()
-			// After the untrack, so a BackfillTarget that still sees it is
-			// guaranteed to be followed by this call.
-			if succeeded && s.onBackfillDone != nil {
-				s.onBackfillDone(addrHex)
-			}
 		}()
 
 		next := from
 		backoff := minBackoff
 		for attempt := 1; ; attempt++ {
 			var err error
-			next, err = s.backfillFrom(bctx, sub, next, to)
+			if to == ToTip {
+				var tip uint64
+				if tip, err = s.tipBlockNumber(bctx); err == nil {
+					to = tip
+				}
+			}
 			if err == nil {
-				succeeded = bctx.Err() == nil
+				next, err = s.backfillFrom(bctx, sub, next, to)
+			}
+			if err == nil {
+				// In-band, behind the last backfill event: the consumer sees
+				// it only once those are processed. Sent before the untrack,
+				// so a backfill no longer tracked has already signalled.
+				select {
+				case s.events <- RawEvent{ContractAddress: sub.Address, BackfillDone: true}:
+				case <-bctx.Done():
+				}
 				return
 			}
 			if bctx.Err() != nil {
