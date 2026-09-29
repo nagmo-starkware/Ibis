@@ -673,10 +673,16 @@ func (e *Engine) persistContract(ctx context.Context, cs *contractState) {
 // completeBackfill handles a backfill's in-band completion: every event it
 // delivered has been processed, so the history is complete. Looked up by
 // address among the CURRENT contracts, so a deregistered one is ignored.
-func (e *Engine) completeBackfill(ctx context.Context, addr *felt.Felt) {
+func (e *Engine) completeBackfill(ctx context.Context, addr *felt.Felt, gen uint64) {
 	cs := e.findContractByAddress(addr)
 	if cs == nil {
 		return
+	}
+	// A newer backfill owns the marker: this completion is stale.
+	if e.subscriber != nil {
+		if cur, ok := e.subscriber.TrackedBackfillGen(addr.String()); ok && cur != gen {
+			return
+		}
 	}
 	e.mu.Lock()
 	marked, dynamic := cs.config.BackfillTo != 0, cs.config.Dynamic
@@ -1552,7 +1558,7 @@ func (e *Engine) eventLoop(ctx context.Context) error {
 			}
 
 			if event.BackfillDone {
-				e.completeBackfill(ctx, event.ContractAddress)
+				e.completeBackfill(ctx, event.ContractAddress, event.BackfillGen)
 				continue
 			}
 
