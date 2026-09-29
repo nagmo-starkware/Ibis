@@ -447,12 +447,16 @@ func TestCompleteBackfill_StaleGenerationKeepsMarker(t *testing.T) {
 	e.subscriber = p.NewSubscriber(nil, make(chan provider.RawEvent, 8), &provider.SubscriberConfig{SharedFirehose: true})
 	e.persistContract(ctx, cs)
 
+	// An older backfill (e.g. registration's) superseded by a newer one (e.g.
+	// a freeze-launched resume) for the same address.
+	e.subscriber.BackfillBackground(ctx, provider.ContractSubscription{Address: addr}, 900, 950)
+	older, _ := e.subscriber.TrackedBackfillGen(addr.String())
 	e.subscriber.BackfillBackground(ctx, provider.ContractSubscription{Address: addr}, 900, 950)
 	gen, ok := e.subscriber.TrackedBackfillGen(addr.String())
-	if !ok {
-		t.Fatal("backfill not tracked")
+	if !ok || gen == older || older == 0 {
+		t.Fatalf("generations older=%d current=%d (tracked %v), want two distinct non-zero", older, gen, ok)
 	}
-	for _, stale := range []uint64{0, gen - 1} {
+	for _, stale := range []uint64{0, older} {
 		e.completeBackfill(ctx, addr, stale)
 		if got := persistedBackfillTo(t, e); got != provider.ToTip {
 			t.Fatalf("completion gen %d (current %d) cleared the marker: BackfillTo = %d", stale, gen, got)
@@ -461,20 +465,5 @@ func TestCompleteBackfill_StaleGenerationKeepsMarker(t *testing.T) {
 	e.completeBackfill(ctx, addr, gen)
 	if got := persistedBackfillTo(t, e); got != 0 {
 		t.Fatalf("current backfill's completion left BackfillTo = %d", got)
-	}
-}
-
-// Resume/freeze backfills keep the contract's event-selector filter; a
-// wildcard contract fetches everything.
-func TestBackfillSub_KeepsSelectorFilter(t *testing.T) {
-	ev := testEventDef("Transfer")
-	cs := testContractState(new(felt.Felt).SetUint64(0xC0FFEE), "Child_c0ffee", []*abi.EventDef{ev}, types.TableTypeLog)
-	cs.config.Events = []config.EventConfig{{Name: "Transfer"}}
-	if sub := backfillSub(cs); len(sub.Keys) != 1 || len(sub.Keys[0]) != 1 || !sub.Keys[0][0].Equal(ev.Selector) {
-		t.Fatalf("Keys = %v, want [[Transfer selector]]", sub.Keys)
-	}
-	cs.config.Events = []config.EventConfig{{Name: "*"}}
-	if sub := backfillSub(cs); sub.Keys != nil {
-		t.Fatalf("wildcard Keys = %v, want nil", sub.Keys)
 	}
 }

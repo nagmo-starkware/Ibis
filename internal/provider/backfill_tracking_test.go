@@ -992,47 +992,49 @@ func TestBackfillToTip(t *testing.T) {
 	}
 }
 
-// TestBackfillCancelledOrSupersededSendsNoSentinel: a superseded or cancelled
-// backfill sends no BackfillDone; the current one sends exactly one, carrying
-// its own generation. (The engine's generation check is the guard for a
-// superseded backfill that already finished its fetch; see
-// TestCompleteBackfill_StaleGenerationKeepsMarker.)
+// TestBackfillCancelledOrSupersededSendsNoSentinel: a backfill superseded
+// after its fetch finished, or cancelled mid-fetch, sends no BackfillDone; the
+// current one sends exactly one, carrying its own generation.
 func TestBackfillCancelledOrSupersededSendsNoSentinel(t *testing.T) {
-	release := make(chan struct{})
 	sub, events, cleanup := newBackfillSub(t, func(params json.RawMessage) (interface{}, error) {
-		<-release
 		return chunkEvent(params), nil
 	})
 	defer cleanup()
-	defer func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	}()
 	addr := newTestFelt(0xC0FFEE)
 
-	// Superseded: a re-launch for the same address replaces the first.
-	sub.BackfillBackground(context.Background(), ContractSubscription{Address: addr}, 900, 950)
-	first, _ := sub.TrackedBackfillGen(addr.String())
-	sub.BackfillBackground(context.Background(), ContractSubscription{Address: addr}, 900, 950)
-	second, _ := sub.TrackedBackfillGen(addr.String())
-	if second == first {
-		t.Fatalf("re-launch kept generation %d", first)
-	}
-	close(release)
-	waitPending(t, sub, 0, 5*time.Second)
+	// Supersede the first backfill in the window between its successful fetch
+	// and its send decision. Repeated: a cancelled backfill's send races its
+	// Done case, so one round could pass by luck without the guard.
+	defer func() { beforeBackfillDone = nil }()
+	for round := 0; round < 20; round++ {
+		var first atomic.Uint64
+		var once sync.Once
+		launched := make(chan struct{})
+		beforeBackfillDone = func(gen uint64) {
+			<-launched
+			if gen == first.Load() {
+				once.Do(func() {
+					sub.BackfillBackground(context.Background(), ContractSubscription{Address: addr}, 900, 950)
+				})
+			}
+		}
+		sub.BackfillBackground(context.Background(), ContractSubscription{Address: addr}, 900, 950)
+		g, _ := sub.TrackedBackfillGen(addr.String())
+		first.Store(g)
+		close(launched)
+		waitPending(t, sub, 0, 5*time.Second)
 
-	var sentinels []uint64
-	for len(events) > 0 {
-		if e := <-events; e.BackfillDone {
-			sentinels = append(sentinels, e.BackfillGen)
+		var sentinels []uint64
+		for len(events) > 0 {
+			if e := <-events; e.BackfillDone {
+				sentinels = append(sentinels, e.BackfillGen)
+			}
+		}
+		if len(sentinels) != 1 || sentinels[0] == g {
+			t.Fatalf("round %d: sentinels = %v, want exactly one, not from the superseded generation %d", round, sentinels, g)
 		}
 	}
-	if len(sentinels) != 1 || sentinels[0] != second {
-		t.Fatalf("sentinels = %v, want exactly one for generation %d", sentinels, second)
-	}
+	beforeBackfillDone = nil
 
 	// Cancelled: RemoveContract mid-fetch sends none.
 	block := make(chan struct{})
@@ -1048,6 +1050,84 @@ func TestBackfillCancelledOrSupersededSendsNoSentinel(t *testing.T) {
 	for len(events2) > 0 {
 		if (<-events2).BackfillDone {
 			t.Fatal("cancelled backfill sent BackfillDone")
+		}
+	}
+}
+
+// TestBackfillQueuedBehindCap: a backfill waiting for a resume slot counts as
+// pending and can be cancelled while queued; it never fetches or signals.
+func TestBackfillQueuedBehindCap(t *testing.T) {
+	release := make(chan struct{})
+	var fetched sync.Map
+	sub, events, cleanup := newBackfillSubWith(t, &SubscriberConfig{
+		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}, MaxConcurrentPolls: 1,
+	}, func(params json.RawMessage) (interface{}, error) {
+		fetched.Store(string(params), true)
+		<-release
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+
+	holder, queued := newTestFelt(0xA001), newTestFelt(0xA002)
+	sub.BackfillBackground(context.Background(), ContractSubscription{Address: holder}, 900, 950)
+	sub.BackfillBackground(context.Background(), ContractSubscription{Address: queued}, 900, 950)
+	if got := sub.BackfillsPending(); got != 2 {
+		t.Fatalf("BackfillsPending = %d, want 2 (one fetching, one queued)", got)
+	}
+	if _, _, complete := sub.TransportStatus(); complete {
+		t.Fatal("catchup_complete true with a backfill queued")
+	}
+	sub.RemoveContract(queued.String())
+	waitPending(t, sub, 1, 5*time.Second)
+	unblock()
+	waitPending(t, sub, 0, 5*time.Second)
+	for len(events) > 0 {
+		if e := <-events; e.ContractAddress.String() == queued.String() {
+			t.Fatalf("cancelled queued backfill delivered %+v", e)
+		}
+	}
+}
+
+// TestBackfillSlotFreedDuringBackoff: a backfill retrying after a failure
+// holds no resume slot while it waits, so it cannot starve the queue.
+func TestBackfillSlotFreedDuringBackoff(t *testing.T) {
+	failing := newTestFelt(0xBAD)
+	var failures atomic.Int32
+	sub, events, cleanup := newBackfillSubWith(t, &SubscriberConfig{
+		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}, MaxConcurrentPolls: 1,
+	}, func(params json.RawMessage) (interface{}, error) {
+		if strings.Contains(string(params), strings.TrimPrefix(failing.String(), "0x")) {
+			failures.Add(1)
+			return nil, errors.New("rpc down") // retries with backoff, forever
+		}
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+
+	// The failing backfill takes the only slot first and is in backoff before
+	// the other one queues.
+	sub.BackfillBackground(context.Background(), ContractSubscription{Address: failing}, 900, 950)
+	for start := time.Now(); failures.Load() == 0; {
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("failing backfill never attempted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ok := newTestFelt(0xA003)
+	sub.BackfillBackground(context.Background(), ContractSubscription{Address: ok}, 900, 950)
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case e := <-events:
+			if e.BackfillDone && e.ContractAddress.String() == ok.String() {
+				sub.RemoveContract(failing.String())
+				return
+			}
+		case <-deadline:
+			t.Fatal("queued backfill never ran while another retried: slot held across backoff")
 		}
 	}
 }

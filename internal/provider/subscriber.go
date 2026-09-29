@@ -657,6 +657,10 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 	s.launchBackfill(ctx, sub, from, to, nil)
 }
 
+// beforeBackfillDone, if set (tests only), runs after a backfill's fetch
+// succeeds and before it decides whether to signal BackfillDone.
+var beforeBackfillDone func(gen uint64)
+
 // launchBackfill is launchReservedBackfill, optionally holding a slot of sem
 // while it fetches.
 func (s *EventSubscriber) launchBackfill(ctx context.Context, sub ContractSubscription, from, to uint64, sem chan struct{}) {
@@ -685,18 +689,31 @@ func (s *EventSubscriber) launchBackfill(ctx context.Context, sub ContractSubscr
 			cancel()
 		}()
 
-		if sem != nil {
+		// A sem slot covers one fetch attempt, never a retry backoff, so a
+		// failing backfill cannot starve the queue.
+		acquire := func() bool {
+			if sem == nil {
+				return true
+			}
 			select {
 			case sem <- struct{}{}:
-				defer func() { <-sem }()
+				return true
 			case <-bctx.Done():
-				return
+				return false
+			}
+		}
+		release := func() {
+			if sem != nil {
+				<-sem
 			}
 		}
 
 		next := from
 		backoff := minBackoff
 		for attempt := 1; ; attempt++ {
+			if !acquire() {
+				return
+			}
 			var err error
 			if to == ToTip {
 				var tip uint64
@@ -707,12 +724,16 @@ func (s *EventSubscriber) launchBackfill(ctx context.Context, sub ContractSubscr
 			if err == nil {
 				next, err = s.backfillFrom(bctx, sub, next, to)
 			}
+			release()
 			if err == nil {
 				// In-band, behind the last backfill event: the consumer sees
 				// it only once those are processed. Sent before the untrack,
 				// so a backfill no longer tracked has already signalled.
 				// Only the current, uncancelled backfill signals: a superseded
 				// or cancelled one must not clear a newer backfill's marker.
+				if beforeBackfillDone != nil {
+					beforeBackfillDone(tb.gen)
+				}
 				s.backfillMu.Lock()
 				current := s.backfills[addrHex] == tb
 				s.backfillMu.Unlock()
