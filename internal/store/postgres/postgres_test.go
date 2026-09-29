@@ -12,6 +12,7 @@ import (
 	pgmodule "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/b-j-roberts/ibis/internal/config"
 	"github.com/b-j-roberts/ibis/internal/store"
 	"github.com/b-j-roberts/ibis/internal/types"
 )
@@ -1257,5 +1258,22 @@ func TestConcurrentReconciliationConverges(t *testing.T) {
 		if got := events[0].Data[fmt.Sprintf("field_%d", i)]; got != want {
 			t.Errorf("field_%d = %v, want %s", i, got, want)
 		}
+	}
+}
+
+func TestDynamicContractBackfillToRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	cc := &config.ContractConfig{Name: "child", Address: "0x1", Dynamic: true, Frozen: true, BackfillTo: 1234}
+	if err := s.SaveDynamicContract(ctx, cc); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := s.GetDynamicContracts(ctx)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("get: %v (%d contracts)", err, len(got))
+	}
+	if !got[0].Frozen || got[0].BackfillTo != 1234 {
+		t.Fatalf("Frozen=%v BackfillTo=%d, want true/1234", got[0].Frozen, got[0].BackfillTo)
 	}
 }

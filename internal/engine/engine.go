@@ -103,6 +103,10 @@ type Engine struct {
 	// runCtx is the context from Run(), used for dynamic contract subscriptions.
 	runCtx context.Context
 
+	// frozenBackfills maps address hex to a frozen contract whose backfill is
+	// in flight (its config.BackfillTo is set). Protected by mu.
+	frozenBackfills map[string]*contractState
+
 	// onContractRegistered is called after a contract is dynamically registered,
 	// passing the new schemas. Used by the API server to add routes.
 	onContractRegistered func(cc *config.ContractConfig, schemas []*types.TableSchema)
@@ -452,7 +456,21 @@ func (e *Engine) FreezeContract(ctx context.Context, name string) error {
 	found.config.Frozen = true
 	addr := found.address.String()
 	dynamic := found.config.Dynamic
+	// A backfill still in flight is not stopped below, so record where it ends:
+	// a restart before it finishes resumes it (see resumeFrozenBackfills).
+	if e.subscriber != nil {
+		if to, ok := e.subscriber.BackfillTarget(addr); ok {
+			found.config.BackfillTo = to
+			e.trackFrozenBackfill(addr, found)
+		}
+	}
 	ccCopy := found.config
+	// Persisted under the lock so it cannot overwrite onBackfillDone's clear.
+	if dynamic {
+		if err := e.store.SaveDynamicContract(ctx, &ccCopy); err != nil {
+			e.logger.Error("failed to persist frozen state", "contract", name, "error", err)
+		}
+	}
 	e.mu.Unlock()
 
 	// Stop the live stream (closes WSS / stops the polling goroutine). A
@@ -465,14 +483,9 @@ func (e *Engine) FreezeContract(ctx context.Context, name string) error {
 		e.poller.RemoveContract(name)
 	}
 
-	// Persist the frozen flag so rehydration skips re-subscribing. Only dynamic
-	// contracts live in the store; a frozen static contract reverts to its
-	// (unfrozen) config on restart.
-	if dynamic {
-		if err := e.store.SaveDynamicContract(ctx, &ccCopy); err != nil {
-			e.logger.Error("failed to persist frozen state", "contract", name, "error", err)
-		}
-	} else {
+	// Only dynamic contracts live in the store; a frozen static contract
+	// reverts to its (unfrozen) config on restart.
+	if !dynamic {
 		e.logger.Warn("froze a static (config) contract; freeze will not persist across restart", "contract", name)
 	}
 
@@ -601,6 +614,69 @@ func (e *Engine) evaluatePredicateContract(name string) {
 		if err := e.FreezeContract(e.runCtx, name); err != nil {
 			e.logger.Error("failed to freeze contract (predicate)", "contract", name, "error", err)
 		}
+	}
+}
+
+// trackFrozenBackfill records cs as frozen with a backfill in flight. Caller
+// holds e.mu.
+func (e *Engine) trackFrozenBackfill(addr string, cs *contractState) {
+	if e.frozenBackfills == nil {
+		e.frozenBackfills = make(map[string]*contractState)
+	}
+	e.frozenBackfills[addr] = cs
+}
+
+// onBackfillDone is the subscriber's completion hook: a frozen contract's
+// history is now complete, so clear and persist its BackfillTo marker.
+func (e *Engine) onBackfillDone(addr string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cs := e.frozenBackfills[addr]
+	if cs == nil {
+		return
+	}
+	delete(e.frozenBackfills, addr)
+	cs.config.BackfillTo = 0
+	if cs.config.Dynamic {
+		if err := e.store.SaveDynamicContract(context.Background(), &cs.config); err != nil {
+			e.logger.Error("failed to persist completed backfill", "contract", cs.config.Name, "error", err)
+		}
+	}
+}
+
+// resumeFrozenBackfills finishes, after a restart, the history of frozen
+// contracts whose backfill was cut short (BackfillTo still set): a bounded
+// fetch, no live stream and no view polling. Resumes from the contract's
+// cursor itself, not cursor+1: a re-fetched block is a harmless duplicate, a
+// skipped one is a hole. Complete contracts (BackfillTo == 0) are untouched.
+func (e *Engine) resumeFrozenBackfills(ctx context.Context) {
+	for _, cs := range e.contracts {
+		to := cs.config.BackfillTo
+		if !cs.config.Frozen || to == 0 {
+			continue
+		}
+		from := derefUint64(cs.config.StartBlock)
+		if cs.config.StartBlock == nil {
+			from = derefUint64(e.cfg.Indexer.StartBlock)
+		}
+		if cursor, err := e.store.GetCursor(ctx, cs.config.Name); err != nil {
+			e.logger.Warn("resume backfill: cursor read failed; using start block",
+				"contract", cs.config.Name, "error", err)
+		} else if cursor > from {
+			from = cursor
+		}
+
+		addr := cs.address.String()
+		e.mu.Lock()
+		e.trackFrozenBackfill(addr, cs)
+		e.mu.Unlock()
+		if from > to {
+			e.onBackfillDone(addr) // nothing left to fetch
+			continue
+		}
+		e.logger.Info("resuming backfill for frozen contract",
+			"contract", cs.config.Name, "from", from, "to", to)
+		e.subscriber.BackfillBackground(ctx, provider.ContractSubscription{Address: cs.address}, from, to)
 	}
 }
 
@@ -852,6 +928,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		TipPollInterval:     tipInterval,
 		CatchupPollInterval: catchupInterval,
 		MaxConcurrentPolls:  e.cfg.Indexer.MaxConcurrentCatchup,
+		OnBackfillDone:      e.onBackfillDone,
 	})
 	subscriber.SetReorgChan(e.reorgs)
 
@@ -862,6 +939,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	defer subCancel()
 
 	e.runCtx = subCtx
+	e.resumeFrozenBackfills(subCtx)
 
 	// Start the shared chain-tip poller (only when enabled) before the subscriber
 	// so every contract goroutine reads one cached block number instead of each
@@ -1320,6 +1398,7 @@ func (e *Engine) buildSubscriptions(startBlocks map[string]uint64) []provider.Co
 		// Frozen contracts keep their indexed data but are never re-subscribed:
 		// no event subscription, no view polling. This is what makes a freeze
 		// survive restarts (the Frozen flag is persisted with the contract).
+		// An unfinished backfill is resumed by resumeFrozenBackfills.
 		if cs.config.Frozen {
 			e.logger.Info("skipping subscription for frozen contract", "contract", cs.config.Name)
 			continue

@@ -131,6 +131,13 @@ type ContractConfig struct {
 	// has fired. Persisted with the dynamic-contract record so a frozen contract
 	// stays frozen across restarts and is never re-subscribed on rehydration.
 	Frozen bool `yaml:"-" json:"frozen,omitempty"`
+
+	// BackfillTo is runtime state: non-zero while the history up to this block
+	// has not been fully backfilled. Set when a contract is frozen with its
+	// backfill in flight, cleared when that backfill completes; a restart
+	// resumes a frozen contract's backfill to it. Zero means complete, which
+	// is also what records persisted before this field read as.
+	BackfillTo uint64 `yaml:"-" json:"backfill_to,omitempty"`
 }
 
 // FreezeConfig declares an event-driven lifecycle "freeze". When one of the

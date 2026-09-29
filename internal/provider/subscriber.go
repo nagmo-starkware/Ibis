@@ -243,6 +243,11 @@ type SubscriberConfig struct {
 	// SharedFirehose. When false, the subscriber uses direct per-poll BlockNumber
 	// (legacy behavior).
 	SharedTipPoller bool
+
+	// OnBackfillDone, if set, is called (from the backfill goroutine, holding
+	// no subscriber lock) with a contract's address hex after its backfill
+	// completes successfully. Not called for cancelled backfills.
+	OnBackfillDone func(addressHex string)
 }
 
 // EventSubscriber manages per-contract event subscriptions with automatic
@@ -282,6 +287,7 @@ type EventSubscriber struct {
 	backfillsPending atomic.Int64
 	backfillMu       sync.Mutex
 	backfills        map[string]*trackedBackfill // by address hex
+	onBackfillDone   func(addressHex string)
 
 	// sem bounds the number of goroutines that can execute RPC-heavy catchup or
 	// HTTP-polling iterations concurrently. See maxConcurrentCatchup.
@@ -409,6 +415,9 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		dialSharedWS: func(ctx context.Context, wsURL string) (*rpc.WsProvider, error) {
 			return rpc.NewWebsocketProvider(ctx, wsURL)
 		},
+	}
+	if cfg != nil {
+		sub.onBackfillDone = cfg.OnBackfillDone
 	}
 	// Firehose-keys multiplexes all address-subs onto one shared socket (see
 	// multiplexKeysDialer); other transports keep the one-socket-per-dial
@@ -576,6 +585,27 @@ func (s *EventSubscriber) TransportStatus() (live, total int64, complete bool) {
 // that superseded it for the same address.
 type trackedBackfill struct {
 	cancel context.CancelFunc
+	to     uint64 // last block the backfill covers
+}
+
+// BackfillTarget reports the last block of addressHex's in-flight backfill, if
+// any. A backfill is tracked until it finishes, so !ok means none is running
+// (complete, cancelled, or never started).
+func (s *EventSubscriber) BackfillTarget(addressHex string) (to uint64, ok bool) {
+	s.backfillMu.Lock()
+	defer s.backfillMu.Unlock()
+	if tb := s.backfills[addressHex]; tb != nil {
+		return tb.to, true
+	}
+	return 0, false
+}
+
+// BackfillBackground fetches [from, to] for sub over HTTP with no live stream,
+// in the background, counted as pending until it succeeds (retried until then). Transport-independent: it only needs the provider
+// and the events channel. Used to finish the history of a frozen contract.
+func (s *EventSubscriber) BackfillBackground(ctx context.Context, sub ContractSubscription, from, to uint64) {
+	s.reserveBackfill()
+	s.launchReservedBackfill(ctx, sub, from, to)
 }
 
 // BackfillsPending reports how many dynamic backfills have not yet completed.
@@ -609,7 +639,7 @@ func (s *EventSubscriber) releaseBackfill() {
 func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub ContractSubscription, from, to uint64) {
 	addrHex := sub.Address.String()
 	bctx, cancel := context.WithCancel(ctx)
-	tb := &trackedBackfill{cancel: cancel}
+	tb := &trackedBackfill{cancel: cancel, to: to}
 
 	s.backfillMu.Lock()
 	if s.backfills == nil {
@@ -623,6 +653,7 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 
 	go func() {
 		defer s.releaseBackfill()
+		succeeded := false
 		defer func() {
 			s.backfillMu.Lock()
 			if s.backfills[addrHex] == tb {
@@ -630,6 +661,11 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 			}
 			s.backfillMu.Unlock()
 			cancel()
+			// After the untrack, so a BackfillTarget that still sees it is
+			// guaranteed to be followed by this call.
+			if succeeded && s.onBackfillDone != nil {
+				s.onBackfillDone(addrHex)
+			}
 		}()
 
 		next := from
@@ -637,7 +673,11 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 		for attempt := 1; ; attempt++ {
 			var err error
 			next, err = s.backfillFrom(bctx, sub, next, to)
-			if err == nil || bctx.Err() != nil {
+			if err == nil {
+				succeeded = bctx.Err() == nil
+				return
+			}
+			if bctx.Err() != nil {
 				return
 			}
 			s.logger.Error("backfill failed; retrying from where it stopped",
