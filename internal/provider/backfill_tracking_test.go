@@ -746,3 +746,190 @@ func TestPerContractRemoveCancelsBackfill(t *testing.T) {
 	default:
 	}
 }
+
+// getEventsRanges records every [from, to] a mock RPC receives via getEvents.
+type getEventsRanges struct {
+	mu  sync.Mutex
+	got [][2]uint64
+}
+
+func (r *getEventsRanges) record(params json.RawMessage) {
+	var p []struct {
+		From struct {
+			N uint64 `json:"block_number"`
+		} `json:"from_block"`
+		To struct {
+			N uint64 `json:"block_number"`
+		} `json:"to_block"`
+	}
+	if json.Unmarshal(params, &p) != nil || len(p) != 1 {
+		return
+	}
+	r.mu.Lock()
+	r.got = append(r.got, [2]uint64{p[0].From.N, p[0].To.N})
+	r.mu.Unlock()
+}
+
+func (r *getEventsRanges) snapshot() [][2]uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([][2]uint64(nil), r.got...)
+}
+
+// waitRanges polls until cond holds over the recorded ranges.
+func waitRanges(t *testing.T, r *getEventsRanges, what string, cond func([][2]uint64) bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond(r.snapshot()) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s; getEvents ranges = %v", what, r.snapshot())
+}
+
+// newRangeSub builds a per-contract subscriber whose starknet_blockNumber
+// answers tip(n) on its n-th call (1-based, counted from AddContract), so a
+// test controls the tip AddContract sees and the tip the live stream sees.
+func newRangeSub(t *testing.T, cfg *SubscriberConfig, tip func(n int32) (interface{}, error)) (*EventSubscriber, *getEventsRanges, context.Context, func()) {
+	t.Helper()
+	ranges := &getEventsRanges{}
+	var tipCalls atomic.Int32
+	c := *cfg
+	c.TipPollInterval, c.CatchupPollInterval = 10*time.Millisecond, 10*time.Millisecond
+	handlers := map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) { return tip(tipCalls.Add(1)) },
+		"starknet_getEvents": func(params json.RawMessage) (interface{}, error) {
+			ranges.record(params)
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
+	}
+	server := mockRPCServer(t, handlers)
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		server.Close()
+		t.Fatalf("New() error: %v", err)
+	}
+	sub := p.NewSubscriber(nil, make(chan RawEvent, 256), &c)
+	tipCalls.Store(0)
+	ctx, cancel := context.WithCancel(context.Background())
+	return sub, ranges, ctx, func() { cancel(); p.Close(); server.Close() }
+}
+
+var perContractPollingConfigs = map[string]*SubscriberConfig{
+	"force polling":   {ForcePolling: true},
+	"catchup polling": {CatchupWithPolling: true},
+}
+
+// TestPerContractHandoffAtTipPlusOne: a normal contract's backfill covers
+// exactly [StartBlock, tip] and its live poll starts at tip+1 — no gap, no overlap.
+func TestPerContractHandoffAtTipPlusOne(t *testing.T) {
+	for name, cfg := range perContractPollingConfigs {
+		t.Run(name, func(t *testing.T) {
+			// AddContract sees tip 1000; the live stream then sees 1200.
+			sub, ranges, ctx, cleanup := newRangeSub(t, cfg, func(n int32) (interface{}, error) {
+				if n == 1 {
+					return uint64(1000), nil
+				}
+				return uint64(1200), nil
+			})
+			defer cleanup()
+
+			sub.AddContract(ctx, ContractSubscription{Address: newTestFelt(0xC0FFEE), StartBlock: 900})
+			waitPending(t, sub, 0, 5*time.Second)
+			waitRanges(t, ranges, "a live poll past the tip", func(rs [][2]uint64) bool {
+				for _, r := range rs {
+					if r[0] > 1000 {
+						return true
+					}
+				}
+				return false
+			})
+
+			// Backfill chunks (blocksPerQuery 100) tile [900, 1000]; the first
+			// live poll starts at 1001. Nothing straddles the tip.
+			var backfill [][2]uint64
+			var firstLive uint64
+			for _, r := range ranges.snapshot() {
+				switch {
+				case r[1] <= 1000:
+					backfill = append(backfill, r)
+				case r[0] > 1000:
+					if firstLive == 0 {
+						firstLive = r[0]
+					}
+				default:
+					t.Fatalf("range %v straddles the tip 1000", r)
+				}
+			}
+			want := [][2]uint64{{900, 999}, {1000, 1000}}
+			if len(backfill) != len(want) || backfill[0] != want[0] || backfill[1] != want[1] {
+				t.Fatalf("backfill ranges = %v, want %v", backfill, want)
+			}
+			if firstLive != 1001 {
+				t.Fatalf("live poll starts at %d, want 1001", firstLive)
+			}
+		})
+	}
+}
+
+// TestPerContractNoTipStreamsFromStartBlock: when AddContract cannot read the
+// tip, no backfill is reserved and the live stream starts at StartBlock.
+func TestPerContractNoTipStreamsFromStartBlock(t *testing.T) {
+	for name, cfg := range perContractPollingConfigs {
+		t.Run(name, func(t *testing.T) {
+			// Tip read fails in AddContract only; the live stream then sees 1000.
+			sub, ranges, ctx, cleanup := newRangeSub(t, cfg, func(n int32) (interface{}, error) {
+				if n == 1 {
+					return nil, errors.New("rpc down")
+				}
+				return uint64(1000), nil
+			})
+			defer cleanup()
+
+			sub.AddContract(ctx, ContractSubscription{Address: newTestFelt(0xC0FFEE), StartBlock: 900})
+			if got := sub.BackfillsPending(); got != 0 {
+				t.Fatalf("BackfillsPending = %d, want 0 with no tip", got)
+			}
+			waitRanges(t, ranges, "the first live poll", func(rs [][2]uint64) bool { return len(rs) > 0 })
+			if first := ranges.snapshot()[0]; first[0] != 900 {
+				t.Fatalf("live poll starts at %d, want StartBlock 900", first[0])
+			}
+			if got := sub.BackfillsPending(); got != 0 {
+				t.Fatalf("BackfillsPending = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// TestPerContractStartAfterTipNoBackfill: a StartBlock beyond the tip has no
+// history to fetch — no backfill, and the live stream starts at StartBlock.
+func TestPerContractStartAfterTipNoBackfill(t *testing.T) {
+	for name, cfg := range perContractPollingConfigs {
+		t.Run(name, func(t *testing.T) {
+			// AddContract sees tip 1000; the live stream then sees 2000.
+			sub, ranges, ctx, cleanup := newRangeSub(t, cfg, func(n int32) (interface{}, error) {
+				if n == 1 {
+					return uint64(1000), nil
+				}
+				return uint64(2000), nil
+			})
+			defer cleanup()
+
+			sub.AddContract(ctx, ContractSubscription{Address: newTestFelt(0xC0FFEE), StartBlock: 1500})
+			if got := sub.BackfillsPending(); got != 0 {
+				t.Fatalf("BackfillsPending = %d, want 0 for StartBlock > tip", got)
+			}
+			waitRanges(t, ranges, "the first live poll", func(rs [][2]uint64) bool { return len(rs) > 0 })
+			for _, r := range ranges.snapshot() {
+				if r[0] < 1500 {
+					t.Fatalf("range %v starts below StartBlock 1500", r)
+				}
+			}
+			if got := sub.BackfillsPending(); got != 0 {
+				t.Fatalf("BackfillsPending = %d, want 0", got)
+			}
+		})
+	}
+}
