@@ -487,6 +487,21 @@ func (s *EventSubscriber) AddContract(ctx context.Context, sub ContractSubscript
 		return
 	}
 
+	// Pre-tip history goes through a tracked backfill that StopLive leaves
+	// running; the live stream starts at tip+1. Reserved before the stream
+	// exists — see reserveBackfill.
+	s.reserveBackfill()
+	tip, err := s.tipBlockNumber(ctx)
+	if err != nil {
+		// No tip: stream from StartBlock and catch up in-stream, as before.
+		s.releaseBackfill()
+	} else if sub.StartBlock <= tip {
+		s.launchReservedBackfill(ctx, sub, sub.StartBlock, tip)
+		sub.StartBlock = tip + 1
+	} else {
+		s.releaseBackfill()
+	}
+
 	contractCtx, cancel := context.WithCancel(ctx)
 	addrHex := sub.Address.String()
 

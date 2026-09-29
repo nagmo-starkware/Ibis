@@ -15,7 +15,7 @@ import (
 
 // TestEngine_FreezeContract_KeepsBackfill: a child frozen while its backfill is
 // in flight (e.g. registered already past its expiry predicate) must still get
-// its history. Covers the firehose transports, which run backfills on their own.
+// its history. Covers every transport.
 func TestEngine_FreezeContract_KeepsBackfill(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -23,6 +23,7 @@ func TestEngine_FreezeContract_KeepsBackfill(t *testing.T) {
 	}{
 		{"shared firehose", &provider.SubscriberConfig{SharedFirehose: true}},
 		{"keys firehose", &provider.SubscriberConfig{KeysFirehose: true, OptionSelectors: []*felt.Felt{new(felt.Felt).SetUint64(0x999)}}},
+		{"per-contract", &provider.SubscriberConfig{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			addr := new(felt.Felt).SetUint64(0xC0FFEE)
