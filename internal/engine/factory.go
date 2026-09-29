@@ -146,6 +146,7 @@ func (e *Engine) registerFactoryChild(ctx context.Context, factoryCS *contractSt
 // event loop is not stalled behind a write-lock during slow DDL or DB inserts.
 func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractState, factory *config.FactoryConfig, cc *config.ContractConfig, childABI *abi.ABI) error {
 	cc.Dynamic = true
+	e.markBackfill(cc)
 
 	registry := abi.NewEventRegistry(childABI)
 
@@ -242,7 +243,7 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 			}
 		}
 
-		e.subscriber.AddContract(e.runCtx, sub)
+		e.addSubscription(sub)
 	}
 
 	if e.runCtx != nil {
@@ -270,6 +271,7 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 // in-memory mutations; all store I/O runs outside the lock.
 func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig, contractABI *abi.ABI) error {
 	cc.Dynamic = true
+	e.markBackfill(cc)
 
 	registry := abi.NewEventRegistry(contractABI)
 	schemas := schema.BuildSchemas(cc, contractABI, registry, nil)
@@ -337,7 +339,7 @@ func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig,
 			}
 		}
 
-		e.subscriber.AddContract(e.runCtx, sub)
+		e.addSubscription(sub)
 	}
 
 	if e.runCtx != nil {

@@ -32,6 +32,11 @@ type RawEvent struct {
 	// events — e.g. reactive view re-reads, which would otherwise fire once per
 	// replayed historical event. Live (at-tip / WSS) events have it false.
 	IsCatchup bool
+
+	// BackfillDone marks a tracked backfill of ContractAddress as fully
+	// delivered: a sentinel sent after its last event, carrying no event data.
+	// Consumers must not decode it.
+	BackfillDone bool
 }
 
 // ContractSubscription defines event subscription parameters for a contract.

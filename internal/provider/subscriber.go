@@ -576,6 +576,33 @@ func (s *EventSubscriber) TransportStatus() (live, total int64, complete bool) {
 // that superseded it for the same address.
 type trackedBackfill struct {
 	cancel context.CancelFunc
+	to     uint64 // last block the backfill covers
+}
+
+// BackfillTarget reports the last block of addressHex's in-flight backfill, if
+// any. A backfill is tracked until it finishes, so !ok means none is running
+// (complete, cancelled, or never started).
+func (s *EventSubscriber) BackfillTarget(addressHex string) (to uint64, ok bool) {
+	s.backfillMu.Lock()
+	defer s.backfillMu.Unlock()
+	if tb := s.backfills[addressHex]; tb != nil {
+		return tb.to, true
+	}
+	return 0, false
+}
+
+// ToTip, as a backfill's `to`, means the chain tip, read by the backfill itself
+// (retried like its fetches) rather than by the caller.
+const ToTip = math.MaxUint64
+
+// BackfillBackground fetches [from, to] for sub over HTTP with no live stream,
+// in the background, counted as pending until it succeeds (retried until then).
+// Transport-independent: it only needs the provider and the events channel.
+// Used to finish a contract's history after a restart or a freeze. On success
+// it sends a BackfillDone event after the last backfill event.
+func (s *EventSubscriber) BackfillBackground(ctx context.Context, sub ContractSubscription, from, to uint64) {
+	s.reserveBackfill()
+	s.launchReservedBackfill(ctx, sub, from, to)
 }
 
 // BackfillsPending reports how many dynamic backfills have not yet completed.
@@ -609,7 +636,7 @@ func (s *EventSubscriber) releaseBackfill() {
 func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub ContractSubscription, from, to uint64) {
 	addrHex := sub.Address.String()
 	bctx, cancel := context.WithCancel(ctx)
-	tb := &trackedBackfill{cancel: cancel}
+	tb := &trackedBackfill{cancel: cancel, to: to}
 
 	s.backfillMu.Lock()
 	if s.backfills == nil {
@@ -636,8 +663,26 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 		backoff := minBackoff
 		for attempt := 1; ; attempt++ {
 			var err error
-			next, err = s.backfillFrom(bctx, sub, next, to)
-			if err == nil || bctx.Err() != nil {
+			if to == ToTip {
+				var tip uint64
+				if tip, err = s.tipBlockNumber(bctx); err == nil {
+					to = tip
+				}
+			}
+			if err == nil {
+				next, err = s.backfillFrom(bctx, sub, next, to)
+			}
+			if err == nil {
+				// In-band, behind the last backfill event: the consumer sees
+				// it only once those are processed. Sent before the untrack,
+				// so a backfill no longer tracked has already signalled.
+				select {
+				case s.events <- RawEvent{ContractAddress: sub.Address, BackfillDone: true}:
+				case <-bctx.Done():
+				}
+				return
+			}
+			if bctx.Err() != nil {
 				return
 			}
 			s.logger.Error("backfill failed; retrying from where it stopped",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/b-j-roberts/ibis/internal/config"
 	"github.com/b-j-roberts/ibis/internal/store"
 	"github.com/b-j-roberts/ibis/internal/types"
 )
@@ -878,5 +879,22 @@ func TestCursorPersistsAcrossReopen(t *testing.T) {
 	cursor, _ := s2.GetCursor(ctx, "mycontract")
 	if cursor != 42 {
 		t.Errorf("expected cursor 42 after reopen, got %d", cursor)
+	}
+}
+
+func TestDynamicContractBackfillToRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	cc := &config.ContractConfig{Name: "child", Address: "0x1", Dynamic: true, Frozen: true, BackfillTo: 1234}
+	if err := s.SaveDynamicContract(ctx, cc); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := s.GetDynamicContracts(ctx)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("get: %v (%d contracts)", err, len(got))
+	}
+	if !got[0].Frozen || got[0].BackfillTo != 1234 {
+		t.Fatalf("Frozen=%v BackfillTo=%d, want true/1234", got[0].Frozen, got[0].BackfillTo)
 	}
 }

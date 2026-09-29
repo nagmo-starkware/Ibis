@@ -29,6 +29,10 @@ type contractState struct {
 	registry *abi.EventRegistry
 	schemas  map[string]*types.TableSchema // event name -> schema
 
+	// removed is set (under Engine.mu) by DeregisterContract, so a late persist
+	// or backfill completion cannot resurrect the contract's record.
+	removed bool
+
 	// childABIs caches resolved ABIs for factory children keyed by factory.ChildABI string.
 	// Each factory entry may specify a different ChildABI, so the cache is per-type.
 	childABIs map[string]*abi.ABI
@@ -102,6 +106,10 @@ type Engine struct {
 
 	// runCtx is the context from Run(), used for dynamic contract subscriptions.
 	runCtx context.Context
+
+	// persistMu serializes persistContract's snapshot+save, so concurrent
+	// persisters cannot land a stale copy. Lock order: persistMu before mu.
+	persistMu sync.Mutex
 
 	// onContractRegistered is called after a contract is dynamically registered,
 	// passing the new schemas. Used by the API server to add routes.
@@ -237,6 +245,7 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 		cc.ABI = "fetch"
 	}
 	cc.Dynamic = true
+	e.markBackfill(cc)
 
 	// Resolve ABI.
 	resolver := config.NewABIResolver(e.provider)
@@ -333,7 +342,7 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 			}
 		}
 
-		e.subscriber.AddContract(e.runCtx, sub)
+		e.addSubscription(sub)
 		e.logger.Info("started subscription for dynamic contract",
 			"contract", cc.Name,
 			"start_block", derefUint64(resolvedStart),
@@ -367,6 +376,8 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 // DeregisterContract removes a contract from indexing. If dropTables is true,
 // the contract's tables are also dropped from the store.
 func (e *Engine) DeregisterContract(ctx context.Context, name string, dropTables bool) error {
+	e.persistMu.Lock() // no persist may land after the delete below
+	defer e.persistMu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -382,6 +393,8 @@ func (e *Engine) DeregisterContract(ctx context.Context, name string, dropTables
 	if found == nil {
 		return fmt.Errorf("contract %q not found", name)
 	}
+
+	found.removed = true
 
 	// Stop subscription.
 	if e.subscriber != nil {
@@ -452,11 +465,40 @@ func (e *Engine) FreezeContract(ctx context.Context, name string) error {
 	found.config.Frozen = true
 	addr := found.address.String()
 	dynamic := found.config.Dynamic
-	ccCopy := found.config
+
+	// A frozen contract keeps fetching its history, so mark it for a restart
+	// (see resumeBackfills). A tracked backfill already carries the marker; one
+	// in flight without it (or no backfill and the indexer not caught up: the
+	// contract may be mid in-stream catchup, which StopLive would cut) gets it
+	// here, and the latter also a backfill of its own.
+	var launchFrom uint64
+	launch := false
+	if e.subscriber != nil && found.config.BackfillTo == 0 {
+		_, tracked := e.subscriber.BackfillTarget(addr)
+		_, _, complete := e.subscriber.TransportStatus()
+		start, haveStart := e.backfillStart(found)
+		if tracked || (!complete && haveStart && e.runCtx != nil) {
+			found.config.BackfillTo = provider.ToTip
+			launch = !tracked
+			launchFrom = start
+		}
+	}
 	e.mu.Unlock()
 
+	// Marker first, so it is on disk before any backfill event is processed.
+	if dynamic {
+		e.persistContract(ctx, found)
+	}
+	if launch {
+		// The cursor is contiguous progress here: no backfill was in flight.
+		if c, err := e.store.GetCursor(ctx, name); err == nil && c > launchFrom {
+			launchFrom = c
+		}
+		e.subscriber.BackfillBackground(e.runCtx, provider.ContractSubscription{Address: found.address}, launchFrom, provider.ToTip)
+	}
+
 	// Stop the live stream (closes WSS / stops the polling goroutine). A
-	// firehose backfill keeps running, so a frozen contract keeps its history.
+	// backfill keeps running, so a frozen contract keeps its history.
 	if e.subscriber != nil {
 		e.subscriber.StopLive(addr)
 	}
@@ -465,14 +507,9 @@ func (e *Engine) FreezeContract(ctx context.Context, name string) error {
 		e.poller.RemoveContract(name)
 	}
 
-	// Persist the frozen flag so rehydration skips re-subscribing. Only dynamic
-	// contracts live in the store; a frozen static contract reverts to its
-	// (unfrozen) config on restart.
-	if dynamic {
-		if err := e.store.SaveDynamicContract(ctx, &ccCopy); err != nil {
-			e.logger.Error("failed to persist frozen state", "contract", name, "error", err)
-		}
-	} else {
+	// Only dynamic contracts live in the store; a frozen static contract
+	// reverts to its (unfrozen) config on restart.
+	if !dynamic {
 		e.logger.Warn("froze a static (config) contract; freeze will not persist across restart", "contract", name)
 	}
 
@@ -604,6 +641,105 @@ func (e *Engine) evaluatePredicateContract(name string) {
 	}
 }
 
+// backfillStart is the first block of cs's history: its configured start, else
+// the indexer's. !ok when neither is set (it started at the chain tip).
+func (e *Engine) backfillStart(cs *contractState) (uint64, bool) {
+	if cs.config.StartBlock != nil {
+		return *cs.config.StartBlock, true
+	}
+	if e.cfg != nil && e.cfg.Indexer.StartBlock != nil {
+		return *e.cfg.Indexer.StartBlock, true
+	}
+	return 0, false
+}
+
+// persistContract saves cs's current config. Snapshot and save run together
+// under persistMu, so the last save always carries the latest state, and e.mu
+// is not held across store I/O. A deregistered contract is not written back.
+func (e *Engine) persistContract(ctx context.Context, cs *contractState) {
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
+	e.mu.RLock()
+	cc, removed := cs.config, cs.removed
+	e.mu.RUnlock()
+	if removed {
+		return
+	}
+	if err := e.store.SaveDynamicContract(ctx, &cc); err != nil {
+		e.logger.Error("failed to persist contract state", "contract", cc.Name, "error", err)
+	}
+}
+
+// completeBackfill handles a backfill's in-band completion: every event it
+// delivered has been processed, so the history is complete. Looked up by
+// address among the CURRENT contracts, so a deregistered one is ignored.
+func (e *Engine) completeBackfill(ctx context.Context, addr *felt.Felt) {
+	cs := e.findContractByAddress(addr)
+	if cs == nil {
+		return
+	}
+	e.mu.Lock()
+	marked, dynamic := cs.config.BackfillTo != 0, cs.config.Dynamic
+	cs.config.BackfillTo = 0
+	e.mu.Unlock()
+	if marked && dynamic {
+		e.persistContract(ctx, cs)
+	}
+}
+
+// signalBackfillDone enqueues the completion for a contract whose registration
+// launched no backfill (nothing before the tip, or no tip), so it clears the
+// marker that was persisted ahead of AddContract. Async: the caller may be the
+// event loop itself.
+func (e *Engine) signalBackfillDone(addr *felt.Felt) {
+	go func() {
+		select {
+		case e.events <- provider.RawEvent{ContractAddress: addr, BackfillDone: true}:
+		case <-e.runCtx.Done():
+		}
+	}()
+}
+
+// addSubscription adds sub to the running subscriber. The caller has already
+// persisted its contract with BackfillTo set (see markBackfill), so the marker
+// is on disk before AddContract's backfill can deliver anything.
+func (e *Engine) addSubscription(sub provider.ContractSubscription) {
+	e.subscriber.AddContract(e.runCtx, sub)
+	if _, ok := e.subscriber.BackfillTarget(sub.Address.String()); !ok {
+		e.signalBackfillDone(sub.Address)
+	}
+}
+
+// markBackfill sets, on a dynamic contract about to be persisted and
+// subscribed, the marker for the backfill AddContract may launch.
+func (e *Engine) markBackfill(cc *config.ContractConfig) {
+	if e.subscriber != nil && e.runCtx != nil {
+		cc.BackfillTo = provider.ToTip
+	}
+}
+
+// resumeBackfills re-fetches, after a restart, the history of every contract
+// whose backfill did not finish (BackfillTo set), from its start block: the
+// cursor cannot tell how far a backfill got, since live events advance it past
+// unfetched blocks. A bounded fetch: no live stream and no view polling
+// (a non-frozen contract's live stream starts as usual). Re-fetched blocks are
+// harmless duplicates. Complete contracts (BackfillTo == 0) are untouched.
+func (e *Engine) resumeBackfills(ctx context.Context) {
+	for _, cs := range e.contracts {
+		to := cs.config.BackfillTo
+		if to == 0 {
+			continue
+		}
+		from, ok := e.backfillStart(cs)
+		if !ok {
+			e.logger.Warn("resume backfill: no start block configured; skipping", "contract", cs.config.Name)
+			continue
+		}
+		e.logger.Info("resuming backfill", "contract", cs.config.Name, "from", from, "to", to)
+		e.subscriber.BackfillBackground(ctx, provider.ContractSubscription{Address: cs.address}, from, to)
+	}
+}
+
 // reconcileFrozenContracts freezes, at startup, any contract whose local freeze
 // trigger event was already indexed in a previous run. Those events sit below
 // the contract's resume cursor and would never be replayed, so the live/catchup
@@ -692,6 +828,14 @@ func (e *Engine) reconcileFrozenContracts(ctx context.Context) {
 		cs.config.Frozen = true
 		frozen++
 		if cs.config.Dynamic {
+			// May not have caught up (rehydrated mid-catchup) and the frozen
+			// contract is never re-subscribed, so mark it for resumeBackfills:
+			// full history to the tip at resume. Dynamic only: a static
+			// contract's marker could not be persisted, so it would refetch
+			// on every boot. An earlier marker (from a backfill) is kept.
+			if cs.config.BackfillTo == 0 {
+				cs.config.BackfillTo = provider.ToTip
+			}
 			if err := e.store.SaveDynamicContract(ctx, &cs.config); err != nil {
 				e.logger.Error("freeze reconcile: persist failed", "contract", cs.config.Name, "error", err)
 			}
@@ -862,6 +1006,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	defer subCancel()
 
 	e.runCtx = subCtx
+	e.resumeBackfills(subCtx)
 
 	// Start the shared chain-tip poller (only when enabled) before the subscriber
 	// so every contract goroutine reads one cached block number instead of each
@@ -1320,6 +1465,7 @@ func (e *Engine) buildSubscriptions(startBlocks map[string]uint64) []provider.Co
 		// Frozen contracts keep their indexed data but are never re-subscribed:
 		// no event subscription, no view polling. This is what makes a freeze
 		// survive restarts (the Frozen flag is persisted with the contract).
+		// An unfinished backfill is resumed by resumeBackfills.
 		if cs.config.Frozen {
 			e.logger.Info("skipping subscription for frozen contract", "contract", cs.config.Name)
 			continue
@@ -1403,6 +1549,11 @@ func (e *Engine) eventLoop(ctx context.Context) error {
 		case event, ok := <-e.events:
 			if !ok {
 				return nil
+			}
+
+			if event.BackfillDone {
+				e.completeBackfill(ctx, event.ContractAddress)
+				continue
 			}
 
 			// Route UDC events to the discovery handler instead of normal processing.

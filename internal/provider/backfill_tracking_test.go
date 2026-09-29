@@ -150,6 +150,9 @@ func TestBackfillRetryResumesFromFailedChunk(t *testing.T) {
 	for drained := false; !drained; {
 		select {
 		case e := <-events:
+			if e.BackfillDone {
+				continue
+			}
 			mu.Lock()
 			seen[e.BlockNumber]++
 			mu.Unlock()
@@ -931,5 +934,60 @@ func TestPerContractStartAfterTipNoBackfill(t *testing.T) {
 				t.Fatalf("BackfillsPending = %d, want 0", got)
 			}
 		})
+	}
+}
+
+// TestBackfillSignalsDoneAfterLastEvent: a successful backfill ends with one
+// in-band BackfillDone, behind every event it delivered, so the consumer sees
+// it only once those are processed.
+func TestBackfillSignalsDoneAfterLastEvent(t *testing.T) {
+	sub, events, cleanup := newBackfillSub(t, func(params json.RawMessage) (interface{}, error) {
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+
+	sub.BackfillBackground(context.Background(), ContractSubscription{Address: newTestFelt(0xC0FFEE)}, 0, 350)
+	waitPending(t, sub, 0, 5*time.Second)
+
+	var got []RawEvent
+	for len(events) > 0 {
+		got = append(got, <-events)
+	}
+	if len(got) != 5 {
+		t.Fatalf("got %d events, want 4 chunk events + 1 sentinel", len(got))
+	}
+	for i, e := range got[:4] {
+		if e.BackfillDone {
+			t.Fatalf("event %d is the sentinel, want it last", i)
+		}
+	}
+	if last := got[4]; !last.BackfillDone || last.ContractAddress.String() != newTestFelt(0xC0FFEE).String() {
+		t.Fatalf("last event = %+v, want the BackfillDone sentinel for the contract", last)
+	}
+}
+
+// TestBackfillToTip: ToTip is resolved by the backfill itself.
+func TestBackfillToTip(t *testing.T) {
+	var maxFrom atomic.Uint64
+	sub, events, cleanup := newBackfillSub(t, func(params json.RawMessage) (interface{}, error) {
+		if f := fromBlockOf(params); f > maxFrom.Load() {
+			maxFrom.Store(f)
+		}
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+
+	sub.BackfillBackground(context.Background(), ContractSubscription{Address: newTestFelt(0xC0FFEE)}, 900, ToTip)
+	waitPending(t, sub, 0, 5*time.Second)
+	// Tip 1000, 100 blocks per query: [900,999] then [1000,1000].
+	if got := maxFrom.Load(); got != 1000 {
+		t.Fatalf("last chunk started at %d, want 1000 (the tip)", got)
+	}
+	var done bool
+	for len(events) > 0 {
+		done = (<-events).BackfillDone
+	}
+	if !done {
+		t.Fatal("no BackfillDone after a ToTip backfill")
 	}
 }
