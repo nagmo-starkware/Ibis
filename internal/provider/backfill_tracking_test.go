@@ -696,3 +696,53 @@ func TestStopLiveHoldsCatchupIncompleteUntilBackfillDone(t *testing.T) {
 		})
 	}
 }
+
+// TestPerContractBackfillSurvivesStopLive: in the default per-contract
+// transport a contract's pre-tip history is a tracked backfill too, so a freeze
+// (StopLive) mid-fetch keeps it, while RemoveContract still cancels it.
+func TestPerContractBackfillSurvivesStopLive(t *testing.T) {
+	for name, cfg := range map[string]*SubscriberConfig{
+		"default":         {},
+		"catchup polling": {CatchupWithPolling: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			sub, events, cleanup := newBackfillSubWith(t, cfg, func(params json.RawMessage) (interface{}, error) {
+				if fromBlockOf(params) <= 1000 && calls.Add(1) <= 2 {
+					return nil, errors.New("rpc down") // still retrying when StopLive lands
+				}
+				return chunkEvent(params), nil
+			})
+			defer cleanup()
+
+			addr := newTestFelt(0xC0FFEE)
+			sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 900})
+			sub.StopLive(addr.String())
+
+			select {
+			case <-events:
+			case <-time.After(10 * time.Second):
+				t.Fatal("per-contract backfill delivered no events after StopLive")
+			}
+			waitPending(t, sub, 0, 10*time.Second)
+		})
+	}
+}
+
+func TestPerContractRemoveCancelsBackfill(t *testing.T) {
+	sub, events, cleanup := newBackfillSubWith(t, &SubscriberConfig{}, func(params json.RawMessage) (interface{}, error) {
+		return nil, errors.New("rpc down") // never succeeds
+	})
+	defer cleanup()
+
+	addr := newTestFelt(0xC0FFEE)
+	sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 900})
+	waitPending(t, sub, 1, 3*time.Second)
+	sub.RemoveContract(addr.String())
+	waitPending(t, sub, 0, 3*time.Second)
+	select {
+	case <-events:
+		t.Fatal("removed contract delivered an event")
+	default:
+	}
+}
