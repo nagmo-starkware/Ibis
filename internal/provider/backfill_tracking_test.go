@@ -991,3 +991,102 @@ func TestBackfillToTip(t *testing.T) {
 		t.Fatal("no BackfillDone after a ToTip backfill")
 	}
 }
+
+// TestBackfillCancelledOrSupersededSendsNoSentinel: a superseded or cancelled
+// backfill sends no BackfillDone; the current one sends exactly one, carrying
+// its own generation. (The engine's generation check is the guard for a
+// superseded backfill that already finished its fetch; see
+// TestCompleteBackfill_StaleGenerationKeepsMarker.)
+func TestBackfillCancelledOrSupersededSendsNoSentinel(t *testing.T) {
+	release := make(chan struct{})
+	sub, events, cleanup := newBackfillSub(t, func(params json.RawMessage) (interface{}, error) {
+		<-release
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	addr := newTestFelt(0xC0FFEE)
+
+	// Superseded: a re-launch for the same address replaces the first.
+	sub.BackfillBackground(context.Background(), ContractSubscription{Address: addr}, 900, 950)
+	first, _ := sub.TrackedBackfillGen(addr.String())
+	sub.BackfillBackground(context.Background(), ContractSubscription{Address: addr}, 900, 950)
+	second, _ := sub.TrackedBackfillGen(addr.String())
+	if second == first {
+		t.Fatalf("re-launch kept generation %d", first)
+	}
+	close(release)
+	waitPending(t, sub, 0, 5*time.Second)
+
+	var sentinels []uint64
+	for len(events) > 0 {
+		if e := <-events; e.BackfillDone {
+			sentinels = append(sentinels, e.BackfillGen)
+		}
+	}
+	if len(sentinels) != 1 || sentinels[0] != second {
+		t.Fatalf("sentinels = %v, want exactly one for generation %d", sentinels, second)
+	}
+
+	// Cancelled: RemoveContract mid-fetch sends none.
+	block := make(chan struct{})
+	sub2, events2, cleanup2 := newBackfillSub(t, func(params json.RawMessage) (interface{}, error) {
+		<-block
+		return chunkEvent(params), nil
+	})
+	defer cleanup2()
+	sub2.BackfillBackground(context.Background(), ContractSubscription{Address: addr}, 900, 950)
+	sub2.RemoveContract(addr.String())
+	close(block)
+	waitPending(t, sub2, 0, 5*time.Second)
+	for len(events2) > 0 {
+		if (<-events2).BackfillDone {
+			t.Fatal("cancelled backfill sent BackfillDone")
+		}
+	}
+}
+
+// TestBackfillBackgroundIsBounded: resume/freeze backfills share a cap, so a
+// boot with thousands of marked contracts does not fetch them all at once.
+func TestBackfillBackgroundIsBounded(t *testing.T) {
+	var inFlight, peak atomic.Int32
+	release := make(chan struct{})
+	sub, _, cleanup := newBackfillSubWith(t, &SubscriberConfig{
+		KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}, MaxConcurrentPolls: 2,
+	}, func(params json.RawMessage) (interface{}, error) {
+		n := inFlight.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		<-release
+		inFlight.Add(-1)
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock() // before cleanup: the server waits on held handlers
+
+	for i := uint64(0); i < 6; i++ {
+		sub.BackfillBackground(context.Background(), ContractSubscription{Address: newTestFelt(0xA000 + i)}, 900, 950)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for inFlight.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // give an unbounded implementation the chance to exceed the cap
+	if got := peak.Load(); got != 2 {
+		t.Fatalf("peak concurrent fetches = %d, want the cap 2", got)
+	}
+	unblock()
+	waitPending(t, sub, 0, 10*time.Second)
+}

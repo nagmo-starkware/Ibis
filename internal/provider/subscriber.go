@@ -287,6 +287,12 @@ type EventSubscriber struct {
 	// HTTP-polling iterations concurrently. See maxConcurrentCatchup.
 	sem chan struct{}
 
+	// resumeSem bounds concurrent BackfillBackground fetches (restart/freeze
+	// resumes), which can number in the tens of thousands at boot.
+	resumeSem chan struct{}
+	// backfillGen numbers tracked backfills; 0 is never used.
+	backfillGen atomic.Uint64
+
 	// Per-contract cancel functions for dynamic management (per-contract modes).
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -400,6 +406,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		statusInterval:      transportStatusInterval,
 		dialWSS:             defaultWSSDialer,
 		sem:                 make(chan struct{}, maxConcurrent),
+		resumeSem:           make(chan struct{}, maxConcurrent),
 		cancels:             make(map[string]context.CancelFunc),
 		router:              make(map[string]*firehoseSink),
 		tracked:             make(map[string]ContractSubscription),
@@ -577,6 +584,18 @@ func (s *EventSubscriber) TransportStatus() (live, total int64, complete bool) {
 type trackedBackfill struct {
 	cancel context.CancelFunc
 	to     uint64 // last block the backfill covers
+	gen    uint64 // carried by its BackfillDone
+}
+
+// TrackedBackfillGen reports the generation of addressHex's tracked backfill,
+// so a consumer can tell a stale BackfillDone from the current one.
+func (s *EventSubscriber) TrackedBackfillGen(addressHex string) (gen uint64, ok bool) {
+	s.backfillMu.Lock()
+	defer s.backfillMu.Unlock()
+	if tb := s.backfills[addressHex]; tb != nil {
+		return tb.gen, true
+	}
+	return 0, false
 }
 
 // BackfillTarget reports the last block of addressHex's in-flight backfill, if
@@ -600,9 +619,10 @@ const ToTip = math.MaxUint64
 // Transport-independent: it only needs the provider and the events channel.
 // Used to finish a contract's history after a restart or a freeze. On success
 // it sends a BackfillDone event after the last backfill event.
+// Bounded by resumeSem.
 func (s *EventSubscriber) BackfillBackground(ctx context.Context, sub ContractSubscription, from, to uint64) {
 	s.reserveBackfill()
-	s.launchReservedBackfill(ctx, sub, from, to)
+	s.launchBackfill(ctx, sub, from, to, s.resumeSem)
 }
 
 // BackfillsPending reports how many dynamic backfills have not yet completed.
@@ -634,9 +654,15 @@ func (s *EventSubscriber) releaseBackfill() {
 // chunk that failed: backfillFrom reports where it stopped, and restarting
 // from `from` would re-deliver chunks the engine already has.
 func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub ContractSubscription, from, to uint64) {
+	s.launchBackfill(ctx, sub, from, to, nil)
+}
+
+// launchBackfill is launchReservedBackfill, optionally holding a slot of sem
+// while it fetches.
+func (s *EventSubscriber) launchBackfill(ctx context.Context, sub ContractSubscription, from, to uint64, sem chan struct{}) {
 	addrHex := sub.Address.String()
 	bctx, cancel := context.WithCancel(ctx)
-	tb := &trackedBackfill{cancel: cancel, to: to}
+	tb := &trackedBackfill{cancel: cancel, to: to, gen: s.backfillGen.Add(1)}
 
 	s.backfillMu.Lock()
 	if s.backfills == nil {
@@ -659,6 +685,15 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 			cancel()
 		}()
 
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-bctx.Done():
+				return
+			}
+		}
+
 		next := from
 		backoff := minBackoff
 		for attempt := 1; ; attempt++ {
@@ -676,9 +711,16 @@ func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub Contra
 				// In-band, behind the last backfill event: the consumer sees
 				// it only once those are processed. Sent before the untrack,
 				// so a backfill no longer tracked has already signalled.
-				select {
-				case s.events <- RawEvent{ContractAddress: sub.Address, BackfillDone: true}:
-				case <-bctx.Done():
+				// Only the current, uncancelled backfill signals: a superseded
+				// or cancelled one must not clear a newer backfill's marker.
+				s.backfillMu.Lock()
+				current := s.backfills[addrHex] == tb
+				s.backfillMu.Unlock()
+				if current && bctx.Err() == nil {
+					select {
+					case s.events <- RawEvent{ContractAddress: sub.Address, BackfillDone: true, BackfillGen: tb.gen}:
+					case <-bctx.Done():
+					}
 				}
 				return
 			}

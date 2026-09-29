@@ -494,7 +494,7 @@ func (e *Engine) FreezeContract(ctx context.Context, name string) error {
 		if c, err := e.store.GetCursor(ctx, name); err == nil && c > launchFrom {
 			launchFrom = c
 		}
-		e.subscriber.BackfillBackground(e.runCtx, provider.ContractSubscription{Address: found.address}, launchFrom, provider.ToTip)
+		e.subscriber.BackfillBackground(e.runCtx, backfillSub(found), launchFrom, provider.ToTip)
 	}
 
 	// Stop the live stream (closes WSS / stops the polling goroutine). A
@@ -673,10 +673,16 @@ func (e *Engine) persistContract(ctx context.Context, cs *contractState) {
 // completeBackfill handles a backfill's in-band completion: every event it
 // delivered has been processed, so the history is complete. Looked up by
 // address among the CURRENT contracts, so a deregistered one is ignored.
-func (e *Engine) completeBackfill(ctx context.Context, addr *felt.Felt) {
+func (e *Engine) completeBackfill(ctx context.Context, addr *felt.Felt, gen uint64) {
 	cs := e.findContractByAddress(addr)
 	if cs == nil {
 		return
+	}
+	// A newer backfill owns the marker: this completion is stale.
+	if e.subscriber != nil {
+		if cur, ok := e.subscriber.TrackedBackfillGen(addr.String()); ok && cur != gen {
+			return
+		}
 	}
 	e.mu.Lock()
 	marked, dynamic := cs.config.BackfillTo != 0, cs.config.Dynamic
@@ -712,6 +718,24 @@ func (e *Engine) addSubscription(sub provider.ContractSubscription) {
 
 // markBackfill sets, on a dynamic contract about to be persisted and
 // subscribed, the marker for the backfill AddContract may launch.
+// backfillSub is cs's subscription for a resume/freeze backfill, keeping its
+// event-selector filter (as buildSubscriptions does).
+func backfillSub(cs *contractState) provider.ContractSubscription {
+	sub := provider.ContractSubscription{Address: cs.address}
+	if !hasWildcardEvent(&cs.config) && cs.registry != nil {
+		var selectors []*felt.Felt
+		for _, ec := range cs.config.Events {
+			if ev := cs.registry.MatchName(ec.Name); ev != nil {
+				selectors = append(selectors, ev.Selector)
+			}
+		}
+		if len(selectors) > 0 {
+			sub.Keys = [][]*felt.Felt{selectors}
+		}
+	}
+	return sub
+}
+
 func (e *Engine) markBackfill(cc *config.ContractConfig) {
 	if e.subscriber != nil && e.runCtx != nil {
 		cc.BackfillTo = provider.ToTip
@@ -736,7 +760,7 @@ func (e *Engine) resumeBackfills(ctx context.Context) {
 			continue
 		}
 		e.logger.Info("resuming backfill", "contract", cs.config.Name, "from", from, "to", to)
-		e.subscriber.BackfillBackground(ctx, provider.ContractSubscription{Address: cs.address}, from, to)
+		e.subscriber.BackfillBackground(ctx, backfillSub(cs), from, to)
 	}
 }
 
@@ -1552,7 +1576,7 @@ func (e *Engine) eventLoop(ctx context.Context) error {
 			}
 
 			if event.BackfillDone {
-				e.completeBackfill(ctx, event.ContractAddress)
+				e.completeBackfill(ctx, event.ContractAddress, event.BackfillGen)
 				continue
 			}
 

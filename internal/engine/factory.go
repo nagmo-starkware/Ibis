@@ -218,10 +218,9 @@ func (e *Engine) registerSharedChild(ctx context.Context, factoryCS *contractSta
 	}
 
 	// Best-effort: if persistence fails the engine will rediscover the child on
-	// restart because its deploy event is still in the durable event log.
-	if err := e.store.SaveDynamicContract(ctx, cc); err != nil {
-		e.logger.Error("failed to persist factory child", "name", cc.Name, "error", err)
-	}
+	// restart because its deploy event is still in the durable event log. Via
+	// persistContract: cs is already visible, so a freeze may persist it too.
+	e.persistContract(ctx, cs)
 
 	if e.subscriber != nil && e.runCtx != nil {
 		sub := provider.ContractSubscription{
@@ -315,9 +314,7 @@ func (e *Engine) registerWithABI(ctx context.Context, cc *config.ContractConfig,
 	}
 
 	// Best-effort persistence; engine rediscovers children on restart.
-	if err := e.store.SaveDynamicContract(ctx, cc); err != nil {
-		e.logger.Error("failed to persist factory child", "name", cc.Name, "error", err)
-	}
+	e.persistContract(ctx, cs)
 
 	if e.subscriber != nil && e.runCtx != nil {
 		sub := provider.ContractSubscription{

@@ -338,7 +338,7 @@ func TestCompleteBackfill_DeregisterAndReAdd(t *testing.T) {
 	if err := e.DeregisterContract(ctx, cs.config.Name, false); err != nil {
 		t.Fatal(err)
 	}
-	e.completeBackfill(ctx, cs.address)
+	e.completeBackfill(ctx, cs.address, 0)
 	e.persistContract(ctx, cs)
 	if got, _ := e.store.GetDynamicContracts(ctx); len(got) != 0 {
 		t.Fatalf("deregistered contract resurrected in the store: %+v", got)
@@ -352,7 +352,7 @@ func TestCompleteBackfill_DeregisterAndReAdd(t *testing.T) {
 	if err := e.store.SaveDynamicContract(ctx, &fresh); err != nil {
 		t.Fatal(err)
 	}
-	e.completeBackfill(ctx, cs.address)
+	e.completeBackfill(ctx, cs.address, 0)
 	got, _ := e.store.GetDynamicContracts(ctx)
 	if len(got) != 1 || got[0].StartBlock == nil || *got[0].StartBlock != 950 {
 		t.Fatalf("fresh record clobbered: %+v", got)
@@ -417,5 +417,64 @@ func TestRegisterChild_MarkerPersistedBeforeBackfillAndCleared(t *testing.T) {
 			close(srv.hold)
 			waitMarkerCleared(t, e)
 		})
+	}
+}
+
+// A completion from an older backfill (or an engine-sent one, generation 0)
+// must not clear the marker while a newer backfill for the address is still
+// tracked: that newer backfill's history is not in yet.
+func TestCompleteBackfill_StaleGenerationKeepsMarker(t *testing.T) {
+	ctx := context.Background()
+	addr := new(felt.Felt).SetUint64(0xC0FFEE)
+	release := make(chan struct{})
+	srv := backfillRPC(func() interface{} {
+		<-release
+		return map[string]interface{}{"events": []interface{}{}}
+	})
+	defer srv.Close()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	p, err := provider.New(ctx, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("provider.New: %v", err)
+	}
+	defer p.Close()
+
+	cs := testContractState(addr, "Child_c0ffee", nil, types.TableTypeLog)
+	cs.config.Dynamic, cs.config.BackfillTo = true, provider.ToTip
+	e := &Engine{store: memory.New(), logger: noopLogger(), contracts: []*contractState{cs}}
+	e.subscriber = p.NewSubscriber(nil, make(chan provider.RawEvent, 8), &provider.SubscriberConfig{SharedFirehose: true})
+	e.persistContract(ctx, cs)
+
+	e.subscriber.BackfillBackground(ctx, provider.ContractSubscription{Address: addr}, 900, 950)
+	gen, ok := e.subscriber.TrackedBackfillGen(addr.String())
+	if !ok {
+		t.Fatal("backfill not tracked")
+	}
+	for _, stale := range []uint64{0, gen - 1} {
+		e.completeBackfill(ctx, addr, stale)
+		if got := persistedBackfillTo(t, e); got != provider.ToTip {
+			t.Fatalf("completion gen %d (current %d) cleared the marker: BackfillTo = %d", stale, gen, got)
+		}
+	}
+	e.completeBackfill(ctx, addr, gen)
+	if got := persistedBackfillTo(t, e); got != 0 {
+		t.Fatalf("current backfill's completion left BackfillTo = %d", got)
+	}
+}
+
+// Resume/freeze backfills keep the contract's event-selector filter; a
+// wildcard contract fetches everything.
+func TestBackfillSub_KeepsSelectorFilter(t *testing.T) {
+	ev := testEventDef("Transfer")
+	cs := testContractState(new(felt.Felt).SetUint64(0xC0FFEE), "Child_c0ffee", []*abi.EventDef{ev}, types.TableTypeLog)
+	cs.config.Events = []config.EventConfig{{Name: "Transfer"}}
+	if sub := backfillSub(cs); len(sub.Keys) != 1 || len(sub.Keys[0]) != 1 || !sub.Keys[0][0].Equal(ev.Selector) {
+		t.Fatalf("Keys = %v, want [[Transfer selector]]", sub.Keys)
+	}
+	cs.config.Events = []config.EventConfig{{Name: "*"}}
+	if sub := backfillSub(cs); sub.Keys != nil {
+		t.Fatalf("wildcard Keys = %v, want nil", sub.Keys)
 	}
 }

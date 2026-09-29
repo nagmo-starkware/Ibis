@@ -37,6 +37,9 @@ type RawEvent struct {
 	// delivered: a sentinel sent after its last event, carrying no event data.
 	// Consumers must not decode it.
 	BackfillDone bool
+	// BackfillGen identifies the backfill that sent BackfillDone (see
+	// EventSubscriber.TrackedBackfillGen); 0 for an engine-sent completion.
+	BackfillGen uint64
 }
 
 // ContractSubscription defines event subscription parameters for a contract.
