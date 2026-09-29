@@ -455,8 +455,8 @@ func (e *Engine) FreezeContract(ctx context.Context, name string) error {
 	ccCopy := found.config
 	e.mu.Unlock()
 
-	// Stop the live stream (closes WSS / stops the polling goroutine). Any
-	// in-flight backfill keeps running: a frozen contract keeps its history.
+	// Stop the live stream (closes WSS / stops the polling goroutine). A
+	// firehose backfill keeps running, so a frozen contract keeps its history.
 	if e.subscriber != nil {
 		e.subscriber.StopLive(addr)
 	}
