@@ -184,6 +184,39 @@ func TestBackfillCancelledOnRemoval(t *testing.T) {
 	waitPending(t, sub, 0, 3*time.Second)
 }
 
+// TestBackfillSurvivesStopLive: freezing a contract (StopLive) must not cancel
+// its backfill — a child frozen at registration would otherwise never get its
+// history, and the frozen flag keeps it from being re-subscribed later.
+func TestBackfillSurvivesStopLive(t *testing.T) {
+	for name, cfg := range map[string]*SubscriberConfig{
+		"shared firehose": {SharedFirehose: true},
+		"keys firehose":   {KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			sub, events, cleanup := newBackfillSubWith(t, cfg, func(params json.RawMessage) (interface{}, error) {
+				if calls.Add(1) <= 2 {
+					return nil, errors.New("rpc down") // still retrying when StopLive lands
+				}
+				return chunkEvent(params), nil
+			})
+			defer cleanup()
+
+			addr := newTestFelt(0xC0FFEE)
+			sub.reserveBackfill()
+			sub.launchReservedBackfill(context.Background(), ContractSubscription{Address: addr}, 0, 350)
+			sub.StopLive(addr.String())
+
+			select {
+			case <-events:
+			case <-time.After(10 * time.Second):
+				t.Fatal("backfill delivered no events after StopLive")
+			}
+			waitPending(t, sub, 0, 10*time.Second)
+		})
+	}
+}
+
 // TestBackfillReAddSupersedesInFlight: re-adding a contract cancels its earlier
 // backfill, and that attempt's cleanup must not delete the newer entry — else
 // RemoveContract could no longer cancel it. Each attempt releases exactly once.
@@ -527,5 +560,139 @@ func TestResumeFloorAfterRollbackSeedsERC20ChildAtFloor(t *testing.T) {
 	}
 	if got := maxTo.Load(); got != 799 {
 		t.Errorf("backfill reached %d, want 799", got)
+	}
+}
+
+// stopLiveFixture builds a subscriber for each firehose transport with a held
+// backfill, plus a forward func that feeds it one live event. Keys firehose
+// needs its keys-sub seeded the way startKeysFirehose would.
+func stopLiveFixture(t *testing.T, cfg *SubscriberConfig, getEvents func(json.RawMessage) (interface{}, error)) (*EventSubscriber, chan RawEvent, func(block uint64), func()) {
+	t.Helper()
+	sub, events, cleanup := newBackfillSubWith(t, cfg, getEvents)
+	forward := func(block uint64) { sub.forwardIfTracked(context.Background(), fhEvent(0xC0FFEE, block)) }
+	if cfg.KeysFirehose {
+		sub.streamsMu.Lock()
+		sub.keysStream = newFirehoseKeysStream("keys-sub", nil, [][]*felt.Felt{sub.optionSelectors})
+		sub.streamsMu.Unlock()
+		forward = func(block uint64) {
+			sub.forwardStream(context.Background(), sub.keysStream, fhEvent(0xC0FFEE, block))
+		}
+	}
+	return sub, events, forward, cleanup
+}
+
+var stopLiveConfigs = map[string]*SubscriberConfig{
+	"shared firehose": {SharedFirehose: true},
+	"keys firehose":   {KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}},
+}
+
+// TestStopLiveIdempotentAndUnknownAddress: StopLive on an unknown address or a
+// repeated call neither panics nor disturbs a backfill that is still pending.
+func TestStopLiveIdempotentAndUnknownAddress(t *testing.T) {
+	for name, cfg := range stopLiveConfigs {
+		t.Run(name, func(t *testing.T) {
+			release := make(chan struct{})
+			sub, _, _, cleanup := stopLiveFixture(t, cfg, func(params json.RawMessage) (interface{}, error) {
+				<-release
+				return chunkEvent(params), nil
+			})
+			defer cleanup()
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+
+			addr := newTestFelt(0xC0FFEE)
+			sub.reserveBackfill()
+			sub.launchReservedBackfill(context.Background(), ContractSubscription{Address: addr}, 900, 950)
+
+			sub.StopLive(newTestFelt(0xDEAD).String()) // never added
+			sub.StopLive(addr.String())
+			sub.StopLive(addr.String()) // already stopped
+			if got := sub.BackfillsPending(); got != 1 {
+				t.Fatalf("BackfillsPending = %d, want 1 after no-op/repeated StopLive", got)
+			}
+
+			unblock()
+			waitPending(t, sub, 0, 3*time.Second)
+		})
+	}
+}
+
+// TestStopLiveStopsLiveDeliveryKeepsBackfill: after StopLive the live path
+// drops the address's events, while the backfill still delivers its history.
+func TestStopLiveStopsLiveDeliveryKeepsBackfill(t *testing.T) {
+	for name, cfg := range stopLiveConfigs {
+		t.Run(name, func(t *testing.T) {
+			release := make(chan struct{})
+			sub, events, forward, cleanup := stopLiveFixture(t, cfg, func(params json.RawMessage) (interface{}, error) {
+				<-release
+				return chunkEvent(params), nil
+			})
+			defer cleanup()
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+
+			// Tip is 1000: backfill [900, 1000], live from 1001.
+			addr := newTestFelt(0xC0FFEE)
+			sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 900})
+
+			forward(1001)
+			if got := drainBlocks(events); len(got) != 1 || got[0] != 1001 {
+				t.Fatalf("live blocks before StopLive = %v, want [1001]", got)
+			}
+
+			sub.StopLive(addr.String())
+			forward(1002)
+			if got := drainBlocks(events); len(got) != 0 {
+				t.Fatalf("live path delivered %v after StopLive, want nothing", got)
+			}
+
+			unblock()
+			waitPending(t, sub, 0, 3*time.Second)
+			got := drainBlocks(events)
+			if len(got) == 0 || got[0] != 900 {
+				t.Fatalf("backfill blocks after StopLive = %v, want history from 900", got)
+			}
+			for _, b := range got {
+				if b > 1000 {
+					t.Fatalf("backfill delivered live-range block %d: %v", b, got)
+				}
+			}
+		})
+	}
+}
+
+// TestStopLiveHoldsCatchupIncompleteUntilBackfillDone: a frozen contract's
+// backfill still counts as pending, so catchup_complete stays false until it ends.
+func TestStopLiveHoldsCatchupIncompleteUntilBackfillDone(t *testing.T) {
+	for name, cfg := range stopLiveConfigs {
+		t.Run(name, func(t *testing.T) {
+			release := make(chan struct{})
+			sub, _, _, cleanup := stopLiveFixture(t, cfg, func(params json.RawMessage) (interface{}, error) {
+				<-release
+				return chunkEvent(params), nil
+			})
+			defer cleanup()
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+
+			sub.streamsTotal.Store(1)
+			sub.streamsLive.Store(1)
+
+			addr := newTestFelt(0xC0FFEE)
+			sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 900})
+			sub.StopLive(addr.String())
+
+			if _, _, complete := sub.TransportStatus(); complete {
+				t.Fatal("catchup_complete true while a frozen contract's backfill runs")
+			}
+			unblock()
+			waitPending(t, sub, 0, 3*time.Second)
+			if _, _, complete := sub.TransportStatus(); !complete {
+				t.Fatal("catchup_complete still false after the frozen backfill finished")
+			}
+		})
 	}
 }

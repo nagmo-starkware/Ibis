@@ -511,7 +511,12 @@ func (s *EventSubscriber) RemoveContract(addressHex string) {
 	// A removed contract's history no longer matters, and a backfill left
 	// retrying for it would hold catchup_complete false for good.
 	s.cancelBackfill(addressHex)
+	s.StopLive(addressHex)
+}
 
+// StopLive stops a contract's live stream but lets its in-flight backfill
+// finish, so a frozen contract still gets its history.
+func (s *EventSubscriber) StopLive(addressHex string) {
 	if s.sharedFirehose {
 		s.removeSink(addressHex)
 		return

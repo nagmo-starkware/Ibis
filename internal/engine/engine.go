@@ -357,7 +357,8 @@ func (e *Engine) RegisterContract(ctx context.Context, cc *config.ContractConfig
 	}
 
 	// Freeze immediately if this contract registered already past a time-based
-	// predicate threshold, so we never start polling a dead contract.
+	// predicate threshold, so we never live-poll a dead contract. Its backfill
+	// still runs to completion.
 	e.evaluatePredicateContract(cc.Name)
 
 	return nil
@@ -454,9 +455,10 @@ func (e *Engine) FreezeContract(ctx context.Context, name string) error {
 	ccCopy := found.config
 	e.mu.Unlock()
 
-	// Stop the event subscription (closes WSS / stops the polling goroutine).
+	// Stop the live stream (closes WSS / stops the polling goroutine). A
+	// firehose backfill keeps running, so a frozen contract keeps its history.
 	if e.subscriber != nil {
-		e.subscriber.RemoveContract(addr)
+		e.subscriber.StopLive(addr)
 	}
 	// Stop view polling for this contract.
 	if e.poller != nil {
