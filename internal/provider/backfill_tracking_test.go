@@ -184,6 +184,32 @@ func TestBackfillCancelledOnRemoval(t *testing.T) {
 	waitPending(t, sub, 0, 3*time.Second)
 }
 
+// TestBackfillSurvivesStopLive: freezing a contract (StopLive) must not cancel
+// its backfill — a child frozen at registration would otherwise never get its
+// history, and the frozen flag keeps it from being re-subscribed later.
+func TestBackfillSurvivesStopLive(t *testing.T) {
+	var calls atomic.Int32
+	sub, events, cleanup := newBackfillSub(t, func(params json.RawMessage) (interface{}, error) {
+		if calls.Add(1) <= 2 {
+			return nil, errors.New("rpc down") // still retrying when StopLive lands
+		}
+		return chunkEvent(params), nil
+	})
+	defer cleanup()
+
+	addr := newTestFelt(0xC0FFEE)
+	sub.reserveBackfill()
+	sub.launchReservedBackfill(context.Background(), ContractSubscription{Address: addr}, 0, 350)
+	sub.StopLive(addr.String())
+
+	select {
+	case <-events:
+	case <-time.After(10 * time.Second):
+		t.Fatal("backfill delivered no events after StopLive")
+	}
+	waitPending(t, sub, 0, 10*time.Second)
+}
+
 // TestBackfillReAddSupersedesInFlight: re-adding a contract cancels its earlier
 // backfill, and that attempt's cleanup must not delete the newer entry — else
 // RemoveContract could no longer cancel it. Each attempt releases exactly once.
