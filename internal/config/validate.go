@@ -155,6 +155,18 @@ func validateIndexerPolling(ic *IndexerConfig) error {
 			return fieldError("indexer.catchup_poll_interval", "minimum is 10ms")
 		}
 	}
+	if ic.ReconcileInterval != "" {
+		d, err := time.ParseDuration(ic.ReconcileInterval)
+		if err != nil {
+			return fieldError("indexer.reconcile_interval", fmt.Sprintf("invalid duration: %v", err))
+		}
+		if d < 0 || (d > 0 && d < time.Second) {
+			return fieldError("indexer.reconcile_interval", "must be 0 (off) or at least 1s")
+		}
+	}
+	if ic.ReconcileLag < 0 {
+		return fieldError("indexer.reconcile_lag", "must be >= 0")
+	}
 	if ic.MaxConcurrentCatchup < 0 {
 		return fieldError("indexer.max_concurrent_catchup", "must be >= 0")
 	}

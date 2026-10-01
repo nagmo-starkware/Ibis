@@ -121,7 +121,8 @@ func (s *EventSubscriber) runFirehoseWSS(ctx context.Context) error {
 		base := s.snapshotSinkBase()
 		backfilled, err := s.serveSession(ctx, live, p,
 			func(c context.Context, p uint64) error { return s.firehoseBackfill(c, base, p) },
-			func(c context.Context) error { return s.processFirehose(c, session) })
+			func(c context.Context) error { return s.processFirehose(c, session) },
+			nil)
 		backoff = backoffAfterSession(backoff, err)
 		if !backfilled {
 			s.capSinks(base)

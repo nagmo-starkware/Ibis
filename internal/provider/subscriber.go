@@ -256,6 +256,15 @@ type SubscriberConfig struct {
 	// SharedFirehose. When false, the subscriber uses direct per-poll BlockNumber
 	// (legacy behavior).
 	SharedTipPoller bool
+
+	// ReconcileInterval is how often each live stream is re-read over HTTP to
+	// recover events the live subscription silently missed (see reconcile.go).
+	// 0 = off.
+	ReconcileInterval time.Duration
+
+	// ReconcileLag is how many blocks behind the accepted tip a reconcile leaves
+	// to the live stream. 0 = defaultReconcileLag.
+	ReconcileLag uint64
 }
 
 // EventSubscriber manages per-contract event subscriptions with automatic
@@ -276,6 +285,8 @@ type EventSubscriber struct {
 	statusInterval      time.Duration // transportStatusInterval; tests shorten it
 	tipPollInterval     time.Duration
 	catchupPollInterval time.Duration
+	reconcileInterval   time.Duration // 0 = reconcile off
+	reconcileLag        uint64
 
 	// dialWSS creates a WSS session. Override in tests.
 	dialWSS wssDialer
@@ -382,7 +393,13 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 	tipInterval := defaultTipPollInterval
 	catchupInterval := defaultCatchupPollInterval
 	maxConcurrent := maxConcurrentCatchup
+	var reconcileInterval time.Duration
+	reconcileLag := defaultReconcileLag
 	if cfg != nil {
+		reconcileInterval = cfg.ReconcileInterval
+		if cfg.ReconcileLag > 0 {
+			reconcileLag = cfg.ReconcileLag
+		}
 		forcePolling = cfg.ForcePolling
 		catchupWithPolling = cfg.CatchupWithPolling
 		sharedFirehose = cfg.SharedFirehose
@@ -416,6 +433,8 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		sharedTipPoller:     sharedTipPoller,
 		tipPollInterval:     tipInterval,
 		catchupPollInterval: catchupInterval,
+		reconcileInterval:   reconcileInterval,
+		reconcileLag:        reconcileLag,
 		statusInterval:      transportStatusInterval,
 		dialWSS:             defaultWSSDialer,
 		sem:                 make(chan struct{}, maxConcurrent),
@@ -1050,7 +1069,8 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 			func(c context.Context) (err error) {
 				eventsProcessed, err = s.processWSSEvents(c, session, &liveLast, logger)
 				return err
-			})
+			},
+			nil)
 		backoff = backoffAfterSession(backoff, err)
 		if backfilled {
 			// The backfill covered through P, so a quiet contract advances too.

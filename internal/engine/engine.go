@@ -984,6 +984,11 @@ func (e *Engine) Run(ctx context.Context) error {
 	// treat a bad/empty value as 0 so the provider/subscriber apply their defaults.
 	tipInterval := parseDurationOrZero(e.cfg.Indexer.TipPollInterval)
 	catchupInterval := parseDurationOrZero(e.cfg.Indexer.CatchupPollInterval)
+	// Empty = the default; an explicit 0 turns reconciliation off.
+	reconcileInterval := provider.DefaultReconcileInterval
+	if e.cfg.Indexer.ReconcileInterval != "" {
+		reconcileInterval = parseDurationOrZero(e.cfg.Indexer.ReconcileInterval)
+	}
 	// The shared tip poller is opt-in (default off = legacy per-contract polling),
 	// so bumping the image is inert until enabled. Both firehose transports
 	// require it, so either turns the poller on implicitly.
@@ -1002,6 +1007,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		TipPollInterval:     tipInterval,
 		CatchupPollInterval: catchupInterval,
 		MaxConcurrentPolls:  e.cfg.Indexer.MaxConcurrentCatchup,
+		ReconcileInterval:   reconcileInterval,
+		ReconcileLag:        uint64(e.cfg.Indexer.ReconcileLag),
 	})
 	subscriber.SetReorgChan(e.reorgs)
 
