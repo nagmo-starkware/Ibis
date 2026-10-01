@@ -64,6 +64,8 @@ func reconLabel(site gapSite) string {
 		return "child-transfer:" + newTestFelt(site.addr).String()
 	case "shared-firehose":
 		return "firehose"
+	case "per-contract":
+		return "contract:" + newTestFelt(site.addr).String()
 	}
 	return site.name
 }
@@ -159,7 +161,7 @@ func collect(ch <-chan RawEvent, d time.Duration) (live, catchup []uint64) {
 // recovers exactly that one, flagged IsCatchup, logs it at WARN, and neither
 // re-delivers what the live path delivered nor what the backfill delivered.
 func TestReconcileRecoversDroppedLiveEvent(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 105) // gap event: delivered by the post-subscribe backfill
@@ -237,7 +239,7 @@ func TestReconcileChildrenShareOneQuery(t *testing.T) {
 // A failed reconcile does not advance lastReconciled: the next successful tick
 // still covers the range and recovers the event.
 func TestReconcileFailureDoesNotAdvance(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 131)
@@ -274,7 +276,7 @@ func TestReconcileFailureDoesNotAdvance(t *testing.T) {
 // A session that drops before reconcile caught up resumes at/below the first
 // unreconciled block, though live events advanced the cursors past it.
 func TestReconcileDropResumesBelowUnreconciled(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			node := newGapNode()
@@ -302,7 +304,7 @@ func TestReconcileDropResumesBelowUnreconciled(t *testing.T) {
 // Interval 0 turns reconcile off: no fetch after the backfill and the dropped
 // event stays dropped.
 func TestReconcileDisabled(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 131)
