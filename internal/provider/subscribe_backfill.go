@@ -212,6 +212,18 @@ func (s *EventSubscriber) capSinks(base map[string]sinkBase) {
 	}
 }
 
+// capSinksTo pulls sink cursors back to at most block (never forward); see
+// firehoseKeysStream.capCursorsTo.
+func (s *EventSubscriber) capSinksTo(block uint64) {
+	s.routerMu.Lock()
+	defer s.routerMu.Unlock()
+	for _, sk := range s.router {
+		if sk.lastBlock > block {
+			sk.lastBlock = block
+		}
+	}
+}
+
 // --- firehose-keys (option D) ----------------------------------------------
 
 // streamBase snapshots the cursors of st's fill set at session start (see

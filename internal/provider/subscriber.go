@@ -325,6 +325,8 @@ type EventSubscriber struct {
 	// keyed by from_address hex. Nil in per-contract modes. See firehose.go.
 	routerMu sync.RWMutex
 	router   map[string]*firehoseSink
+	// fhRec is the shared firehose session's reconciler (nil when none/off).
+	fhRec atomic.Pointer[reconciler]
 
 	// --- firehose-keys (option D) transport state — see firehose_keys.go ---
 

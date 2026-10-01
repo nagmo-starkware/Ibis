@@ -21,11 +21,14 @@ import (
 type firehoseSink struct {
 	sub       ContractSubscription
 	lastBlock uint64
+	// floor is the sink's join point: reconcile never reads below it (those
+	// blocks are its own backfill's).
+	floor uint64
 }
 
 func (s *EventSubscriber) addSink(sub ContractSubscription, lastBlock uint64) {
 	s.routerMu.Lock()
-	s.router[sub.Address.String()] = &firehoseSink{sub: sub, lastBlock: lastBlock}
+	s.router[sub.Address.String()] = &firehoseSink{sub: sub, lastBlock: lastBlock, floor: lastBlock}
 	s.routerMu.Unlock()
 }
 
@@ -119,13 +122,24 @@ func (s *EventSubscriber) runFirehoseWSS(ctx context.Context) error {
 		// Live only once the post-subscribe backfill is done (the node does not
 		// replay from from_block; see subscribe_backfill.go).
 		base := s.snapshotSinkBase()
+		rec := s.newSessionReconciler()
+		s.fhRec.Store(rec)
 		backfilled, err := s.serveSession(ctx, live, p,
-			func(c context.Context, p uint64) error { return s.firehoseBackfill(c, base, p) },
+			func(c context.Context, p uint64) error {
+				if err := s.firehoseBackfill(c, base, p); err != nil {
+					return err
+				}
+				rec.start(p) // hand off: reconcile covers (p, ..]
+				return nil
+			},
 			func(c context.Context) error { return s.processFirehose(c, session) },
-			nil)
+			s.firehoseReconcileRun(rec))
+		s.fhRec.Store(nil)
 		backoff = backoffAfterSession(backoff, err)
 		if !backfilled {
 			s.capSinks(base)
+		} else if f := rec.resumeFloor(); f > 0 {
+			s.capSinksTo(f) // never resume past the unreconciled range
 		}
 		live.set(false)
 		session.close()
@@ -216,6 +230,7 @@ func (s *EventSubscriber) processFirehose(ctx context.Context, session *wssSessi
 				// Roll every affected sink back to the reorg start so the orphaned
 				// blocks are re-fetched/re-delivered.
 				s.rollbackSinks(reorg.StartBlockNum)
+				s.fhRec.Load().rollback(reorg.StartBlockNum)
 			}
 
 		case evt := <-session.events:
@@ -259,6 +274,8 @@ func (s *EventSubscriber) forwardIfTracked(ctx context.Context, evt *rpc.Emitted
 	if sk == nil {
 		return // untracked contract — the whole point of demux
 	}
+	// Recorded before the cursor guard: the live stream did deliver it.
+	s.fhRec.Load().observe(evt.BlockNumber, emittedID(evt))
 	if evt.BlockNumber < last {
 		return // already forwarded (dedup guard, block-granular)
 	}
