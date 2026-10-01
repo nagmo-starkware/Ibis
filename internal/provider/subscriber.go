@@ -635,7 +635,7 @@ const ToTip = math.MaxUint64
 // Bounded by resumeSem.
 func (s *EventSubscriber) BackfillBackground(ctx context.Context, sub ContractSubscription, from, to uint64) {
 	s.reserveBackfill()
-	s.launchBackfill(ctx, sub, from, to, s.resumeSem)
+	s.launchBackfill(ctx, sub, from, to, s.resumeSem, false)
 }
 
 // BackfillsPending reports how many dynamic backfills have not yet completed.
@@ -667,7 +667,14 @@ func (s *EventSubscriber) releaseBackfill() {
 // chunk that failed: backfillFrom reports where it stopped, and restarting
 // from `from` would re-deliver chunks the engine already has.
 func (s *EventSubscriber) launchReservedBackfill(ctx context.Context, sub ContractSubscription, from, to uint64) {
-	s.launchBackfill(ctx, sub, from, to, nil)
+	s.launchBackfill(ctx, sub, from, to, nil, false)
+}
+
+// launchReservedAcceptedBackfill is launchReservedBackfill for a range that
+// may end past the accepted tip (a just-registered contract's deploy block,
+// still pre_confirmed): each attempt first waits for block to to be accepted.
+func (s *EventSubscriber) launchReservedAcceptedBackfill(ctx context.Context, sub ContractSubscription, from, to uint64) {
+	s.launchBackfill(ctx, sub, from, to, nil, true)
 }
 
 // beforeBackfillDone, if set (tests only), runs after a backfill's fetch
@@ -676,7 +683,7 @@ var beforeBackfillDone func(gen uint64)
 
 // launchBackfill is launchReservedBackfill, optionally holding a slot of sem
 // while it fetches.
-func (s *EventSubscriber) launchBackfill(ctx context.Context, sub ContractSubscription, from, to uint64, sem chan struct{}) {
+func (s *EventSubscriber) launchBackfill(ctx context.Context, sub ContractSubscription, from, to uint64, sem chan struct{}, awaitTo bool) {
 	addrHex := sub.Address.String()
 	bctx, cancel := context.WithCancel(ctx)
 	tb := &trackedBackfill{cancel: cancel, to: to, gen: s.backfillGen.Add(1)}
@@ -733,6 +740,9 @@ func (s *EventSubscriber) launchBackfill(ctx context.Context, sub ContractSubscr
 				if tip, err = s.tipBlockNumber(bctx); err == nil {
 					to = tip
 				}
+			}
+			if err == nil && awaitTo {
+				err = s.waitAccepted(bctx, to)
 			}
 			if err == nil {
 				next, err = s.backfillFrom(bctx, sub, next, to)

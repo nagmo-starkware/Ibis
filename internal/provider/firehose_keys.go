@@ -824,7 +824,8 @@ func (s *EventSubscriber) forwardStream(ctx context.Context, st *firehoseKeysStr
 //   - history [StartBlock, wssFrom-1] is backfilled once over HTTP with NO key
 //     filter — covering BOTH event classes in a single fetch — so future
 //     events split cleanly at wssFrom between the keys-sub and (if ERC20) the
-//     new address-sub, with no gap and no overlap.
+//     new address-sub, with no gap and no overlap. At wssFrom == StartBlock
+//     the deploy block alone is backfilled, once accepted (see below).
 func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub ContractSubscription) {
 	// Reserved before the contract is tracked or seeded, so it can never read
 	// as current before its history is in. Handed to the backfill below, or
@@ -844,14 +845,17 @@ func (s *EventSubscriber) addContractKeysFirehose(ctx context.Context, sub Contr
 	}
 	_, wssFrom, _ := s.seedFromTip(ctx, sub, childFrom)
 
+	backfillSub := sub
+	backfillSub.Keys = nil // no filter: one fetch covers both event classes
 	// Up to wssFrom, not tip: the resume floor can put wssFrom past the tip.
 	if sub.StartBlock < wssFrom {
-		backfillSub := sub
-		backfillSub.Keys = nil // no filter: one fetch covers both event classes
 		s.launchReservedBackfill(ctx, backfillSub, sub.StartBlock, wssFrom-1)
 		return
 	}
-	s.releaseBackfill() // nothing below wssFrom to fetch
+	// wssFrom == StartBlock still needs the deploy block: the keys-sub dropped
+	// its events while the contract was untracked. It may be pre_confirmed,
+	// hence the wait; live re-delivery of it is a harmless duplicate.
+	s.launchReservedAcceptedBackfill(ctx, backfillSub, sub.StartBlock, sub.StartBlock)
 }
 
 // readTipAndSeed reads the tip and seeds sub's keys-sub fill to forward from
