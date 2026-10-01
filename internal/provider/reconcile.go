@@ -519,6 +519,16 @@ type childMember struct {
 	epoch uint64
 }
 
+// active reports whether the member's session is still the one the tick
+// started with and no rollback has happened since.
+func (m childMember) active() bool {
+	if m.st.rec.Load() != m.rec {
+		return false
+	}
+	_, epoch := m.rec.snapshot()
+	return epoch == m.epoch
+}
+
 func (s *EventSubscriber) childReconcileTick(ctx context.Context, logger *slog.Logger) error {
 	to, err := s.reconcileTarget(ctx)
 	if err != nil {
@@ -558,35 +568,34 @@ func (s *EventSubscriber) childReconcileTick(ctx context.Context, logger *slog.L
 			if err != nil {
 				return fmt.Errorf("events [%d, %d]: %w", f, t, err)
 			}
+			// Membership is fixed at tick start; whether a member is still
+			// valid is re-derived on every attempt, so a retry of a split
+			// range neither resurrects a stale member nor skips a healthy one.
 			byAddr := make(map[string][]RawEvent)
 			for _, e := range events {
 				if e.ContractAddress == nil {
 					continue
 				}
 				a := e.ContractAddress.String()
-				if m, ok := members[a]; ok && s.isTracked(a) && e.BlockNumber >= m.st.floor(a) {
-					if last, _ := m.rec.state(); e.BlockNumber > last {
-						byAddr[a] = append(byAddr[a], e)
-					}
+				m, ok := members[a]
+				if !ok || !m.active() || !s.isTracked(a) || e.BlockNumber < m.st.floor(a) {
+					continue
+				}
+				if last, _ := m.rec.state(); e.BlockNumber > last {
+					byAddr[a] = append(byAddr[a], e)
 				}
 			}
 			for a, evs := range byAddr {
 				m := members[a]
-				if m.st.rec.Load() != m.rec {
-					delete(members, a) // its session ended; the next one backfills
-					continue
-				}
 				n, err := s.deliverMissed(ctx, m.rec, m.epoch, s.keysStreamScope(m.st), evs, logger)
 				recovered += n
-				if errors.Is(err, errReconcileStale) {
-					delete(members, a) // rolled back mid-tick: the next tick redoes it
-				} else if err != nil {
+				if err != nil && !errors.Is(err, errReconcileStale) {
 					return err
 				}
 			}
-			for a, m := range members {
-				if !m.rec.advance(t, m.epoch) {
-					delete(members, a)
+			for _, m := range members {
+				if m.active() {
+					m.rec.advance(t, m.epoch) // false (rolled back mid-tick): left for the next tick
 				}
 			}
 			return nil

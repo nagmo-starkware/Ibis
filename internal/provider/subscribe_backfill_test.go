@@ -32,6 +32,8 @@ type gapChain struct {
 	ahead     atomic.Int64  // getEvents calls bounded past the accepted tip
 	maxSpan   atomic.Uint64 // if set, getEvents fails for ranges wider than this many blocks
 
+	onFetch func(from, to uint64) // if set, runs at the start of every getEvents
+
 	gate    chan struct{} // if set, getEvents blocks until closed
 	entered chan struct{} // signalled (non-blocking) on each getEvents entry
 
@@ -104,6 +106,9 @@ func (c *gapChain) handlers() map[string]func(json.RawMessage) (interface{}, err
 			}
 			if err := json.Unmarshal(params, &q); err != nil || len(q) != 1 {
 				return nil, fmt.Errorf("bad params %s", params)
+			}
+			if c.onFetch != nil {
+				c.onFetch(q[0].From.N, q[0].To.N)
 			}
 			if q[0].To.N > c.tip.Load() { // as a node does for a numeric bound past the accepted tip
 				c.ahead.Add(1)

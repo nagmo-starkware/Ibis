@@ -38,7 +38,7 @@ func (s *syncBuf) String() string {
 
 // reconTransports names the gap sites whose live stream is reconciled at this
 // point of the series; tests over "all transports" range over it.
-var reconTransports = []string{"keys-sub"}
+var reconTransports = []string{"keys-sub", "keys-address-sub", "keys-child-transfer"}
 
 // reconSites are the gap sites whose live stream is reconciled.
 func reconSites(names ...string) []gapSite {
@@ -988,5 +988,131 @@ func TestReconcileChildJoinAndRemove(t *testing.T) {
 	}
 	if got[e+"@143"] != 0 {
 		t.Errorf("removed child's event delivered %d times", got[e+"@143"])
+	}
+}
+
+// --- child hub: per-member handling inside one tick --------------------------------
+
+// hubFixture is a subscriber with hand-registered collective child streams.
+type hubFixture struct {
+	sub     *EventSubscriber
+	chain   *gapChain
+	events  chan RawEvent
+	streams map[uint64]*firehoseKeysStream
+	recs    map[uint64]*reconciler
+}
+
+func newHubFixture(t *testing.T, addrs ...uint64) *hubFixture {
+	t.Helper()
+	chain := newGapChain(150, 150)
+	server := mockRPCServer(t, chain.handlers())
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	events := make(chan RawEvent, 64)
+	lag := uint64(2)
+	sub := p.NewSubscriber(nil, events, &SubscriberConfig{KeysFirehose: true, ReconcileInterval: time.Second, ReconcileLag: &lag})
+	f := &hubFixture{sub: sub, chain: chain, events: events, streams: map[uint64]*firehoseKeysStream{}, recs: map[uint64]*reconciler{}}
+	for _, a := range addrs {
+		f.add(a)
+	}
+	return f
+}
+
+// add registers a live child stream (reconciler started at 100) for addr.
+func (f *hubFixture) add(addr uint64) {
+	st := newFirehoseKeysStream("child-transfer:"+newTestFelt(addr).String(), newTestFelt(addr), childTransferKeys())
+	st.collective = true
+	st.setCursor(newTestFelt(addr).String(), 100, true)
+	rec := newReconciler()
+	rec.start(100)
+	st.rec.Store(rec)
+	f.sub.trackContract(ContractSubscription{Address: newTestFelt(addr)})
+	f.sub.streamsMu.Lock()
+	f.sub.addrStreams[newTestFelt(addr).String()] = st
+	f.sub.streamsMu.Unlock()
+	f.streams[addr] = st
+	f.recs[addr] = rec
+	f.chain.addKeyed(120, addr, transferSelector)
+}
+
+func (f *hubFixture) last(addr uint64) uint64 {
+	l, _ := f.recs[addr].state()
+	return l
+}
+
+func (f *hubFixture) tick(t *testing.T) error {
+	t.Helper()
+	return f.sub.childReconcileTick(context.Background(), testLogger)
+}
+
+// Members that go stale (rolled back), are removed, or join while a tick is in
+// flight do not affect the healthy ones: those recover their missed events
+// exactly once and advance; the stale and removed ones neither deliver nor
+// advance; the next tick picks up the stale one and the newcomer.
+func TestReconcileChildHubPerMemberStale(t *testing.T) {
+	f := newHubFixture(t, 0x1, 0x2, 0x3, 0x4) // 1,2 healthy; 3 rolled back; 4 removed
+	f.chain.onFetch = func(uint64, uint64) {
+		f.chain.onFetch = nil
+		f.streams[0x3].rec.Load().rollback(110) // reorg lands mid-tick
+		f.sub.streamsMu.Lock()
+		delete(f.sub.addrStreams, newTestFelt(0x4).String())
+		f.sub.streamsMu.Unlock()
+		f.streams[0x4].rec.Store(nil) // 4's session ended
+		f.add(0x5)                    // joins mid-tick
+	}
+	if err := f.tick(t); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	got := countEvents(f.events, 100*time.Millisecond)
+	k := func(a uint64) string { return fmt.Sprintf("%s@120", newTestFelt(a)) }
+	if got[k(1)] != 1 || got[k(2)] != 1 {
+		t.Errorf("healthy members recovered %d and %d times, want 1 each (%v)", got[k(1)], got[k(2)], got)
+	}
+	if got[k(3)] != 0 || got[k(4)] != 0 || got[k(5)] != 0 {
+		t.Errorf("stale/removed/new member delivered during the tick: %v", got)
+	}
+	if f.last(1) != 148 || f.last(2) != 148 {
+		t.Errorf("healthy members at %d and %d, want 148", f.last(1), f.last(2))
+	}
+	if f.last(3) != 100 || f.last(4) != 100 || f.last(5) != 100 {
+		t.Errorf("stale/removed/new members advanced: %d %d %d, want 100", f.last(3), f.last(4), f.last(5))
+	}
+
+	// Next tick: the rolled-back member and the newcomer catch up; the removed one stays out.
+	if err := f.tick(t); err != nil {
+		t.Fatalf("second tick: %v", err)
+	}
+	got = countEvents(f.events, 100*time.Millisecond)
+	if got[k(3)] != 1 || got[k(5)] != 1 || got[k(4)] != 0 || got[k(1)] != 0 {
+		t.Errorf("second tick delivered %v, want 3 and 5 once, nothing for 1 or 4", got)
+	}
+}
+
+// A range that has to be split and retried, with a member rolled back during
+// the first attempt, still advances every healthy member exactly through the
+// range and recovers its events once; the rolled-back one is left untouched.
+func TestReconcileChildHubRetryKeepsMembership(t *testing.T) {
+	f := newHubFixture(t, 0x1, 0x2, 0x3)
+	f.chain.maxSpan.Store(8) // 48 blocks to reconcile: needs splitting
+	first := true
+	f.chain.onFetch = func(uint64, uint64) {
+		if first {
+			first = false
+			f.streams[0x3].rec.Load().rollback(110)
+		}
+	}
+	if err := f.tick(t); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	got := countEvents(f.events, 100*time.Millisecond)
+	k := func(a uint64) string { return fmt.Sprintf("%s@120", newTestFelt(a)) }
+	if got[k(1)] != 1 || got[k(2)] != 1 || got[k(3)] != 0 {
+		t.Errorf("deliveries %v, want 1 and 2 once, 3 none", got)
+	}
+	if f.last(1) != 148 || f.last(2) != 148 || f.last(3) != 100 {
+		t.Errorf("last = %d %d %d, want 148 148 100", f.last(1), f.last(2), f.last(3))
 	}
 }
