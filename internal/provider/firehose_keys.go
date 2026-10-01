@@ -87,6 +87,9 @@ type firehoseKeysStream struct {
 
 	mu      sync.Mutex
 	cursors map[string]uint64
+	// floors is each address's join point (set when its cursor is seeded):
+	// reconcile never reads below it, those blocks are its own backfill's.
+	floors map[string]uint64
 
 	fillsMu sync.Mutex
 	fills   map[string]ContractSubscription
@@ -109,6 +112,7 @@ func newFirehoseKeysStream(label string, address *felt.Felt, keys [][]*felt.Felt
 		address: address,
 		keys:    keys,
 		cursors: make(map[string]uint64),
+		floors:  make(map[string]uint64),
 		fills:   make(map[string]ContractSubscription),
 	}
 }
@@ -120,7 +124,17 @@ func (st *firehoseKeysStream) setCursor(addrHex string, block uint64, force bool
 	if force || block > st.cursors[addrHex] {
 		st.cursors[addrHex] = block
 	}
+	if force {
+		st.floors[addrHex] = block
+	}
 	st.mu.Unlock()
+}
+
+// floor returns addrHex's join point (0 if unknown).
+func (st *firehoseKeysStream) floor(addrHex string) uint64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.floors[addrHex]
 }
 
 // cursor returns this stream's current cursor for addrHex (0 if unset).
@@ -793,7 +807,7 @@ func (s *EventSubscriber) forwardStream(ctx context.Context, st *firehoseKeysStr
 		return // untracked, or a foreign contract's same-named event — dropped
 	}
 	// Recorded before the cursor guard: the live stream did deliver it.
-	st.rec.Load().observe(evt.BlockNumber, idOf(evt.TransactionHash, evt.FromAddress, evt.Keys, evt.Data))
+	st.rec.Load().observe(evt.BlockNumber, emittedID(evt))
 
 	st.mu.Lock()
 	last := st.cursors[addr]

@@ -77,9 +77,10 @@ type IndexerConfig struct {
 	//
 	//   ReconcileInterval — how often (duration string; default 60s; "0s" = off).
 	//   ReconcileLag      — blocks behind the accepted tip that are left to the
-	//                       live stream before being checked (default 2).
+	//                       live stream before being checked (default 2 when
+	//                       unset; an explicit 0 is allowed).
 	ReconcileInterval string `yaml:"reconcile_interval,omitempty"`
-	ReconcileLag      int    `yaml:"reconcile_lag,omitempty"`
+	ReconcileLag      *int   `yaml:"reconcile_lag,omitempty"`
 
 	// SharedTipPoller enables the shared chain-tip poller: one starknet_blockNumber
 	// per interval into a cache, read by every contract, instead of each contract

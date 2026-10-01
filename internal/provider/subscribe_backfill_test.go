@@ -25,9 +25,10 @@ type gapChain struct {
 	pre       atomic.Uint64 // pre_confirmed block number
 	preFails  atomic.Int64  // pre_confirmed reads that still fail
 	preReads  atomic.Int64
-	fetches   atomic.Int64 // getEvents calls
-	failFetch atomic.Bool  // getEvents returns an error
-	ahead     atomic.Int64 // getEvents calls bounded past the accepted tip
+	fetches   atomic.Int64  // getEvents calls
+	failFetch atomic.Bool   // getEvents returns an error
+	ahead     atomic.Int64  // getEvents calls bounded past the accepted tip
+	maxSpan   atomic.Uint64 // if set, getEvents fails for ranges wider than this many blocks
 
 	gate    chan struct{} // if set, getEvents blocks until closed
 	entered chan struct{} // signalled (non-blocking) on each getEvents entry
@@ -90,6 +91,9 @@ func (c *gapChain) handlers() map[string]func(json.RawMessage) (interface{}, err
 				c.ahead.Add(1)
 				return nil, fmt.Errorf("block %d not found", q[0].To.N)
 			}
+			if m := c.maxSpan.Load(); m > 0 && q[0].To.N-q[0].From.N+1 > m {
+				return nil, fmt.Errorf("range too wide (timeout)")
+			}
 			out := []map[string]interface{}{}
 			c.mu.Lock()
 			for b := q[0].From.N; b <= q[0].To.N; b++ {
@@ -125,6 +129,7 @@ type gapSess struct {
 	in     *rpc.EventSubscriptionInput
 	events chan *rpc.EmittedEventWithFinalityStatus
 	errs   chan error
+	reorgs chan *client.ReorgEvent
 }
 
 func newGapNode() *gapNode { return &gapNode{sessions: make(chan *gapSess, 32)} }
@@ -140,10 +145,10 @@ func (n *gapNode) dialer() wssDialer {
 			n.resumes = append(n.resumes, *in.SubBlockID.Number)
 		}
 		n.mu.Unlock()
-		s := &gapSess{in: in, events: make(chan *rpc.EmittedEventWithFinalityStatus, 64), errs: make(chan error, 1)}
+		s := &gapSess{in: in, events: make(chan *rpc.EmittedEventWithFinalityStatus, 64), errs: make(chan error, 1), reorgs: make(chan *client.ReorgEvent, 1)}
 		n.sessions <- s
 		return &wssSession{
-			events: s.events, errs: s.errs, reorgs: make(chan *client.ReorgEvent, 1),
+			events: s.events, errs: s.errs, reorgs: s.reorgs,
 			close: func() { n.closed.Add(1) },
 		}, nil
 	}

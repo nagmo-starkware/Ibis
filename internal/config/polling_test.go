@@ -108,3 +108,17 @@ func TestValidate_ReconcileKnobs(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_ReconcileLagZeroIsExplicit(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, pollingConfigYAML("  reconcile_lag: 0")))
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Indexer.ReconcileLag == nil || *cfg.Indexer.ReconcileLag != 0 {
+		t.Errorf("ReconcileLag = %v, want explicit 0", cfg.Indexer.ReconcileLag)
+	}
+	cfg, err = Load(writeTestConfig(t, pollingConfigYAML("")))
+	if err != nil || cfg.Indexer.ReconcileLag != nil {
+		t.Errorf("omitted lag = %v (err %v), want nil", cfg.Indexer.ReconcileLag, err)
+	}
+}

@@ -164,7 +164,7 @@ func validateIndexerPolling(ic *IndexerConfig) error {
 			return fieldError("indexer.reconcile_interval", "must be 0 (off) or at least 1s")
 		}
 	}
-	if ic.ReconcileLag < 0 {
+	if ic.ReconcileLag != nil && *ic.ReconcileLag < 0 {
 		return fieldError("indexer.reconcile_lag", "must be >= 0")
 	}
 	if ic.MaxConcurrentCatchup < 0 {

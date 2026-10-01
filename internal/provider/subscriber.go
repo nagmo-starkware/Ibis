@@ -263,8 +263,8 @@ type SubscriberConfig struct {
 	ReconcileInterval time.Duration
 
 	// ReconcileLag is how many blocks behind the accepted tip a reconcile leaves
-	// to the live stream. 0 = defaultReconcileLag.
-	ReconcileLag uint64
+	// to the live stream. nil = defaultReconcileLag; 0 is valid (no lag).
+	ReconcileLag *uint64
 }
 
 // EventSubscriber manages per-contract event subscriptions with automatic
@@ -397,8 +397,8 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 	reconcileLag := defaultReconcileLag
 	if cfg != nil {
 		reconcileInterval = cfg.ReconcileInterval
-		if cfg.ReconcileLag > 0 {
-			reconcileLag = cfg.ReconcileLag
+		if cfg.ReconcileLag != nil {
+			reconcileLag = *cfg.ReconcileLag
 		}
 		forcePolling = cfg.ForcePolling
 		catchupWithPolling = cfg.CatchupWithPolling
