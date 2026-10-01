@@ -21,11 +21,12 @@ import (
 
 // gapChain is the HTTP side of the fixture.
 type gapChain struct {
-	tip      atomic.Uint64 // latest accepted block
-	pre      atomic.Uint64 // pre_confirmed block number
-	preFails atomic.Int64  // pre_confirmed reads that still fail
-	preReads atomic.Int64
-	fetches  atomic.Int64 // getEvents calls
+	tip       atomic.Uint64 // latest accepted block
+	pre       atomic.Uint64 // pre_confirmed block number
+	preFails  atomic.Int64  // pre_confirmed reads that still fail
+	preReads  atomic.Int64
+	fetches   atomic.Int64 // getEvents calls
+	failFetch atomic.Bool  // getEvents returns an error
 
 	gate    chan struct{} // if set, getEvents blocks until closed
 	entered chan struct{} // signalled (non-blocking) on each getEvents entry
@@ -68,6 +69,9 @@ func (c *gapChain) handlers() map[string]func(json.RawMessage) (interface{}, err
 			}
 			if c.gate != nil {
 				<-c.gate
+			}
+			if c.failFetch.Load() {
+				return nil, fmt.Errorf("getEvents unavailable")
 			}
 			var q []struct {
 				From struct {
@@ -215,7 +219,7 @@ func startGapSite(t *testing.T, site gapSite, chain *gapChain, node *gapNode) (*
 // waitEvent returns the first event satisfying pred; fails on timeout.
 func waitEvent(t *testing.T, ch <-chan RawEvent, what string, pred func(RawEvent) bool) RawEvent {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(10 * time.Second)
 	for {
 		select {
 		case e := <-ch:
@@ -235,7 +239,7 @@ func isLive(sub *EventSubscriber) bool {
 
 func waitLive(t *testing.T, sub *EventSubscriber) {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(10 * time.Second)
 	for !isLive(sub) {
 		select {
 		case <-deadline:
@@ -372,6 +376,69 @@ func TestSubscribeDialFailureRetried(t *testing.T) {
 			if node.dials.Load() < int32(2*site.streams) {
 				t.Errorf("dials = %d, want a retry per stream after the failed subscribe", node.dials.Load())
 			}
+		})
+	}
+}
+
+// A session that drops before its backfill finishes is not live and does not
+// let live events push the resume point past the unfilled gap: the next
+// (re)subscribe starts at or below it (the cursors were capped back).
+func TestSubscribeBackfillIncompleteResumesBelowGap(t *testing.T) {
+	for _, site := range gapSites() {
+		t.Run(site.name, func(t *testing.T) {
+			chain := newGapChain(121, 121)
+			chain.gate = make(chan struct{})
+			chain.add(105, site.addr)
+			node := newGapNode()
+			sub, events := startGapSite(t, site, chain, node)
+
+			sess := node.nextFor(t, site)
+			<-chain.entered
+			sess.events <- liveEvent(site.addr, 125) // past the unfilled gap
+			waitEvent(t, events, "live @125", func(e RawEvent) bool { return e.BlockNumber == 125 })
+			sess.errs <- fmt.Errorf("socket dropped")
+			close(chain.gate)
+
+			second := node.nextFor(t, site)
+			n := second.in.SubBlockID.Number
+			if n == nil {
+				t.Fatal("second subscribe has no block_id")
+			}
+			if *n > 105 {
+				t.Errorf("second subscribe block_id %d, want <= 105 (below the unfilled gap)", *n)
+			}
+			_ = sub
+		})
+	}
+}
+
+// A backfill that fails ends the session unused-as-live, escalates the
+// reconnect backoff (1s, 2s, ...), and a later successful session delivers the
+// gap event and goes live.
+func TestSubscribeBackfillFailureEscalatesBackoff(t *testing.T) {
+	for _, site := range gapSites() {
+		t.Run(site.name, func(t *testing.T) {
+			t.Parallel()
+			chain := newGapChain(121, 121)
+			chain.failFetch.Store(true)
+			chain.add(105, site.addr)
+			node := newGapNode()
+			sub, events := startGapSite(t, site, chain, node)
+
+			node.nextFor(t, site)
+			node.nextFor(t, site)
+			t2 := time.Now()
+			node.nextFor(t, site)
+			if gap := time.Since(t2); gap < 1800*time.Millisecond {
+				t.Errorf("third subscribe %v after the second, want >= ~2s (backoff must escalate after a failed backfill)", gap)
+			}
+			if isLive(sub) || node.closed.Load() < int32(2*site.streams) {
+				t.Errorf("failed backfill: live=%v closed=%d, want not live and failed sessions closed", isLive(sub), node.closed.Load())
+			}
+
+			chain.failFetch.Store(false)
+			waitEvent(t, events, "gap event @105", func(e RawEvent) bool { return e.BlockNumber == 105 })
+			waitLive(t, sub)
 		})
 	}
 }
