@@ -610,3 +610,31 @@ func (s *EventSubscriber) childReconcileTick(ctx context.Context, logger *slog.L
 	}
 	return nil
 }
+
+// --- shared firehose ---------------------------------------------------------
+
+// firehoseReconcileRun returns the loop to run while the shared firehose
+// session is live (nil = none). Its scope is the subscription's own: every
+// event, kept for tracked sinks.
+func (s *EventSubscriber) firehoseReconcileRun(rec *reconciler) func(context.Context) {
+	if rec == nil {
+		return nil
+	}
+	sc := reconcileScope{
+		label: "firehose",
+		fetch: func(ctx context.Context, from, to uint64) ([]RawEvent, error) {
+			return s.provider.GetEvents(ctx, GetEventsOptions{FromBlock: from, ToBlock: to, ChunkSize: 1000})
+		},
+		keep: func(e RawEvent) bool {
+			s.routerMu.RLock()
+			defer s.routerMu.RUnlock()
+			return s.router[e.ContractAddress.String()] != nil
+		},
+		delivered: func(e RawEvent) { s.setSinkLast(e.ContractAddress.String(), e.BlockNumber, false) },
+	}
+	return func(ctx context.Context) {
+		s.reconcileLoop(ctx, sc.label, func(c context.Context, l *slog.Logger) error {
+			return s.reconcileTick(c, rec, sc, l)
+		})
+	}
+}
