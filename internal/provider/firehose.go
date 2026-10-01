@@ -21,11 +21,14 @@ import (
 type firehoseSink struct {
 	sub       ContractSubscription
 	lastBlock uint64
+	// floor is the sink's join point: reconcile never reads below it (those
+	// blocks are its own backfill's).
+	floor uint64
 }
 
 func (s *EventSubscriber) addSink(sub ContractSubscription, lastBlock uint64) {
 	s.routerMu.Lock()
-	s.router[sub.Address.String()] = &firehoseSink{sub: sub, lastBlock: lastBlock}
+	s.router[sub.Address.String()] = &firehoseSink{sub: sub, lastBlock: lastBlock, floor: lastBlock}
 	s.routerMu.Unlock()
 }
 
@@ -272,7 +275,7 @@ func (s *EventSubscriber) forwardIfTracked(ctx context.Context, evt *rpc.Emitted
 		return // untracked contract — the whole point of demux
 	}
 	// Recorded before the cursor guard: the live stream did deliver it.
-	s.fhRec.Load().observe(evt.BlockNumber, idOf(evt.TransactionHash, evt.FromAddress, evt.Keys, evt.Data))
+	s.fhRec.Load().observe(evt.BlockNumber, emittedID(evt))
 	if evt.BlockNumber < last {
 		return // already forwarded (dedup guard, block-granular)
 	}

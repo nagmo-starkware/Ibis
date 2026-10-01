@@ -628,7 +628,8 @@ func (s *EventSubscriber) firehoseReconcileRun(rec *reconciler) func(context.Con
 		keep: func(e RawEvent) bool {
 			s.routerMu.RLock()
 			defer s.routerMu.RUnlock()
-			return s.router[e.ContractAddress.String()] != nil
+			sk := s.router[e.ContractAddress.String()]
+			return sk != nil && e.BlockNumber >= sk.floor
 		},
 		delivered: func(e RawEvent) { s.setSinkLast(e.ContractAddress.String(), e.BlockNumber, false) },
 	}

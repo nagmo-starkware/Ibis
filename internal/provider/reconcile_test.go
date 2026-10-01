@@ -561,7 +561,7 @@ func TestCapCursorsToNeverMovesForward(t *testing.T) {
 // until it can, so reconcile keeps making progress instead of retrying the same
 // range forever.
 func TestReconcileSplitsOversizedRange(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 131)
@@ -581,7 +581,7 @@ func TestReconcileSplitsOversizedRange(t *testing.T) {
 
 // reconcile_lag 0 is honoured: the tip block itself is reconciled.
 func TestReconcileLagZero(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 140)
@@ -603,7 +603,7 @@ func TestReconcileLagZero(t *testing.T) {
 // while they were still unreconciled (the seen set, not lastReconciled, matters).
 func TestReconcileReorgRecoversFromReorgStart(t *testing.T) {
 	for _, phase := range []string{"after-reconcile", "before-reconcile"} {
-		for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
+		for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
 			t.Run(phase+"/"+site.name, func(t *testing.T) {
 				interval := 20 * time.Millisecond
 				if phase == "before-reconcile" {
@@ -654,7 +654,7 @@ func TestReconcileReorgRecoversFromReorgStart(t *testing.T) {
 // Healthy live stream, repeated reconnects: each reconnect re-delivers only the
 // few blocks past lastReconciled, a bounded number that does not grow.
 func TestReconcileReconnectRedeliveryBounded(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			node := newGapNode()
@@ -690,14 +690,19 @@ func TestReconcileReconnectRedeliveryBounded(t *testing.T) {
 // (delivered by its own backfill) is not delivered again, its later events are
 // recovered. A removed contract is no longer reconciled.
 func TestReconcileLateJoinerAndRemoved(t *testing.T) {
-	site := reconSites("keys-sub")[0]
+	for _, site := range reconSites("keys-sub", "shared-firehose") {
+		t.Run(site.name, func(t *testing.T) { lateJoinerAndRemoved(t, site) })
+	}
+}
+
+func lateJoinerAndRemoved(t *testing.T, site gapSite) {
 	chain := newGapChain(121, 121)
 	chain.add(128, 0xB1) // B's history, below its join point
 	chain.add(143, 0xB1) // after the join: the live stream drops it
 	chain.add(143, 0xB2) // B2 is removed first
 	chain.add(143, 0xA)  // control
 	node := newGapNode()
-	site.contracts = append(site.contracts, ContractSubscription{Address: newTestFelt(0xB2), StartBlock: 100, Wildcard: true})
+	site.contracts = append(append([]ContractSubscription(nil), site.contracts...), ContractSubscription{Address: newTestFelt(0xB2), StartBlock: 100, Wildcard: true})
 	sub, events, _ := startReconSite(t, site, chain, node, 300*time.Millisecond)
 	node.nextFor(t, site)
 	waitLive(t, sub)
@@ -1116,5 +1121,15 @@ func TestReconcileChildHubRetryKeepsMembership(t *testing.T) {
 	}
 	if f.last(1) != 148 || f.last(2) != 148 || f.last(3) != 100 {
 		t.Errorf("last = %d %d %d, want 148 148 100", f.last(1), f.last(2), f.last(3))
+	}
+}
+
+func TestCapSinksToNeverMovesForward(t *testing.T) {
+	s := &EventSubscriber{router: map[string]*firehoseSink{}}
+	s.addSink(ContractSubscription{Address: newTestFelt(1)}, 50)
+	s.addSink(ContractSubscription{Address: newTestFelt(2)}, 10)
+	s.capSinksTo(30)
+	if a, b := s.router[newTestFelt(1).String()].lastBlock, s.router[newTestFelt(2).String()].lastBlock; a != 30 || b != 10 {
+		t.Errorf("sink cursors %d and %d, want 30 and 10", a, b)
 	}
 }
