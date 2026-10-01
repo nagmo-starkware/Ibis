@@ -19,6 +19,8 @@ var rootCmd = &cobra.Command{
 	Long: `Ibis indexes events from Starknet smart contracts using only an RPC
 connection, generates typed database tables and REST APIs from contract
 ABIs, and launches with a single command from a YAML config file.`,
+	// main prints the error itself, URL-redacted: RPC URLs carry the API key.
+	SilenceErrors: true,
 }
 
 func Execute() error {

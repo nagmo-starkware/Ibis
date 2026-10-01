@@ -95,7 +95,7 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger = newRedactingLogger(logger) // RPC URLs carry the API key
+	logger = NewRedactingLogger(logger) // RPC URLs carry the API key
 
 	httpURL := ToHTTPURL(rpcURL)
 	wsURL := ToWSURL(rpcURL)
@@ -108,7 +108,7 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 		if errors.Is(err, rpc.ErrIncompatibleVersion) && httpRPC != nil {
 			logger.Warn("RPC spec version mismatch (provider still usable)", "error", err)
 		} else {
-			return nil, fmt.Errorf("creating HTTP provider: %s", redactURLs(err.Error()))
+			return nil, fmt.Errorf("creating HTTP provider: %s", RedactURLs(err.Error()))
 		}
 	}
 
@@ -126,7 +126,11 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 // BlockNumber returns the latest block number directly from the chain (one RPC
 // call). Prefer CachedBlockNumber on hot paths — see StartTipPoller.
 func (p *StarknetProvider) BlockNumber(ctx context.Context) (uint64, error) {
-	return p.httpRPC.BlockNumber(ctx)
+	n, err := p.httpRPC.BlockNumber(ctx)
+	if err != nil {
+		return 0, redactErr(err)
+	}
+	return n, nil
 }
 
 // PreConfirmedBlockNumber returns the number of the block currently being
@@ -134,7 +138,7 @@ func (p *StarknetProvider) BlockNumber(ctx context.Context) (uint64, error) {
 func (p *StarknetProvider) PreConfirmedBlockNumber(ctx context.Context) (uint64, error) {
 	res, err := p.httpRPC.BlockWithTxHashes(ctx, rpc.WithBlockTag(rpc.BlockTagPreConfirmed))
 	if err != nil {
-		return 0, fmt.Errorf("fetching pre_confirmed block: %w", err)
+		return 0, fmt.Errorf("fetching pre_confirmed block: %w", redactErr(err))
 	}
 	switch b := res.(type) {
 	case *rpc.PreConfirmedBlockTxHashes:
@@ -214,7 +218,7 @@ func (p *StarknetProvider) CachedBlockNumber(ctx context.Context) (uint64, error
 		if bn != 0 {
 			return bn, nil
 		}
-		return 0, err
+		return 0, redactErr(err)
 	}
 	p.tipBlock.Store(fresh)
 	p.tipUpdated.Store(time.Now().UnixNano())
@@ -234,7 +238,7 @@ func (p *StarknetProvider) GetBlockTimestamp(ctx context.Context, blockNumber ui
 	blockID := rpc.BlockID{Number: &blockNumber}
 	result, err := p.httpRPC.BlockWithTxHashes(ctx, blockID)
 	if err != nil {
-		return 0, fmt.Errorf("fetching block %d header: %w", blockNumber, err)
+		return 0, fmt.Errorf("fetching block %d header: %w", blockNumber, redactErr(err))
 	}
 
 	var ts uint64
@@ -296,7 +300,7 @@ func (p *StarknetProvider) GetEvents(ctx context.Context, opts GetEventsOptions)
 
 		chunk, err := p.httpRPC.Events(ctx, input)
 		if err != nil {
-			return allEvents, fmt.Errorf("fetching events: %w", err)
+			return allEvents, fmt.Errorf("fetching events: %w", redactErr(err))
 		}
 
 		for i := range chunk.Events {
@@ -323,24 +327,26 @@ func (p *StarknetProvider) GetEvents(ctx context.Context, opts GetEventsOptions)
 // Call executes a read-only function call on a Starknet contract.
 // Returns the raw felt array result from starknet_call.
 func (p *StarknetProvider) Call(ctx context.Context, contractAddress, entryPointSelector *felt.Felt, calldata []*felt.Felt, blockID rpc.BlockID) ([]*felt.Felt, error) {
-	return p.httpRPC.Call(ctx, rpc.FunctionCall{
+	res, err := p.httpRPC.Call(ctx, rpc.FunctionCall{
 		ContractAddress:    contractAddress,
 		EntryPointSelector: entryPointSelector,
 		Calldata:           calldata,
 	}, blockID)
+	return res, redactErr(err)
 }
 
 // ClassAt fetches the contract class at the given address.
 // Satisfies the config.ABIFetcher interface for chain-based ABI resolution.
 func (p *StarknetProvider) ClassAt(ctx context.Context, blockID rpc.BlockID, contractAddress *felt.Felt) (rpc.ClassOutput, error) {
-	return p.httpRPC.ClassAt(ctx, blockID, contractAddress)
+	res, err := p.httpRPC.ClassAt(ctx, blockID, contractAddress)
+	return res, redactErr(err)
 }
 
 // GetClassAt fetches the contract class (ABI) at the given address as raw JSON.
 func (p *StarknetProvider) GetClassAt(ctx context.Context, address *felt.Felt) (json.RawMessage, error) {
 	result, err := p.httpRPC.ClassAt(ctx, rpc.BlockID{Tag: rpc.BlockTagLatest}, address)
 	if err != nil {
-		return nil, fmt.Errorf("fetching class at %s: %w", address, err)
+		return nil, fmt.Errorf("fetching class at %s: %w", address, redactErr(err))
 	}
 
 	raw, err := json.Marshal(result)
@@ -386,4 +392,22 @@ func ToWSURL(url string) string {
 		return "ws://" + strings.TrimPrefix(url, "http://")
 	}
 	return url
+}
+
+// redactedError masks URLs in the message but keeps the chain for errors.Is/As.
+type redactedError struct{ err error }
+
+func (e redactedError) Error() string { return RedactURLs(e.err.Error()) }
+func (e redactedError) Unwrap() error { return e.err }
+
+// redactErr hides RPC URLs (API keys) in err's message; nil and already
+// redacted errors pass through.
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := err.(redactedError); ok {
+		return err
+	}
+	return redactedError{err}
 }
