@@ -1068,7 +1068,13 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 			func(c context.Context, p uint64) (err error) {
 				next, err = s.backfillFrom(c, contract, resume, p)
 				if err == nil {
-					rec.start(p) // hand off: reconcile covers (p, ..]
+					// Hand off: reconcile covers what follows. Blocks below resume
+					// are another mechanism's (a late joiner's own backfill).
+					startAt := p
+					if resume > p+1 {
+						startAt = resume - 1
+					}
+					rec.start(startAt)
 				}
 				return err
 			},
@@ -1170,7 +1176,7 @@ func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSess
 				continue
 			}
 
-			rec.observe(evt.BlockNumber, idOf(evt.TransactionHash, evt.FromAddress, evt.Keys, evt.Data))
+			rec.observe(evt.BlockNumber, emittedID(evt))
 
 			var ts uint64
 			if t, err := s.provider.GetBlockTimestamp(ctx, evt.BlockNumber); err == nil {
