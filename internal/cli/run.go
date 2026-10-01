@@ -44,10 +44,7 @@ var runCmd = &cobra.Command{
 			cfg.Indexer.SharedTipPoller = v == "1" || v == "true"
 		}
 
-		// Root logger for the whole process: RPC URLs carry the API key.
-		logger := provider.NewRedactingLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
-		})))
+		logger := newRootLogger(os.Stderr)
 
 		printConfigSummary(cmd.OutOrStdout(), cfgPath, cfg)
 
@@ -178,4 +175,12 @@ func printConfigSummary(w io.Writer, path string, cfg *config.Config) {
 	for _, c := range cfg.Contracts {
 		fmt.Fprintf(w, "    - %s (%s): %d events\n", c.Name, c.Address, len(c.Events))
 	}
+}
+
+// newRootLogger builds the process-wide logger; RPC URLs carry the API key,
+// so every log line is URL-redacted.
+func newRootLogger(w io.Writer) *slog.Logger {
+	return provider.NewRedactingLogger(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
 }

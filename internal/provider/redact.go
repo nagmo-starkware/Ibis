@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/url"
 	"regexp"
+	"strings"
 )
 
 // RPC endpoints carry their API key in the URL path (or query), and Go's HTTP
@@ -18,6 +19,9 @@ var urlRE = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s"'<>\\]+`)
 
 // RedactURLs masks the path, query and userinfo of every URL in s.
 func RedactURLs(s string) string {
+	if !strings.Contains(s, "://") {
+		return s
+	}
 	return urlRE.ReplaceAllStringFunc(s, func(m string) string {
 		u, err := url.Parse(m)
 		if err != nil || u.Host == "" {
@@ -60,7 +64,11 @@ func redactAttr(a slog.Attr) slog.Attr {
 		case error:
 			return slog.String(a.Key, RedactURLs(v.Error()))
 		case fmt.Stringer:
-			return slog.String(a.Key, RedactURLs(v.String()))
+			if str, ok := safeString(v); ok {
+				if red := RedactURLs(str); red != str {
+					return slog.String(a.Key, red)
+				}
+			}
 		}
 	}
 	return a
@@ -82,4 +90,14 @@ func (h redactHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h redactHandler) WithGroup(name string) slog.Handler {
 	return redactHandler{h.Handler.WithGroup(name)}
+}
+
+// safeString calls v.String(), reporting false if it panics (typed-nil receiver).
+func safeString(v fmt.Stringer) (s string, ok bool) {
+	defer func() {
+		if recover() != nil {
+			s, ok = "", false
+		}
+	}()
+	return v.String(), true
 }

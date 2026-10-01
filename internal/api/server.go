@@ -13,6 +13,7 @@ import (
 
 	"github.com/b-j-roberts/ibis/internal/config"
 	"github.com/b-j-roberts/ibis/internal/engine"
+	"github.com/b-j-roberts/ibis/internal/provider"
 	"github.com/b-j-roberts/ibis/internal/store"
 	"github.com/b-j-roberts/ibis/internal/types"
 )
@@ -290,5 +291,5 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeJSON(w, status, map[string]string{"error": provider.RedactURLs(msg)})
 }
