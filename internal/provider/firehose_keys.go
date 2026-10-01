@@ -456,8 +456,8 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 			return ctx.Err()
 		}
 		if err != nil {
-			// Subscribing anyway would resume from a block the node can no
-			// longer replay and write a permanent hole into the store. Back off
+			// Subscribing anyway would leave a gap between the cursors and the
+			// post-subscribe backfill (a permanent hole in the store). Back off
 			// and re-run the whole gap-fill instead. The stream stays
 			// not-live meanwhile, which /v1/catchup_status reports and a
 			// promote gate blocks on, rather than looking healthy while losing
@@ -482,7 +482,7 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 			subInput.SubBlockID = rpc.SubscriptionBlockID{Number: &bn}
 		}
 
-		session, err := s.dialWSS(ctx, s.provider.wsURL, subInput)
+		session, p, err := s.dialWithGap(ctx, subInput)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -497,14 +497,21 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 			backoff = time.Duration(math.Min(float64(backoff)*2, float64(maxBackoff)))
 			continue
 		}
-		backoff = minBackoff
-		s.logger.Info("firehose-keys WSS active", "stream", st.label, "from_block", fromBlock)
+		s.logger.Info("firehose-keys WSS subscribed; backfilling to pre-confirmed",
+			"stream", st.label, "from_block", fromBlock, "pre_confirmed", p)
 
-		// Live only for the duration of the session: gap-fill above and the
-		// reconnect backoff below both count as not-live, which is exactly
-		// what a promote gate needs to distinguish from "serving fine".
-		live.set(true)
-		err = s.processKeysStream(ctx, st, session)
+		// Live only once the post-subscribe backfill is done (the node does not
+		// replay from from_block): gap-fill, that backfill and the reconnect
+		// backoff all count as not-live, which is exactly what a promote gate
+		// needs to distinguish from "serving fine".
+		base := st.streamBase()
+		backfilled, err := s.serveSession(ctx, live, p,
+			func(c context.Context, p uint64) error { return s.keysStreamBackfill(c, st, base, fromBlock, p) },
+			func(c context.Context) error { return s.processKeysStream(c, st, session) })
+		backoff = backoffAfterSession(backoff, err)
+		if !backfilled {
+			st.capCursors(base)
+		}
 		live.set(false)
 		session.close()
 		if ctx.Err() != nil {
@@ -524,22 +531,21 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 
 // keysStreamGapFill brings every contract in st's gap-fill set within
 // catchupThreshold of chain tip over HTTP, then returns the min cursor across
-// them to resume st's subscription from.
+// them: the block st's post-subscribe backfill starts from (the node does not
+// replay from it, see subscribe_backfill.go).
 //
 // The fan-out is REPEATED until the whole set sits within catchupThreshold of
 // the tip at the same time. One pass is not enough: the pass returns only when
 // its slowest contract finishes, and with thousands of fills sharing
 // maxConcurrentCatchup that wait can run for over an hour. Contracts that
-// finished early are stale by then, and the resume block handed to WSS is as
-// old as the slowest cursor -- far outside the node's replay window, so every
-// event in between is dropped silently and permanently. Repeating costs little:
-// each pass only covers the blocks produced during the previous one, so cursors
-// converge on the tip geometrically, and the resume lands inside the replay
-// window where the node can actually redeliver.
+// finished early are stale by then, and the resume block handed to the
+// post-subscribe backfill is as old as the slowest cursor -- an arbitrarily
+// large range to fetch in one go. Repeating costs little: each pass only
+// covers the blocks produced during the previous one, so cursors converge on
+// the tip geometrically and that backfill stays small.
 // Returns an error rather than a usable resume block whenever it cannot get
-// the whole set to the tip. Every failure here would mean subscribing from a
-// block the node can no longer replay, i.e. writing a permanent hole into the
-// store -- so the caller must retry, never proceed.
+// the whole set to the tip, so the caller retries instead of backfilling a huge
+// range (or, worse, skipping part of it).
 func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKeysStream) (uint64, error) {
 	var prev uint64
 	var prevFills int
@@ -565,8 +571,8 @@ func (s *EventSubscriber) keysStreamGapFill(ctx context.Context, st *firehoseKey
 		// safe to subscribe, and s.tipBlockNumber goes through CachedBlockNumber
 		// on this transport — which, when the RPC fails, returns the last cached
 		// tip with a nil error, however stale. A stale, low tip makes a lagging
-		// cursor look converged and hands WSS a resume block outside the replay
-		// window. One direct RPC per pass is negligible next to the pass itself.
+		// cursor look converged and hands the backfill a far larger range.
+		// One direct RPC per pass is negligible next to the pass itself.
 		tip, err := s.provider.BlockNumber(ctx)
 		if err != nil {
 			return 0, fmt.Errorf("reading chain tip after gap-fill pass %d: %w", pass, err)

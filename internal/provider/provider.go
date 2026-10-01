@@ -128,6 +128,23 @@ func (p *StarknetProvider) BlockNumber(ctx context.Context) (uint64, error) {
 	return p.httpRPC.BlockNumber(ctx)
 }
 
+// PreConfirmedBlockNumber returns the number of the block currently being
+// built (the "pre_confirmed" tag), one RPC call.
+func (p *StarknetProvider) PreConfirmedBlockNumber(ctx context.Context) (uint64, error) {
+	res, err := p.httpRPC.BlockWithTxHashes(ctx, rpc.WithBlockTag(rpc.BlockTagPreConfirmed))
+	if err != nil {
+		return 0, fmt.Errorf("fetching pre_confirmed block: %w", err)
+	}
+	switch b := res.(type) {
+	case *rpc.PreConfirmedBlockTxHashes:
+		return b.Number, nil
+	case *rpc.BlockTxHashes:
+		return b.Number, nil
+	default:
+		return 0, fmt.Errorf("unexpected pre_confirmed block type %T", res)
+	}
+}
+
 // StartTipPoller primes the chain-tip cache with one synchronous fetch, then
 // launches a background goroutine that refreshes it every interval until ctx is
 // canceled. Subscriber goroutines read the cached value via CachedBlockNumber,

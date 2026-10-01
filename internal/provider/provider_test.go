@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -103,6 +104,23 @@ func mockRPCServer(t *testing.T, handlers map[string]func(params json.RawMessage
 	if _, ok := handlers["starknet_specVersion"]; !ok {
 		handlers["starknet_specVersion"] = func(_ json.RawMessage) (interface{}, error) {
 			return "0.9.0", nil
+		}
+	}
+
+	// Every WSS subscribe now reads the pre_confirmed block: default it to the
+	// current tip (already accepted) unless a test supplies its own handler.
+	if _, ok := handlers["starknet_getBlockWithTxHashes"]; !ok {
+		if tip, ok := handlers["starknet_blockNumber"]; ok {
+			handlers["starknet_getBlockWithTxHashes"] = func(params json.RawMessage) (interface{}, error) {
+				if !strings.Contains(string(params), "pre_confirmed") {
+					return nil, fmt.Errorf("block not found")
+				}
+				n, err := tip(nil)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{"block_number": n, "timestamp": 1}, nil
+			}
 		}
 	}
 
