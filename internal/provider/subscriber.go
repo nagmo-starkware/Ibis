@@ -1063,20 +1063,33 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 		// the reconnect backoff below reads as not-live.
 		resume := *lastBlock
 		liveLast, next := resume, resume
+		rec := s.newSessionReconciler()
 		backfilled, err := s.serveSession(ctx, live, p,
 			func(c context.Context, p uint64) (err error) {
 				next, err = s.backfillFrom(c, contract, resume, p)
+				if err == nil {
+					// Hand off: reconcile covers what follows. Blocks below resume
+					// are another mechanism's (a late joiner's own backfill).
+					startAt := p
+					if resume > p+1 {
+						startAt = resume - 1
+					}
+					rec.start(startAt)
+				}
 				return err
 			},
 			func(c context.Context) (err error) {
-				eventsProcessed, err = s.processWSSEvents(c, session, &liveLast, logger)
+				eventsProcessed, err = s.processWSSEvents(c, session, &liveLast, logger, rec)
 				return err
 			},
-			nil)
+			s.contractReconcileRun(contract, rec))
 		backoff = backoffAfterSession(backoff, err)
 		if backfilled {
 			// The backfill covered through P, so a quiet contract advances too.
 			*lastBlock = max(liveLast, p)
+			if f := rec.resumeFloor(); f > 0 {
+				*lastBlock = min(*lastBlock, f) // never resume past the unreconciled range
+			}
 		} else {
 			*lastBlock = min(next, liveLast)
 		}
@@ -1123,7 +1136,7 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 // processWSSEvents reads events from an active WSS session until an error
 // occurs or the context is canceled. Returns the number of events successfully
 // processed and the error that ended the session.
-func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSession, lastBlock *uint64, logger *slog.Logger) (int, error) {
+func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSession, lastBlock *uint64, logger *slog.Logger, rec *reconciler) (int, error) {
 	eventsProcessed := 0
 	lastLogBlock := *lastBlock
 	for {
@@ -1151,6 +1164,7 @@ func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSess
 						return eventsProcessed, ctx.Err()
 					}
 				}
+				rec.rollback(reorg.StartBlockNum)
 				// Reset to reorg start so the subscriber re-fetches.
 				if reorg.StartBlockNum < *lastBlock {
 					*lastBlock = reorg.StartBlockNum
@@ -1161,6 +1175,8 @@ func (s *EventSubscriber) processWSSEvents(ctx context.Context, session *wssSess
 			if evt == nil {
 				continue
 			}
+
+			rec.observe(evt.BlockNumber, emittedID(evt))
 
 			var ts uint64
 			if t, err := s.provider.GetBlockTimestamp(ctx, evt.BlockNumber); err == nil {

@@ -639,3 +639,29 @@ func (s *EventSubscriber) firehoseReconcileRun(rec *reconciler) func(context.Con
 		})
 	}
 }
+
+// --- per-contract WSS --------------------------------------------------------
+
+// contractReconcileRun returns the loop to run while a per-contract session is
+// live (nil = none). Scope: the contract's own address and keys. This costs
+// O(contracts) calls per tick (one tip read plus one query each), bounded by
+// the shared semaphore; the per-contract transport is for small deployments.
+func (s *EventSubscriber) contractReconcileRun(c ContractSubscription, rec *reconciler) func(context.Context) {
+	if rec == nil {
+		return nil
+	}
+	sc := reconcileScope{
+		label: "contract:" + c.Address.String(),
+		fetch: func(ctx context.Context, from, to uint64) ([]RawEvent, error) {
+			return s.provider.GetEvents(ctx, GetEventsOptions{
+				FromBlock: from, ToBlock: to, Address: c.Address, Keys: c.Keys, ChunkSize: 1000,
+			})
+		},
+		keep: func(RawEvent) bool { return true },
+	}
+	return func(ctx context.Context) {
+		s.reconcileLoop(ctx, sc.label, func(cx context.Context, l *slog.Logger) error {
+			return s.reconcileTick(cx, rec, sc, l)
+		})
+	}
+}

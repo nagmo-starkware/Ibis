@@ -38,7 +38,7 @@ func (s *syncBuf) String() string {
 
 // reconTransports names the gap sites whose live stream is reconciled at this
 // point of the series; tests over "all transports" range over it.
-var reconTransports = []string{"keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose"}
+var reconTransports = []string{"keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract"}
 
 // reconSites are the gap sites whose live stream is reconciled.
 func reconSites(names ...string) []gapSite {
@@ -64,6 +64,8 @@ func reconLabel(site gapSite) string {
 		return "child-transfer:" + newTestFelt(site.addr).String()
 	case "shared-firehose":
 		return "firehose"
+	case "per-contract":
+		return "contract:" + newTestFelt(site.addr).String()
 	}
 	return site.name
 }
@@ -159,7 +161,7 @@ func collect(ch <-chan RawEvent, d time.Duration) (live, catchup []uint64) {
 // recovers exactly that one, flagged IsCatchup, logs it at WARN, and neither
 // re-delivers what the live path delivered nor what the backfill delivered.
 func TestReconcileRecoversDroppedLiveEvent(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 105) // gap event: delivered by the post-subscribe backfill
@@ -237,7 +239,7 @@ func TestReconcileChildrenShareOneQuery(t *testing.T) {
 // A failed reconcile does not advance lastReconciled: the next successful tick
 // still covers the range and recovers the event.
 func TestReconcileFailureDoesNotAdvance(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 131)
@@ -274,7 +276,7 @@ func TestReconcileFailureDoesNotAdvance(t *testing.T) {
 // A session that drops before reconcile caught up resumes at/below the first
 // unreconciled block, though live events advanced the cursors past it.
 func TestReconcileDropResumesBelowUnreconciled(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			node := newGapNode()
@@ -302,7 +304,7 @@ func TestReconcileDropResumesBelowUnreconciled(t *testing.T) {
 // Interval 0 turns reconcile off: no fetch after the backfill and the dropped
 // event stays dropped.
 func TestReconcileDisabled(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 131)
@@ -561,7 +563,7 @@ func TestCapCursorsToNeverMovesForward(t *testing.T) {
 // until it can, so reconcile keeps making progress instead of retrying the same
 // range forever.
 func TestReconcileSplitsOversizedRange(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 131)
@@ -581,7 +583,7 @@ func TestReconcileSplitsOversizedRange(t *testing.T) {
 
 // reconcile_lag 0 is honoured: the tip block itself is reconciled.
 func TestReconcileLagZero(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 140)
@@ -603,7 +605,7 @@ func TestReconcileLagZero(t *testing.T) {
 // while they were still unreconciled (the seen set, not lastReconciled, matters).
 func TestReconcileReorgRecoversFromReorgStart(t *testing.T) {
 	for _, phase := range []string{"after-reconcile", "before-reconcile"} {
-		for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+		for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 			t.Run(phase+"/"+site.name, func(t *testing.T) {
 				interval := 20 * time.Millisecond
 				if phase == "before-reconcile" {
@@ -654,7 +656,7 @@ func TestReconcileReorgRecoversFromReorgStart(t *testing.T) {
 // Healthy live stream, repeated reconnects: each reconnect re-delivers only the
 // few blocks past lastReconciled, a bounded number that does not grow.
 func TestReconcileReconnectRedeliveryBounded(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			node := newGapNode()
@@ -690,7 +692,7 @@ func TestReconcileReconnectRedeliveryBounded(t *testing.T) {
 // (delivered by its own backfill) is not delivered again, its later events are
 // recovered. A removed contract is no longer reconciled.
 func TestReconcileLateJoinerAndRemoved(t *testing.T) {
-	for _, site := range reconSites("keys-sub", "shared-firehose") {
+	for _, site := range reconSites("keys-sub", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) { lateJoinerAndRemoved(t, site) })
 	}
 }
