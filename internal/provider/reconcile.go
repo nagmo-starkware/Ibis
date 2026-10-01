@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -462,18 +463,16 @@ func (s *EventSubscriber) deliverMissed(ctx context.Context, rec *reconciler, ep
 
 // --- firehose-keys streams ---------------------------------------------------
 
-// streamReconciler returns a fresh reconciler for st's session, or nil when st
-// is not reconciled.
-func (s *EventSubscriber) streamReconciler(st *firehoseKeysStream) *reconciler {
-	if st.address != nil {
-		return nil // address-subs: later commit
-	}
+// streamReconciler returns a fresh reconciler for st's session (nil = off).
+func (s *EventSubscriber) streamReconciler(*firehoseKeysStream) *reconciler {
 	return s.newSessionReconciler()
 }
 
-// streamReconcileRun returns the loop to run while st's session is live (nil = none).
+// streamReconcileRun returns the loop to run while st's session is live (nil =
+// none). Child Transfer/Approval streams are reconciled together by
+// childReconcileLoop instead of one HTTP loop each.
 func (s *EventSubscriber) streamReconcileRun(st *firehoseKeysStream, rec *reconciler) func(context.Context) {
-	if rec == nil {
+	if rec == nil || st.collective {
 		return nil
 	}
 	sc := s.keysStreamScope(st)
@@ -484,8 +483,8 @@ func (s *EventSubscriber) streamReconcileRun(st *firehoseKeysStream, rec *reconc
 	}
 }
 
-// keysStreamScope is st's own subscription filter, routed like keysStreamBackfill:
-// tracked contracts only.
+// keysStreamScope is st's own subscription filter (address and keys), routed
+// like keysStreamBackfill: tracked contracts only.
 func (s *EventSubscriber) keysStreamScope(st *firehoseKeysStream) reconcileScope {
 	return reconcileScope{
 		label: st.label,
@@ -503,4 +502,111 @@ func (s *EventSubscriber) keysStreamScope(st *firehoseKeysStream) reconcileScope
 			st.setCursor(e.ContractAddress.String(), e.BlockNumber, false)
 		},
 	}
+}
+
+// childReconcileLoop reconciles every live child Transfer/Approval stream with
+// ONE keys-filtered, address-less query per tick (all children share the
+// filter), instead of one HTTP loop per child (~2000 on mainnet). The cost is a
+// payload of the chain's Transfer/Approval events for the tick's blocks, of
+// which only the tracked children's are kept.
+func (s *EventSubscriber) childReconcileLoop(ctx context.Context) {
+	s.reconcileLoop(ctx, "child-transfer", s.childReconcileTick)
+}
+
+type childMember struct {
+	st    *firehoseKeysStream
+	rec   *reconciler
+	epoch uint64
+}
+
+// active reports whether the member's session is still the one the tick
+// started with and no rollback has happened since.
+func (m childMember) active() bool {
+	if m.st.rec.Load() != m.rec {
+		return false
+	}
+	_, epoch := m.rec.snapshot()
+	return epoch == m.epoch
+}
+
+func (s *EventSubscriber) childReconcileTick(ctx context.Context, logger *slog.Logger) error {
+	to, err := s.reconcileTarget(ctx)
+	if err != nil {
+		return err
+	}
+	members := make(map[string]childMember)
+	from := uint64(math.MaxUint64)
+	s.streamsMu.Lock()
+	for addr, st := range s.addrStreams {
+		rec := st.rec.Load()
+		if !st.collective || rec == nil {
+			continue
+		}
+		if _, ready := rec.state(); !ready {
+			continue
+		}
+		if last, epoch := rec.snapshot(); last < to {
+			members[addr] = childMember{st, rec, epoch}
+			from = min(from, last+1)
+		}
+	}
+	s.streamsMu.Unlock()
+	if len(members) == 0 {
+		return nil
+	}
+
+	fetch := func(ctx context.Context, from, to uint64) ([]RawEvent, error) {
+		return s.provider.GetEvents(ctx, GetEventsOptions{
+			FromBlock: from, ToBlock: to, Keys: childTransferKeys(), ChunkSize: 1000,
+		})
+	}
+	recovered := 0
+	for cur := from; cur <= to; {
+		end := min(cur+s.blocksPerQuery-1, to)
+		err := s.splitRetry(ctx, cur, end, logger, func(f, t uint64) error {
+			events, err := s.reconcileFetch(ctx, fetch, f, t)
+			if err != nil {
+				return fmt.Errorf("events [%d, %d]: %w", f, t, err)
+			}
+			// Membership is fixed at tick start; whether a member is still
+			// valid is re-derived on every attempt, so a retry of a split
+			// range neither resurrects a stale member nor skips a healthy one.
+			byAddr := make(map[string][]RawEvent)
+			for _, e := range events {
+				if e.ContractAddress == nil {
+					continue
+				}
+				a := e.ContractAddress.String()
+				m, ok := members[a]
+				if !ok || !m.active() || !s.isTracked(a) || e.BlockNumber < m.st.floor(a) {
+					continue
+				}
+				if last, _ := m.rec.state(); e.BlockNumber > last {
+					byAddr[a] = append(byAddr[a], e)
+				}
+			}
+			for a, evs := range byAddr {
+				m := members[a]
+				n, err := s.deliverMissed(ctx, m.rec, m.epoch, s.keysStreamScope(m.st), evs, logger)
+				recovered += n
+				if err != nil && !errors.Is(err, errReconcileStale) {
+					return err
+				}
+			}
+			for _, m := range members {
+				if m.active() {
+					m.rec.advance(t, m.epoch) // false (rolled back mid-tick): left for the next tick
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		cur = end + 1
+	}
+	if recovered > 0 {
+		logger.Warn("reconcile recovered events the live stream missed", "from", from, "to", to, "recovered", recovered)
+	}
+	return nil
 }

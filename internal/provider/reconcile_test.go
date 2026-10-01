@@ -38,7 +38,7 @@ func (s *syncBuf) String() string {
 
 // reconTransports names the gap sites whose live stream is reconciled at this
 // point of the series; tests over "all transports" range over it.
-var reconTransports = []string{"keys-sub"}
+var reconTransports = []string{"keys-sub", "keys-address-sub", "keys-child-transfer"}
 
 // reconSites are the gap sites whose live stream is reconciled.
 func reconSites(names ...string) []gapSite {
@@ -58,18 +58,42 @@ func reconLabel(site gapSite) string {
 	switch site.name {
 	case "keys-sub":
 		return "keys-sub"
+	case "keys-address-sub":
+		return "token:" + newTestFelt(site.addr).String()
+	case "keys-child-transfer":
+		return "child-transfer:" + newTestFelt(site.addr).String()
 	}
 	return site.name
 }
 
+// reconKey is keys[0] of the site's events: a Transfer for the child stream (so
+// only its filter selects them), else the match-any 0x1.
+func reconKey(site gapSite) *felt.Felt {
+	if site.name == "keys-child-transfer" {
+		return transferSelector
+	}
+	return newTestFelt(1)
+}
+
 // reconAdd puts an event of the site's scope on the chain.
-func reconAdd(chain *gapChain, site gapSite, block uint64) { chain.add(block, site.addr) }
+func reconAdd(chain *gapChain, site gapSite, block uint64) {
+	switch site.name {
+	case "keys-child-transfer":
+		chain.addKeyed(block, site.addr, transferSelector)
+	case "keys-address-sub":
+		// Keyed, so the keys-sub's filter (0x999) does not also select it.
+		chain.addKeyed(block, site.addr, newTestFelt(1))
+	default:
+		chain.add(block, site.addr)
+	}
+}
 
 // reconLive is a live event whose identity matches what gapChain serves over
-// HTTP for (addr, block): tx hash = block, keys [1], data [2].
-func reconLive(addr, block uint64) *rpc.EmittedEventWithFinalityStatus {
-	e := fhEvent(addr, block)
+// HTTP for the site at block: tx hash = block, keys [reconKey], data [2].
+func reconLive(site gapSite, block uint64) *rpc.EmittedEventWithFinalityStatus {
+	e := fhEvent(site.addr, block)
 	e.TransactionHash = newTestFelt(block)
+	e.Keys = []*felt.Felt{reconKey(site)}
 	return e
 }
 
@@ -133,12 +157,12 @@ func collect(ch <-chan RawEvent, d time.Duration) (live, catchup []uint64) {
 // recovers exactly that one, flagged IsCatchup, logs it at WARN, and neither
 // re-delivers what the live path delivered nor what the backfill delivered.
 func TestReconcileRecoversDroppedLiveEvent(t *testing.T) {
-	for _, site := range reconSites("keys-sub") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
-			chain.add(105, site.addr) // gap event: delivered by the post-subscribe backfill
+			reconAdd(chain, site, 105) // gap event: delivered by the post-subscribe backfill
 			for _, b := range []uint64{130, 131, 132} {
-				chain.add(b, site.addr)
+				reconAdd(chain, site, b)
 			}
 			node := newGapNode()
 			sub, events, logs := startReconSite(t, site, chain, node, 20*time.Millisecond)
@@ -147,8 +171,8 @@ func TestReconcileRecoversDroppedLiveEvent(t *testing.T) {
 			waitLive(t, sub)
 			waitEvent(t, events, "backfilled @105", func(e RawEvent) bool { return e.BlockNumber == 105 })
 
-			sess.events <- reconLive(site.addr, 130)
-			sess.events <- reconLive(site.addr, 132) // 131 is dropped by the node
+			sess.events <- reconLive(site, 130)
+			sess.events <- reconLive(site, 132) // 131 is dropped by the node
 			waitEvent(t, events, "live @130", func(e RawEvent) bool { return e.BlockNumber == 130 && !e.IsCatchup })
 			waitEvent(t, events, "live @132", func(e RawEvent) bool { return e.BlockNumber == 132 && !e.IsCatchup })
 
@@ -174,13 +198,47 @@ func TestReconcileRecoversDroppedLiveEvent(t *testing.T) {
 	}
 }
 
+// Child Transfer/Approval streams are reconciled with one address-less query per
+// tick, not one per child: every child's dropped event is recovered exactly
+// once and no per-address query is issued.
+func TestReconcileChildrenShareOneQuery(t *testing.T) {
+	const n = 4
+	var subs []ContractSubscription
+	chain := newGapChain(121, 121)
+	for i := uint64(0); i < n; i++ {
+		subs = append(subs, ContractSubscription{Address: newTestFelt(0xD0 + i), StartBlock: 100, Wildcard: true, ERC20: true})
+		chain.addKeyed(131, 0xD0+i, transferSelector)
+	}
+	site := gapSite{"children", subs, SubscriberConfig{KeysFirehose: true, OptionSelectors: []*felt.Felt{newTestFelt(0x999)}}, 0xD0, 100, 0, n + 1}
+	node := newGapNode()
+	sub, events, _ := startReconSite(t, site, chain, node, 20*time.Millisecond)
+	waitLive(t, sub)
+
+	base := chain.addrCalls.Load()
+	chain.tip.Store(140)
+	seen := map[string]int{}
+	for i := 0; i < n; i++ {
+		e := waitEvent(t, events, "recovered child event", func(e RawEvent) bool { return e.BlockNumber == 131 && e.IsCatchup })
+		seen[e.ContractAddress.String()]++
+	}
+	if len(seen) != n {
+		t.Errorf("recovered events per child = %v, want one for each of %d children", seen, n)
+	}
+	if live, catchup := collect(events, 200*time.Millisecond); len(live)+len(catchup) != 0 {
+		t.Errorf("duplicate delivery: %v %v", live, catchup)
+	}
+	if got := chain.addrCalls.Load() - base; got != 0 {
+		t.Errorf("%d per-address getEvents calls during reconcile, want 0 (one shared query)", got)
+	}
+}
+
 // A failed reconcile does not advance lastReconciled: the next successful tick
 // still covers the range and recovers the event.
 func TestReconcileFailureDoesNotAdvance(t *testing.T) {
-	for _, site := range reconSites("keys-sub") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
-			chain.add(131, site.addr)
+			reconAdd(chain, site, 131)
 			node := newGapNode()
 			sub, events, logs := startReconSite(t, site, chain, node, 20*time.Millisecond)
 
@@ -214,7 +272,7 @@ func TestReconcileFailureDoesNotAdvance(t *testing.T) {
 // A session that drops before reconcile caught up resumes at/below the first
 // unreconciled block, though live events advanced the cursors past it.
 func TestReconcileDropResumesBelowUnreconciled(t *testing.T) {
-	for _, site := range reconSites("keys-sub") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			node := newGapNode()
@@ -223,7 +281,7 @@ func TestReconcileDropResumesBelowUnreconciled(t *testing.T) {
 
 			sess := node.nextFor(t, site)
 			waitLive(t, sub)
-			sess.events <- reconLive(site.addr, 130)
+			sess.events <- reconLive(site, 130)
 			waitEvent(t, events, "live @130", func(e RawEvent) bool { return e.BlockNumber == 130 })
 			sess.errs <- fmt.Errorf("socket dropped")
 
@@ -242,10 +300,10 @@ func TestReconcileDropResumesBelowUnreconciled(t *testing.T) {
 // Interval 0 turns reconcile off: no fetch after the backfill and the dropped
 // event stays dropped.
 func TestReconcileDisabled(t *testing.T) {
-	for _, site := range reconSites("keys-sub") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
-			chain.add(131, site.addr)
+			reconAdd(chain, site, 131)
 			node := newGapNode()
 			sub, events, _ := startReconSite(t, site, chain, node, 0)
 
@@ -501,7 +559,7 @@ func TestCapCursorsToNeverMovesForward(t *testing.T) {
 // until it can, so reconcile keeps making progress instead of retrying the same
 // range forever.
 func TestReconcileSplitsOversizedRange(t *testing.T) {
-	for _, site := range reconSites("keys-sub") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 131)
@@ -521,7 +579,7 @@ func TestReconcileSplitsOversizedRange(t *testing.T) {
 
 // reconcile_lag 0 is honoured: the tip block itself is reconciled.
 func TestReconcileLagZero(t *testing.T) {
-	for _, site := range reconSites("keys-sub") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			reconAdd(chain, site, 140)
@@ -543,7 +601,7 @@ func TestReconcileLagZero(t *testing.T) {
 // while they were still unreconciled (the seen set, not lastReconciled, matters).
 func TestReconcileReorgRecoversFromReorgStart(t *testing.T) {
 	for _, phase := range []string{"after-reconcile", "before-reconcile"} {
-		for _, site := range reconSites("keys-sub") {
+		for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
 			t.Run(phase+"/"+site.name, func(t *testing.T) {
 				interval := 20 * time.Millisecond
 				if phase == "before-reconcile" {
@@ -556,8 +614,8 @@ func TestReconcileReorgRecoversFromReorgStart(t *testing.T) {
 				sub, events, _ := startReconSite(t, site, chain, node, interval)
 				sess := node.nextFor(t, site)
 				waitLive(t, sub)
-				sess.events <- reconLive(site.addr, 130)
-				sess.events <- reconLive(site.addr, 131)
+				sess.events <- reconLive(site, 130)
+				sess.events <- reconLive(site, 131)
 				waitEvent(t, events, "live @131", func(e RawEvent) bool { return e.BlockNumber == 131 })
 
 				if phase == "after-reconcile" {
@@ -594,7 +652,7 @@ func TestReconcileReorgRecoversFromReorgStart(t *testing.T) {
 // Healthy live stream, repeated reconnects: each reconnect re-delivers only the
 // few blocks past lastReconciled, a bounded number that does not grow.
 func TestReconcileReconnectRedeliveryBounded(t *testing.T) {
-	for _, site := range reconSites("keys-sub") {
+	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer") {
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(121, 121)
 			node := newGapNode()
@@ -605,7 +663,7 @@ func TestReconcileReconnectRedeliveryBounded(t *testing.T) {
 			for k := 0; k < 4; k++ {
 				for b := tip + 1; b <= tip+10; b++ {
 					reconAdd(chain, site, b)
-					sess.events <- reconLive(site.addr, b)
+					sess.events <- reconLive(site, b)
 				}
 				tip += 10
 				chain.tip.Store(tip)
@@ -894,5 +952,167 @@ func TestReconcileReorgDuringBackfill(t *testing.T) {
 				t.Errorf("event @120 delivered %d times, want 2 (backfill, then re-read after the reorg): %v", got[key], got)
 			}
 		})
+	}
+}
+
+// Child Transfer/Approval streams: a child added mid-session is reconciled from
+// its join point (history delivered once by its own backfill, later events
+// recovered once); a removed child is no longer reconciled.
+func TestReconcileChildJoinAndRemove(t *testing.T) {
+	site := reconSites("keys-child-transfer")[0] // child 0xD from the start
+	site.contracts = append(site.contracts, ContractSubscription{Address: newTestFelt(0xE), StartBlock: 100, Wildcard: true, ERC20: true})
+	chain := newGapChain(121, 121)
+	node := newGapNode()
+	sub, events, _ := startReconSite(t, site, chain, node, 300*time.Millisecond)
+	node.nextFor(t, site)
+	waitLive(t, sub)
+
+	chain.tip.Store(140) // pre stays 121: the joined child's P is below its join point
+	sub.provider.tipBlock.Store(140)
+	for _, a := range []uint64{0xD, 0xE, 0xF} {
+		chain.addKeyed(143, a, transferSelector)
+	}
+	chain.addKeyed(128, 0xF, transferSelector) // F's history, below its join point
+	sub.AddContract(context.Background(), ContractSubscription{Address: newTestFelt(0xF), StartBlock: 125, Wildcard: true, ERC20: true})
+	sub.RemoveContract(newTestFelt(0xE).String())
+	waitLive(t, sub)
+
+	chain.tip.Store(150)
+	got := countEvents(events, 1500*time.Millisecond)
+	f, d, e := newTestFelt(0xF).String(), newTestFelt(0xD).String(), newTestFelt(0xE).String()
+	if got[f+"@128"] != 1 {
+		t.Errorf("joined child's history delivered %d times, want 1 (its own backfill)", got[f+"@128"])
+	}
+	if got[f+"@143"] != 1 || got[d+"@143"] != 1 {
+		t.Errorf("recovered: F@143=%d D@143=%d, want 1 each (%v)", got[f+"@143"], got[d+"@143"], got)
+	}
+	if got[e+"@143"] != 0 {
+		t.Errorf("removed child's event delivered %d times", got[e+"@143"])
+	}
+}
+
+// --- child hub: per-member handling inside one tick --------------------------------
+
+// hubFixture is a subscriber with hand-registered collective child streams.
+type hubFixture struct {
+	sub     *EventSubscriber
+	chain   *gapChain
+	events  chan RawEvent
+	streams map[uint64]*firehoseKeysStream
+	recs    map[uint64]*reconciler
+}
+
+func newHubFixture(t *testing.T, addrs ...uint64) *hubFixture {
+	t.Helper()
+	chain := newGapChain(150, 150)
+	server := mockRPCServer(t, chain.handlers())
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	events := make(chan RawEvent, 64)
+	lag := uint64(2)
+	sub := p.NewSubscriber(nil, events, &SubscriberConfig{KeysFirehose: true, ReconcileInterval: time.Second, ReconcileLag: &lag})
+	f := &hubFixture{sub: sub, chain: chain, events: events, streams: map[uint64]*firehoseKeysStream{}, recs: map[uint64]*reconciler{}}
+	for _, a := range addrs {
+		f.add(a)
+	}
+	return f
+}
+
+// add registers a live child stream (reconciler started at 100) for addr.
+func (f *hubFixture) add(addr uint64) {
+	st := newFirehoseKeysStream("child-transfer:"+newTestFelt(addr).String(), newTestFelt(addr), childTransferKeys())
+	st.collective = true
+	st.setCursor(newTestFelt(addr).String(), 100, true)
+	rec := newReconciler()
+	rec.start(100)
+	st.rec.Store(rec)
+	f.sub.trackContract(ContractSubscription{Address: newTestFelt(addr)})
+	f.sub.streamsMu.Lock()
+	f.sub.addrStreams[newTestFelt(addr).String()] = st
+	f.sub.streamsMu.Unlock()
+	f.streams[addr] = st
+	f.recs[addr] = rec
+	f.chain.addKeyed(120, addr, transferSelector)
+}
+
+func (f *hubFixture) last(addr uint64) uint64 {
+	l, _ := f.recs[addr].state()
+	return l
+}
+
+func (f *hubFixture) tick(t *testing.T) error {
+	t.Helper()
+	return f.sub.childReconcileTick(context.Background(), testLogger)
+}
+
+// Members that go stale (rolled back), are removed, or join while a tick is in
+// flight do not affect the healthy ones: those recover their missed events
+// exactly once and advance; the stale and removed ones neither deliver nor
+// advance; the next tick picks up the stale one and the newcomer.
+func TestReconcileChildHubPerMemberStale(t *testing.T) {
+	f := newHubFixture(t, 0x1, 0x2, 0x3, 0x4) // 1,2 healthy; 3 rolled back; 4 removed
+	f.chain.onFetch = func(uint64, uint64) {
+		f.chain.onFetch = nil
+		f.streams[0x3].rec.Load().rollback(110) // reorg lands mid-tick
+		f.sub.streamsMu.Lock()
+		delete(f.sub.addrStreams, newTestFelt(0x4).String())
+		f.sub.streamsMu.Unlock()
+		f.streams[0x4].rec.Store(nil) // 4's session ended
+		f.add(0x5)                    // joins mid-tick
+	}
+	if err := f.tick(t); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	got := countEvents(f.events, 100*time.Millisecond)
+	k := func(a uint64) string { return fmt.Sprintf("%s@120", newTestFelt(a)) }
+	if got[k(1)] != 1 || got[k(2)] != 1 {
+		t.Errorf("healthy members recovered %d and %d times, want 1 each (%v)", got[k(1)], got[k(2)], got)
+	}
+	if got[k(3)] != 0 || got[k(4)] != 0 || got[k(5)] != 0 {
+		t.Errorf("stale/removed/new member delivered during the tick: %v", got)
+	}
+	if f.last(1) != 148 || f.last(2) != 148 {
+		t.Errorf("healthy members at %d and %d, want 148", f.last(1), f.last(2))
+	}
+	if f.last(3) != 100 || f.last(4) != 100 || f.last(5) != 100 {
+		t.Errorf("stale/removed/new members advanced: %d %d %d, want 100", f.last(3), f.last(4), f.last(5))
+	}
+
+	// Next tick: the rolled-back member and the newcomer catch up; the removed one stays out.
+	if err := f.tick(t); err != nil {
+		t.Fatalf("second tick: %v", err)
+	}
+	got = countEvents(f.events, 100*time.Millisecond)
+	if got[k(3)] != 1 || got[k(5)] != 1 || got[k(4)] != 0 || got[k(1)] != 0 {
+		t.Errorf("second tick delivered %v, want 3 and 5 once, nothing for 1 or 4", got)
+	}
+}
+
+// A range that has to be split and retried, with a member rolled back during
+// the first attempt, still advances every healthy member exactly through the
+// range and recovers its events once; the rolled-back one is left untouched.
+func TestReconcileChildHubRetryKeepsMembership(t *testing.T) {
+	f := newHubFixture(t, 0x1, 0x2, 0x3)
+	f.chain.maxSpan.Store(8) // 48 blocks to reconcile: needs splitting
+	first := true
+	f.chain.onFetch = func(uint64, uint64) {
+		if first {
+			first = false
+			f.streams[0x3].rec.Load().rollback(110)
+		}
+	}
+	if err := f.tick(t); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	got := countEvents(f.events, 100*time.Millisecond)
+	k := func(a uint64) string { return fmt.Sprintf("%s@120", newTestFelt(a)) }
+	if got[k(1)] != 1 || got[k(2)] != 1 || got[k(3)] != 0 {
+		t.Errorf("deliveries %v, want 1 and 2 once, 3 none", got)
+	}
+	if f.last(1) != 148 || f.last(2) != 148 || f.last(3) != 100 {
+		t.Errorf("last = %d %d %d, want 148 148 100", f.last(1), f.last(2), f.last(3))
 	}
 }
