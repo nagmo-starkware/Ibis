@@ -111,8 +111,12 @@ func backoffAfterSession(cur time.Duration, err error) time.Duration {
 // backfill succeeds. A failed backfill ends the session; backfilled reports
 // whether it completed, so the caller can pull cursors back for an incomplete
 // one (live events may have advanced them past the unfilled gap).
+//
+// reconcile (nil = off) runs once the stream is live, until the session ends;
+// the caller starts its reconciler at p inside backfill (see reconcile.go).
 func (s *EventSubscriber) serveSession(ctx context.Context, live *streamLiveness, p uint64,
 	backfill func(ctx context.Context, p uint64) error, process func(ctx context.Context) error,
+	reconcile func(ctx context.Context),
 ) (backfilled bool, err error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -133,6 +137,9 @@ func (s *EventSubscriber) serveSession(ctx context.Context, live *streamLiveness
 			return
 		}
 		live.set(true)
+		if reconcile != nil {
+			reconcile(sctx)
+		}
 	}()
 
 	err = process(sctx)
@@ -225,6 +232,19 @@ func (st *firehoseKeysStream) capCursors(base map[string]uint64) {
 	for addr, c := range base {
 		if st.cursors[addr] > c {
 			st.cursors[addr] = c
+		}
+	}
+}
+
+// capCursorsTo pulls st's cursors back to at most block (never forward): after
+// a session that went live, a reconnect must resume at/below the first
+// unreconciled block even if live events advanced the cursors past it.
+func (st *firehoseKeysStream) capCursorsTo(block uint64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for addr, c := range st.cursors {
+		if c > block {
+			st.cursors[addr] = block
 		}
 	}
 }

@@ -76,6 +76,10 @@ func TestValidate_PollingKnobsInvalid(t *testing.T) {
 		{"bad_catchup_duration", "  catchup_poll_interval: soon"},
 		{"catchup_too_small", "  catchup_poll_interval: 5ms"},
 		{"negative_concurrency", "  max_concurrent_catchup: -1"},
+		{"bad_reconcile_duration", "  reconcile_interval: soon"},
+		{"reconcile_too_small", "  reconcile_interval: 500ms"},
+		{"negative_reconcile_interval", "  reconcile_interval: -1m"},
+		{"negative_reconcile_lag", "  reconcile_lag: -1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -84,5 +88,37 @@ func TestValidate_PollingKnobsInvalid(t *testing.T) {
 				t.Fatalf("expected validation error for %s", tt.name)
 			}
 		})
+	}
+}
+
+func TestValidate_ReconcileKnobs(t *testing.T) {
+	for _, tc := range []struct{ name, yaml, interval string }{
+		{"set", "  reconcile_interval: 30s\n  reconcile_lag: 4", "30s"},
+		{"off", "  reconcile_interval: 0s", "0s"},
+		{"omitted", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeTestConfig(t, pollingConfigYAML(tc.yaml)))
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.Indexer.ReconcileInterval != tc.interval {
+				t.Errorf("ReconcileInterval = %q, want %q", cfg.Indexer.ReconcileInterval, tc.interval)
+			}
+		})
+	}
+}
+
+func TestValidate_ReconcileLagZeroIsExplicit(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, pollingConfigYAML("  reconcile_lag: 0")))
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Indexer.ReconcileLag == nil || *cfg.Indexer.ReconcileLag != 0 {
+		t.Errorf("ReconcileLag = %v, want explicit 0", cfg.Indexer.ReconcileLag)
+	}
+	cfg, err = Load(writeTestConfig(t, pollingConfigYAML("")))
+	if err != nil || cfg.Indexer.ReconcileLag != nil {
+		t.Errorf("omitted lag = %v (err %v), want nil", cfg.Indexer.ReconcileLag, err)
 	}
 }

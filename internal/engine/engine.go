@@ -942,6 +942,22 @@ func (e *Engine) FindContract(name string) *config.ContractConfig {
 	return nil
 }
 
+// reconcileSettings maps the reconcile config knobs. An unset interval means
+// the default (on); an explicit 0 turns reconciliation off. An unset lag means
+// the provider default.
+func reconcileSettings(ic *config.IndexerConfig) (time.Duration, *uint64) {
+	interval := provider.DefaultReconcileInterval
+	if ic.ReconcileInterval != "" {
+		interval = parseDurationOrZero(ic.ReconcileInterval)
+	}
+	var lag *uint64
+	if ic.ReconcileLag != nil && *ic.ReconcileLag >= 0 {
+		l := uint64(*ic.ReconcileLag)
+		lag = &l
+	}
+	return interval, lag
+}
+
 // parseDurationOrZero parses a duration string, returning 0 for an empty or
 // invalid value so callers fall back to their built-in defaults. Values are
 // validated up front in config.Validate; this is a defensive re-parse.
@@ -984,6 +1000,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	// treat a bad/empty value as 0 so the provider/subscriber apply their defaults.
 	tipInterval := parseDurationOrZero(e.cfg.Indexer.TipPollInterval)
 	catchupInterval := parseDurationOrZero(e.cfg.Indexer.CatchupPollInterval)
+	reconcileInterval, reconcileLag := reconcileSettings(&e.cfg.Indexer)
 	// The shared tip poller is opt-in (default off = legacy per-contract polling),
 	// so bumping the image is inert until enabled. Both firehose transports
 	// require it, so either turns the poller on implicitly.
@@ -1002,6 +1019,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		TipPollInterval:     tipInterval,
 		CatchupPollInterval: catchupInterval,
 		MaxConcurrentPolls:  e.cfg.Indexer.MaxConcurrentCatchup,
+		ReconcileInterval:   reconcileInterval,
+		ReconcileLag:        reconcileLag,
 	})
 	subscriber.SetReorgChan(e.reorgs)
 

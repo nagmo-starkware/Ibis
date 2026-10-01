@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NethermindEth/juno/core/felt"
@@ -86,9 +87,16 @@ type firehoseKeysStream struct {
 
 	mu      sync.Mutex
 	cursors map[string]uint64
+	// floors is each address's join point (set when its cursor is seeded):
+	// reconcile never reads below it, those blocks are its own backfill's.
+	floors map[string]uint64
 
 	fillsMu sync.Mutex
 	fills   map[string]ContractSubscription
+
+	// rec is the current session's reconciler (nil when none or reconcile is
+	// off); the live path records what it delivers into it.
+	rec atomic.Pointer[reconciler]
 
 	// seedMu makes a new fill's tip read + seed atomic with fillBehind.
 	// Registrations share it (read lock); fillBehind takes it exclusively.
@@ -104,6 +112,7 @@ func newFirehoseKeysStream(label string, address *felt.Felt, keys [][]*felt.Felt
 		address: address,
 		keys:    keys,
 		cursors: make(map[string]uint64),
+		floors:  make(map[string]uint64),
 		fills:   make(map[string]ContractSubscription),
 	}
 }
@@ -115,7 +124,17 @@ func (st *firehoseKeysStream) setCursor(addrHex string, block uint64, force bool
 	if force || block > st.cursors[addrHex] {
 		st.cursors[addrHex] = block
 	}
+	if force {
+		st.floors[addrHex] = block
+	}
 	st.mu.Unlock()
+}
+
+// floor returns addrHex's join point (0 if unknown).
+func (st *firehoseKeysStream) floor(addrHex string) uint64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.floors[addrHex]
 }
 
 // cursor returns this stream's current cursor for addrHex (0 if unset).
@@ -148,6 +167,7 @@ func (st *firehoseKeysStream) rollbackSeedLocked(startBlock uint64) {
 		}
 	}
 	st.mu.Unlock()
+	st.rec.Load().rollback(startBlock)
 }
 
 // setFill adds or replaces an entry in this stream's gap-fill responsibility
@@ -505,12 +525,24 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 		// backoff all count as not-live, which is exactly what a promote gate
 		// needs to distinguish from "serving fine".
 		base := st.streamBase()
+		rec := s.streamReconciler(st)
+		st.rec.Store(rec)
 		backfilled, err := s.serveSession(ctx, live, p,
-			func(c context.Context, p uint64) error { return s.keysStreamBackfill(c, st, base, fromBlock, p) },
-			func(c context.Context) error { return s.processKeysStream(c, st, session) })
+			func(c context.Context, p uint64) error {
+				if err := s.keysStreamBackfill(c, st, base, fromBlock, p); err != nil {
+					return err
+				}
+				rec.start(p) // hand off: reconcile covers (p, ..]
+				return nil
+			},
+			func(c context.Context) error { return s.processKeysStream(c, st, session) },
+			s.streamReconcileRun(st, rec))
+		st.rec.Store(nil)
 		backoff = backoffAfterSession(backoff, err)
 		if !backfilled {
 			st.capCursors(base)
+		} else if f := rec.resumeFloor(); f > 0 {
+			st.capCursorsTo(f) // never resume past the unreconciled range
 		}
 		live.set(false)
 		session.close()
@@ -774,6 +806,8 @@ func (s *EventSubscriber) forwardStream(ctx context.Context, st *firehoseKeysStr
 	if !s.isTracked(addr) {
 		return // untracked, or a foreign contract's same-named event — dropped
 	}
+	// Recorded before the cursor guard: the live stream did deliver it.
+	st.rec.Load().observe(evt.BlockNumber, emittedID(evt))
 
 	st.mu.Lock()
 	last := st.cursors[addr]

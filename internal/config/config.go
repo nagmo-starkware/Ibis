@@ -70,6 +70,18 @@ type IndexerConfig struct {
 	CatchupPollInterval  string `yaml:"catchup_poll_interval,omitempty"`
 	MaxConcurrentCatchup int    `yaml:"max_concurrent_catchup,omitempty"`
 
+	// Live-stream reconciliation. A WSS subscription can silently miss events
+	// while connected (measured upstream of ibis), so every live stream is
+	// periodically re-read over HTTP and any event the live path did not
+	// deliver is recovered.
+	//
+	//   ReconcileInterval — how often (duration string; default 60s; "0s" = off).
+	//   ReconcileLag      — blocks behind the accepted tip that are left to the
+	//                       live stream before being checked (default 2 when
+	//                       unset; an explicit 0 is allowed).
+	ReconcileInterval string `yaml:"reconcile_interval,omitempty"`
+	ReconcileLag      *int   `yaml:"reconcile_lag,omitempty"`
+
 	// SharedTipPoller enables the shared chain-tip poller: one starknet_blockNumber
 	// per interval into a cache, read by every contract, instead of each contract
 	// polling the tip itself. Default false = legacy per-contract polling, so the

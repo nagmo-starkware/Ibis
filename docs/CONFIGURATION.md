@@ -24,6 +24,8 @@ Complete reference for `ibis.config.yaml`. This document covers every field, its
   - [indexer.start_block](#indexerstart_block)
   - [indexer.pending_blocks](#indexerpending_blocks)
   - [indexer.batch_size](#indexerbatch_size)
+  - [indexer.reconcile_interval](#indexerreconcile_interval)
+  - [indexer.reconcile_lag](#indexerreconcile_lag)
   - [indexer.udc_address](#indexerudc_address)
   - [indexer.udc_event](#indexerudc_event)
 - [Contracts](#contracts)
@@ -282,6 +284,40 @@ Number of blocks per batch during historical backfill. Larger values reduce RPC 
 ```yaml
 indexer:
   batch_size: 50
+```
+
+### `indexer.reconcile_interval`
+
+| Property | Value |
+|----------|-------|
+| Type | `string` (duration) |
+| Required | No |
+| Default | `60s` |
+
+How often every live WSS stream is re-read over HTTP (`starknet_getEvents`) to recover events the live subscription silently missed. A node can drop events while the subscription stays connected, with no error and no reconnect, so Ibis does not assume a live stream is complete. Each tick reads `(last reconciled block, tip - reconcile_lag]` with the stream's own address/keys filter and delivers only events the live path did not (flagged as catch-up, logged at WARN as `live stream missed event; recovered by reconcile`). `0s` disables reconciliation; otherwise the minimum is `1s`.
+
+Cost per tick: one tip read plus one `getEvents` query per stream; the many per-child Transfer/Approval streams of the `firehose-keys` transport share a single keys-filtered query. A failing range is retried on the next tick and, if the failure is a timeout or oversized response, split into smaller ranges.
+
+Also: because `starknet_subscribeEvents` is not trusted to replay from the requested `block_id` (some providers deliver only from roughly the latest block), every (re)subscribe is followed by an HTTP backfill of `[resume block, pre-confirmed block]` for the subscription's own scope before the stream counts as live; reconciliation takes over from there.
+
+```yaml
+indexer:
+  reconcile_interval: 30s
+```
+
+### `indexer.reconcile_lag`
+
+| Property | Value |
+|----------|-------|
+| Type | `int` |
+| Required | No |
+| Default | `2` |
+
+Blocks behind the accepted tip that reconciliation leaves to the live stream before checking them. `0` is valid (check right up to the tip, at the risk of reporting events the live stream is about to deliver; they are then delivered twice).
+
+```yaml
+indexer:
+  reconcile_lag: 2
 ```
 
 ### `indexer.udc_address`
