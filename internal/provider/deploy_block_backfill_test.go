@@ -17,9 +17,6 @@ func TestRegistrationRefetchesUnacceptedDeployBlock(t *testing.T) {
 		if site.name == "keys-address-sub" {
 			continue // its keys-sub tracks nothing to order the drop against
 		}
-		if site.name == "shared-firehose" {
-			continue // not fixed yet
-		}
 		shared := site.name != "per-contract"
 		t.Run(site.name, func(t *testing.T) {
 			chain := newGapChain(tip, tip)

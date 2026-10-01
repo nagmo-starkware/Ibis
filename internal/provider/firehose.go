@@ -293,24 +293,15 @@ func (s *EventSubscriber) addContractFirehose(ctx context.Context, sub ContractS
 	// Reserved before the sink exists — see reserveBackfill.
 	s.reserveBackfill()
 	tip, err := s.tipBlockNumber(ctx)
-	if err != nil {
-		// No tip available: fall back to forwarding from StartBlock and skip
-		// backfill; gap-fill on the next reconnect will reconcile.
-		s.addSink(sub, sub.StartBlock)
-		s.releaseBackfill()
-		return
-	}
-
-	// The subscription forwards blocks >= wssFrom; backfill covers [StartBlock, tip].
-	wssFrom := tip + 1
-	if sub.StartBlock > wssFrom {
-		wssFrom = sub.StartBlock
-	}
-	s.addSink(sub, wssFrom)
-
-	if sub.StartBlock <= tip {
+	if err == nil && sub.StartBlock <= tip {
+		s.addSink(sub, tip+1)
 		s.launchReservedBackfill(ctx, sub, sub.StartBlock, tip)
 		return
 	}
-	s.releaseBackfill()
+	// No tip (the next reconnect's gap-fill reconciles), or StartBlock past it:
+	// forward from StartBlock. The subscription already dropped the deploy
+	// block's events while the contract was untracked, and the block may be
+	// pre_confirmed: backfill it once accepted. A live duplicate is harmless.
+	s.addSink(sub, sub.StartBlock)
+	s.launchReservedAcceptedBackfill(ctx, sub, sub.StartBlock, sub.StartBlock)
 }
