@@ -952,7 +952,7 @@ func TestKeysStreamGapFillLogsRepeatedLateJoins(t *testing.T) {
 
 // TestAddContractKeysFirehoseNoTipSeedsAtStartBlock: with the tip unreadable,
 // a new contract is seeded from its StartBlock so the next gap-fill covers its
-// history, and no backfill is left counted as pending.
+// history, and its deploy-block backfill stays pending until the tip is back.
 func TestAddContractKeysFirehoseNoTipSeedsAtStartBlock(t *testing.T) {
 	handlers := map[string]func(json.RawMessage) (interface{}, error){
 		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
@@ -966,14 +966,16 @@ func TestAddContractKeysFirehoseNoTipSeedsAtStartBlock(t *testing.T) {
 	sub.keysStream = st
 	sub.streamsMu.Unlock()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	addr := newTestFelt(0x1A7E)
-	sub.AddContract(context.Background(), ContractSubscription{Address: addr, StartBlock: 500, Wildcard: true})
+	sub.AddContract(ctx, ContractSubscription{Address: addr, StartBlock: 500, Wildcard: true})
 
 	if got := st.cursor(addr.String()); got != 500 {
 		t.Errorf("keys-sub cursor = %d, want StartBlock 500", got)
 	}
-	if got := sub.BackfillsPending(); got != 0 {
-		t.Errorf("BackfillsPending = %d, want 0: no backfill runs without a tip", got)
+	if got := sub.BackfillsPending(); got != 1 {
+		t.Errorf("BackfillsPending = %d, want 1: the deploy block is not fetched yet", got)
 	}
 }
 
@@ -1368,8 +1370,8 @@ func TestAddContractKeysFirehoseNoTipSeedsERC20Child(t *testing.T) {
 	if got := st.cursor(addr.String()); got != 500 {
 		t.Errorf("keys-sub cursor = %d, want StartBlock 500", got)
 	}
-	if got := sub.BackfillsPending(); got != 0 {
-		t.Errorf("BackfillsPending = %d, want 0", got)
+	if got := sub.BackfillsPending(); got != 1 {
+		t.Errorf("BackfillsPending = %d, want 1", got)
 	}
 }
 

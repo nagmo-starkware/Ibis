@@ -27,6 +27,7 @@ type gapChain struct {
 	preReads  atomic.Int64
 	fetches   atomic.Int64 // getEvents calls
 	failFetch atomic.Bool  // getEvents returns an error
+	ahead     atomic.Int64 // getEvents calls bounded past the accepted tip
 
 	gate    chan struct{} // if set, getEvents blocks until closed
 	entered chan struct{} // signalled (non-blocking) on each getEvents entry
@@ -84,6 +85,10 @@ func (c *gapChain) handlers() map[string]func(json.RawMessage) (interface{}, err
 			}
 			if err := json.Unmarshal(params, &q); err != nil || len(q) != 1 {
 				return nil, fmt.Errorf("bad params %s", params)
+			}
+			if q[0].To.N > c.tip.Load() { // as a node does for a numeric bound past the accepted tip
+				c.ahead.Add(1)
+				return nil, fmt.Errorf("block %d not found", q[0].To.N)
 			}
 			out := []map[string]interface{}{}
 			c.mu.Lock()
