@@ -984,6 +984,7 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		eventsProcessed := 0
 
 		subInput := &rpc.EventSubscriptionInput{
 			FromAddress: contract.Address,
@@ -995,7 +996,7 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 		}
 
 		// Attempt to dial WSS.
-		session, err := s.dialWSS(ctx, s.provider.wsURL, subInput)
+		session, p, err := s.dialWithGap(ctx, subInput)
 		if err != nil {
 			consecutiveDialFails++
 			if consecutiveDialFails >= maxWSSDialFailures {
@@ -1020,14 +1021,32 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 
 		// Connected successfully — reset dial failure tracking.
 		consecutiveDialFails = 0
-		backoff = minBackoff
 
-		logger.Info("WSS subscription active", "from_block", *lastBlock)
+		logger.Info("WSS subscribed; backfilling to pre-confirmed",
+			"from_block", *lastBlock, "pre_confirmed", p)
 
-		// Process events until session error. Live only for the session's
-		// duration: the reconnect backoff below reads as not-live.
-		live.set(true)
-		eventsProcessed, err := s.processWSSEvents(ctx, session, lastBlock, logger)
+		// The node does not replay from the block_id (see subscribe_backfill.go):
+		// backfill [resume, P] while the session runs. Live events advance only
+		// liveLast; lastBlock is committed once the backfill is done, so an
+		// incomplete one resumes below its gap. Live only after that backfill;
+		// the reconnect backoff below reads as not-live.
+		resume := *lastBlock
+		liveLast, next := resume, resume
+		backfilled, err := s.serveSession(ctx, live, p,
+			func(c context.Context, p uint64) (err error) {
+				next, err = s.backfillFrom(c, contract, resume, p)
+				return err
+			},
+			func(c context.Context) (err error) {
+				eventsProcessed, err = s.processWSSEvents(c, session, &liveLast, logger)
+				return err
+			})
+		backoff = backoffAfterSession(backoff, err)
+		if backfilled {
+			*lastBlock = liveLast
+		} else {
+			*lastBlock = min(next, liveLast)
+		}
 		live.set(false)
 		session.close()
 

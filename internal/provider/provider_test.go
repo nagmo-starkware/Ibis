@@ -456,6 +456,9 @@ func TestSubscriberWSSReceivesEvents(t *testing.T) {
 		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
 			return 1000, nil
 		},
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
+		},
 	})
 	defer server.Close()
 
@@ -555,6 +558,11 @@ func TestSubscriberFallsBackToPolling(t *testing.T) {
 		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
 			return 105, nil
 		},
+		// P is ahead of the tip, so the post-subscribe backfill never starts
+		// before the (instantly dropping) session ends.
+		"starknet_getBlockWithTxHashes": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"block_number": 106, "timestamp": 1}, nil
+		},
 		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
 			n := pollCalls.Add(1)
 			if n == 1 {
@@ -631,6 +639,10 @@ func TestSubscriberReorgResets(t *testing.T) {
 	server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){
 		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
 			return 1000, nil
+		},
+		// The post-subscribe backfill [100, P] finds nothing.
+		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"events": []interface{}{}}, nil
 		},
 	})
 	defer server.Close()
@@ -831,6 +843,11 @@ func TestSubscriberWSSSessionInstabilityFallback(t *testing.T) {
 	server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){
 		"starknet_blockNumber": func(_ json.RawMessage) (interface{}, error) {
 			return 105, nil
+		},
+		// P is ahead of the tip, so the post-subscribe backfill never starts
+		// before the (instantly dropping) session ends.
+		"starknet_getBlockWithTxHashes": func(_ json.RawMessage) (interface{}, error) {
+			return map[string]interface{}{"block_number": 106, "timestamp": 1}, nil
 		},
 		"starknet_getEvents": func(_ json.RawMessage) (interface{}, error) {
 			n := pollCalls.Add(1)

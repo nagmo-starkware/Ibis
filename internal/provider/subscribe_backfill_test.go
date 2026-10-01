@@ -183,6 +183,7 @@ func gapSites() []gapSite {
 		{"keys-sub", []ContractSubscription{{Address: newTestFelt(0xA), StartBlock: 100, Wildcard: true}}, keysCfg, 0xA, 100, 0, 1},
 		{"keys-address-sub", []ContractSubscription{{Address: newTestFelt(0xB), StartBlock: 100}}, keysCfg, 0xB, 100, 0xB, 2},
 		{"shared-firehose", []ContractSubscription{{Address: newTestFelt(0xA), StartBlock: 100}}, SubscriberConfig{SharedFirehose: true}, 0xA, 100, 0, 1},
+		{"per-contract", []ContractSubscription{{Address: newTestFelt(0xA), StartBlock: 100}}, SubscriberConfig{}, 0xA, 100, 0xA, 1},
 	}
 }
 
