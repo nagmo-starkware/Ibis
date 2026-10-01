@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -43,19 +44,12 @@ var runCmd = &cobra.Command{
 			cfg.Indexer.SharedTipPoller = v == "1" || v == "true"
 		}
 
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		// Root logger for the whole process: RPC URLs carry the API key.
+		logger := provider.NewRedactingLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 			Level: slog.LevelInfo,
-		}))
+		})))
 
-		fmt.Fprintf(cmd.OutOrStdout(), "Loaded config from %s\n", cfgPath)
-		fmt.Fprintf(cmd.OutOrStdout(), "  Network:  %s\n", cfg.Network)
-		fmt.Fprintf(cmd.OutOrStdout(), "  RPC:      %s\n", cfg.RPC)
-		fmt.Fprintf(cmd.OutOrStdout(), "  Backend:  %s\n", cfg.Database.Backend)
-		fmt.Fprintf(cmd.OutOrStdout(), "  API:      %s:%d\n", cfg.API.Host, cfg.API.Port)
-		fmt.Fprintf(cmd.OutOrStdout(), "  Contracts: %d\n", len(cfg.Contracts))
-		for _, c := range cfg.Contracts {
-			fmt.Fprintf(cmd.OutOrStdout(), "    - %s (%s): %d events\n", c.Name, c.Address, len(c.Events))
-		}
+		printConfigSummary(cmd.OutOrStdout(), cfgPath, cfg)
 
 		// Create Starknet provider.
 		ctx := cmd.Context()
@@ -170,5 +164,18 @@ func createStore(cfg *config.Config, logger *slog.Logger) (store.Store, error) {
 		return postgres.New(ctx, cfg.Database.Postgres)
 	default:
 		return nil, fmt.Errorf("unknown database backend: %s", cfg.Database.Backend)
+	}
+}
+
+// printConfigSummary prints the startup banner; the RPC URL is masked to its host.
+func printConfigSummary(w io.Writer, path string, cfg *config.Config) {
+	fmt.Fprintf(w, "Loaded config from %s\n", path)
+	fmt.Fprintf(w, "  Network:  %s\n", cfg.Network)
+	fmt.Fprintf(w, "  RPC:      %s\n", provider.RedactURLs(cfg.RPC))
+	fmt.Fprintf(w, "  Backend:  %s\n", cfg.Database.Backend)
+	fmt.Fprintf(w, "  API:      %s:%d\n", cfg.API.Host, cfg.API.Port)
+	fmt.Fprintf(w, "  Contracts: %d\n", len(cfg.Contracts))
+	for _, c := range cfg.Contracts {
+		fmt.Fprintf(w, "    - %s (%s): %d events\n", c.Name, c.Address, len(c.Events))
 	}
 }
