@@ -38,7 +38,7 @@ func (s *syncBuf) String() string {
 
 // reconTransports names the gap sites whose live stream is reconciled at this
 // point of the series; tests over "all transports" range over it.
-var reconTransports = []string{"keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose"}
+var reconTransports = []string{"keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract"}
 
 // reconSites are the gap sites whose live stream is reconciled.
 func reconSites(names ...string) []gapSite {
