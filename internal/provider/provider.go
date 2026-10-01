@@ -95,7 +95,7 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger = newRedactingLogger(logger) // RPC URLs carry the API key
+	logger = NewRedactingLogger(logger) // RPC URLs carry the API key
 
 	httpURL := ToHTTPURL(rpcURL)
 	wsURL := ToWSURL(rpcURL)
@@ -108,7 +108,7 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 		if errors.Is(err, rpc.ErrIncompatibleVersion) && httpRPC != nil {
 			logger.Warn("RPC spec version mismatch (provider still usable)", "error", err)
 		} else {
-			return nil, fmt.Errorf("creating HTTP provider: %s", redactURLs(err.Error()))
+			return nil, fmt.Errorf("creating HTTP provider: %s", RedactURLs(err.Error()))
 		}
 	}
 
@@ -126,7 +126,11 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 // BlockNumber returns the latest block number directly from the chain (one RPC
 // call). Prefer CachedBlockNumber on hot paths — see StartTipPoller.
 func (p *StarknetProvider) BlockNumber(ctx context.Context) (uint64, error) {
-	return p.httpRPC.BlockNumber(ctx)
+	n, err := p.httpRPC.BlockNumber(ctx)
+	if err != nil {
+		return 0, redactedError{err}
+	}
+	return n, nil
 }
 
 // PreConfirmedBlockNumber returns the number of the block currently being
@@ -387,3 +391,9 @@ func ToWSURL(url string) string {
 	}
 	return url
 }
+
+// redactedError masks URLs in the message but keeps the chain for errors.Is/As.
+type redactedError struct{ err error }
+
+func (e redactedError) Error() string { return RedactURLs(e.err.Error()) }
+func (e redactedError) Unwrap() error { return e.err }

@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"regexp"
@@ -15,8 +16,8 @@ import (
 
 var urlRE = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s"'<>\\]+`)
 
-// redactURLs masks the path, query and userinfo of every URL in s.
-func redactURLs(s string) string {
+// RedactURLs masks the path, query and userinfo of every URL in s.
+func RedactURLs(s string) string {
 	return urlRE.ReplaceAllStringFunc(s, func(m string) string {
 		u, err := url.Parse(m)
 		if err != nil || u.Host == "" {
@@ -32,7 +33,8 @@ func redactURLs(s string) string {
 
 type redactHandler struct{ slog.Handler }
 
-func newRedactingLogger(l *slog.Logger) *slog.Logger {
+// NewRedactingLogger wraps l so every URL it logs is masked; idempotent.
+func NewRedactingLogger(l *slog.Logger) *slog.Logger {
 	if _, ok := l.Handler().(redactHandler); ok {
 		return l
 	}
@@ -42,7 +44,7 @@ func newRedactingLogger(l *slog.Logger) *slog.Logger {
 func redactAttr(a slog.Attr) slog.Attr {
 	switch a.Value.Kind() {
 	case slog.KindString:
-		return slog.String(a.Key, redactURLs(a.Value.String()))
+		return slog.String(a.Key, RedactURLs(a.Value.String()))
 	case slog.KindGroup:
 		attrs := a.Value.Group()
 		out := make([]slog.Attr, len(attrs))
@@ -50,16 +52,22 @@ func redactAttr(a slog.Attr) slog.Attr {
 			out[i] = redactAttr(g)
 		}
 		return slog.Attr{Key: a.Key, Value: slog.GroupValue(out...)}
+	case slog.KindLogValuer:
+		a.Value = a.Value.Resolve()
+		return redactAttr(a)
 	case slog.KindAny:
-		if err, ok := a.Value.Any().(error); ok {
-			return slog.String(a.Key, redactURLs(err.Error()))
+		switch v := a.Value.Any().(type) {
+		case error:
+			return slog.String(a.Key, RedactURLs(v.Error()))
+		case fmt.Stringer:
+			return slog.String(a.Key, RedactURLs(v.String()))
 		}
 	}
 	return a
 }
 
 func (h redactHandler) Handle(ctx context.Context, r slog.Record) error {
-	out := slog.NewRecord(r.Time, r.Level, redactURLs(r.Message), r.PC)
+	out := slog.NewRecord(r.Time, r.Level, RedactURLs(r.Message), r.PC)
 	r.Attrs(func(a slog.Attr) bool { out.AddAttrs(redactAttr(a)); return true })
 	return h.Handler.Handle(ctx, out)
 }

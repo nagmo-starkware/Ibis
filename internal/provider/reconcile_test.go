@@ -882,7 +882,7 @@ func TestReconcileLoopBackoffNeverCollapses(t *testing.T) {
 
 func TestRedactURLs(t *testing.T) {
 	in := `Post "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/SECRETKEY": dial tcp: lookup failed; ws: wss://user:pw@node.example/ws?apikey=SECRET2 and http://127.0.0.1:8080/`
-	out := redactURLs(in)
+	out := RedactURLs(in)
 	for _, leak := range []string{"SECRETKEY", "SECRET2", "pw@", "v0_10"} {
 		if strings.Contains(out, leak) {
 			t.Errorf("%q leaked in %q", leak, out)
