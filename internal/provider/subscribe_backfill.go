@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -142,6 +143,66 @@ func (s *EventSubscriber) serveSession(ctx context.Context, live *streamLiveness
 		err = fmt.Errorf("%w [..%d]: %w", errBackfillFailed, p, bfErr)
 	}
 	return bfErr == nil, err
+}
+
+// --- shared firehose (option C) --------------------------------------------
+
+// sinkBase snapshots each sink's cursor at session start. The backfill uses it
+// instead of the live cursor, which live events advance concurrently.
+type sinkBase struct {
+	sub  ContractSubscription
+	last uint64
+}
+
+func (s *EventSubscriber) snapshotSinkBase() map[string]sinkBase {
+	s.routerMu.RLock()
+	defer s.routerMu.RUnlock()
+	out := make(map[string]sinkBase, len(s.router))
+	for addr, sk := range s.router {
+		out[addr] = sinkBase{sub: sk.sub, last: sk.lastBlock}
+	}
+	return out
+}
+
+// firehoseBackfill fetches [last, p] for every sink in base over HTTP, bounded
+// by the shared catchup semaphore. Returns the first error.
+func (s *EventSubscriber) firehoseBackfill(ctx context.Context, base map[string]sinkBase, p uint64) error {
+	var wg sync.WaitGroup
+	errs := make(chan error, len(base))
+	for _, b := range base {
+		if b.last > p {
+			continue
+		}
+		wg.Add(1)
+		go func(b sinkBase) {
+			defer wg.Done()
+			select {
+			case s.sem <- struct{}{}:
+			case <-ctx.Done():
+				errs <- ctx.Err()
+				return
+			}
+			defer func() { <-s.sem }()
+			if _, err := s.backfillFrom(ctx, b.sub, b.last, p); err != nil {
+				errs <- err
+			}
+		}(b)
+	}
+	wg.Wait()
+	close(errs)
+	return <-errs // nil when empty
+}
+
+// capSinks pulls sink cursors back to base (never forward), for an incomplete
+// backfill: a reconnect's gap-fill must start below the unfilled gap.
+func (s *EventSubscriber) capSinks(base map[string]sinkBase) {
+	s.routerMu.Lock()
+	defer s.routerMu.Unlock()
+	for addr, b := range base {
+		if sk := s.router[addr]; sk != nil && sk.lastBlock > b.last {
+			sk.lastBlock = b.last
+		}
+	}
 }
 
 // --- firehose-keys (option D) ----------------------------------------------

@@ -99,7 +99,7 @@ func (s *EventSubscriber) runFirehoseWSS(ctx context.Context) error {
 			subInput.SubBlockID = rpc.SubscriptionBlockID{Number: &bn}
 		}
 
-		session, err := s.dialWSS(ctx, s.provider.wsURL, subInput)
+		session, p, err := s.dialWithGap(ctx, subInput)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -113,11 +113,19 @@ func (s *EventSubscriber) runFirehoseWSS(ctx context.Context) error {
 			backoff = time.Duration(math.Min(float64(backoff)*2, float64(maxBackoff)))
 			continue
 		}
-		backoff = minBackoff
-		s.logger.Info("firehose WSS active", "from_block", fromBlock, "tracked", len(s.router))
+		s.logger.Info("firehose WSS subscribed; backfilling to pre-confirmed",
+			"from_block", fromBlock, "pre_confirmed", p, "tracked", len(s.router))
 
-		live.set(true)
-		err = s.processFirehose(ctx, session)
+		// Live only once the post-subscribe backfill is done (the node does not
+		// replay from from_block; see subscribe_backfill.go).
+		base := s.snapshotSinkBase()
+		backfilled, err := s.serveSession(ctx, live, p,
+			func(c context.Context, p uint64) error { return s.firehoseBackfill(c, base, p) },
+			func(c context.Context) error { return s.processFirehose(c, session) })
+		backoff = backoffAfterSession(backoff, err)
+		if !backfilled {
+			s.capSinks(base)
+		}
 		live.set(false)
 		session.close()
 		if ctx.Err() != nil {
