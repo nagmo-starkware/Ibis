@@ -444,3 +444,27 @@ func TestSubscribeBackfillFailureEscalatesBackoff(t *testing.T) {
 		})
 	}
 }
+
+// After a successful backfill a quiet contract (no live events) resumes from P,
+// not from its old cursor, so a reconnect does not re-fetch the same range.
+func TestSubscribePerContractQuietResumesFromP(t *testing.T) {
+	site := gapSites()[3] // per-contract
+	chain := newGapChain(121, 121)
+	chain.add(105, site.addr)
+	node := newGapNode()
+	sub, events := startGapSite(t, site, chain, node)
+
+	sess := node.nextFor(t, site)
+	waitEvent(t, events, "gap event @105", func(e RawEvent) bool { return e.BlockNumber == 105 })
+	waitLive(t, sub) // backfill [100, 121] done
+	sess.errs <- fmt.Errorf("socket dropped")
+
+	second := node.nextFor(t, site)
+	n := second.in.SubBlockID.Number
+	if n == nil {
+		t.Fatal("second subscribe has no block_id")
+	}
+	if *n != 121 {
+		t.Errorf("second subscribe block_id %d, want P=121 (resume advanced past the old 100)", *n)
+	}
+}

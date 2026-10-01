@@ -1043,7 +1043,8 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 			})
 		backoff = backoffAfterSession(backoff, err)
 		if backfilled {
-			*lastBlock = liveLast
+			// The backfill covered through P, so a quiet contract advances too.
+			*lastBlock = max(liveLast, p)
 		} else {
 			*lastBlock = min(next, liveLast)
 		}
