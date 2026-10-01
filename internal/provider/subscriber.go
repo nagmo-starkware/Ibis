@@ -82,7 +82,7 @@ func defaultWSSDialer(ctx context.Context, wsURL string, input *rpc.EventSubscri
 	}
 
 	eventCh := make(chan *rpc.EmittedEventWithFinalityStatus, 100)
-	sub, err := ws.SubscribeEvents(ctx, eventCh, input)
+	sub, err := subscribeEventsAwaitReply(ctx, ws, eventCh, input)
 	if err != nil {
 		ws.Close()
 		return nil, fmt.Errorf("subscribing to events: %w", err)
@@ -97,6 +97,19 @@ func defaultWSSDialer(ctx context.Context, wsURL string, input *rpc.EventSubscri
 			ws.Close()
 		},
 	}, nil
+}
+
+// subscribeReplyTimeout bounds the wait for the node's subscribe reply.
+var subscribeReplyTimeout = 30 * time.Second
+
+// subscribeEventsAwaitReply subscribes and returns only once the node has
+// replied with the subscription id (SubscribeEvents blocks on that reply); a
+// JSON-RPC error or no reply within subscribeReplyTimeout is an error. The
+// timeout ctx only bounds the request, not the subscription after it returns.
+func subscribeEventsAwaitReply(ctx context.Context, ws *rpc.WsProvider, ch chan<- *rpc.EmittedEventWithFinalityStatus, input *rpc.EventSubscriptionInput) (*client.ClientSubscription, error) {
+	rctx, cancel := context.WithTimeout(ctx, subscribeReplyTimeout)
+	defer cancel()
+	return ws.SubscribeEvents(rctx, ch, input)
 }
 
 // multiplexKeysDialer is the firehose-keys transport's WSS dialer (see the
@@ -123,7 +136,7 @@ func (s *EventSubscriber) multiplexKeysDialer(ctx context.Context, wsURL string,
 		return nil, ctx.Err()
 	}
 	eventCh := make(chan *rpc.EmittedEventWithFinalityStatus, 100)
-	sub, err := ws.SubscribeEvents(ctx, eventCh, input)
+	sub, err := subscribeEventsAwaitReply(ctx, ws, eventCh, input)
 	<-s.addrSubSem
 	if err != nil {
 		// The failure is this one subscription's; leave the shared socket up
