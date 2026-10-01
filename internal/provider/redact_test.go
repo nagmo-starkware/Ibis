@@ -140,3 +140,18 @@ func TestProviderErrorsMaskRPCURL(t *testing.T) {
 		})
 	}
 }
+
+type nilErr struct{ msg string }
+
+func (e *nilErr) Error() string { return e.msg }
+
+// A typed-nil error attr must not panic the handler.
+func TestRedactAttrTypedNilError(t *testing.T) {
+	var e *nilErr
+	var buf bytes.Buffer
+	l := NewRedactingLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+	l.Error("boom", "error", error(e))
+	if !strings.Contains(buf.String(), "boom") {
+		t.Errorf("not logged: %s", buf.String())
+	}
+}

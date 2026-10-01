@@ -62,9 +62,11 @@ func redactAttr(a slog.Attr) slog.Attr {
 	case slog.KindAny:
 		switch v := a.Value.Any().(type) {
 		case error:
-			return slog.String(a.Key, RedactURLs(v.Error()))
+			if str, ok := safeString(v.Error); ok {
+				return slog.String(a.Key, RedactURLs(str))
+			}
 		case fmt.Stringer:
-			if str, ok := safeString(v); ok {
+			if str, ok := safeString(v.String); ok {
 				if red := RedactURLs(str); red != str {
 					return slog.String(a.Key, red)
 				}
@@ -92,12 +94,12 @@ func (h redactHandler) WithGroup(name string) slog.Handler {
 	return redactHandler{h.Handler.WithGroup(name)}
 }
 
-// safeString calls v.String(), reporting false if it panics (typed-nil receiver).
-func safeString(v fmt.Stringer) (s string, ok bool) {
+// safeString calls f, reporting false if it panics (typed-nil receiver).
+func safeString(f func() string) (s string, ok bool) {
 	defer func() {
 		if recover() != nil {
 			s, ok = "", false
 		}
 	}()
-	return v.String(), true
+	return f(), true
 }
