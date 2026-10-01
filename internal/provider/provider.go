@@ -95,6 +95,7 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 	if logger == nil {
 		logger = slog.Default()
 	}
+	logger = newRedactingLogger(logger) // RPC URLs carry the API key
 
 	httpURL := ToHTTPURL(rpcURL)
 	wsURL := ToWSURL(rpcURL)
@@ -107,7 +108,7 @@ func New(ctx context.Context, rpcURL string, logger *slog.Logger) (*StarknetProv
 		if errors.Is(err, rpc.ErrIncompatibleVersion) && httpRPC != nil {
 			logger.Warn("RPC spec version mismatch (provider still usable)", "error", err)
 		} else {
-			return nil, fmt.Errorf("creating HTTP provider: %w", err)
+			return nil, fmt.Errorf("creating HTTP provider: %s", redactURLs(err.Error()))
 		}
 	}
 

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -96,6 +98,10 @@ type reconciler struct {
 	last  uint64                     // last reconciled block (valid once ready)
 	ready bool                       // start() ran: the post-subscribe backfill is done
 	epoch uint64                     // bumped by rollback; invalidates in-flight ticks
+	// pending is the lowest reorg start seen before start(): the backfill that
+	// follows may have fetched orphaned data, so reconcile starts below it.
+	pending    uint64
+	hasPending bool
 }
 
 func newReconciler() *reconciler {
@@ -147,6 +153,12 @@ func (r *reconciler) start(p uint64) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.hasPending && r.pending <= p {
+		p = r.pending - 1
+		if r.pending == 0 {
+			p = 0
+		}
+	}
 	r.last, r.ready = p, true
 	r.pruneLocked(p + 1)
 }
@@ -204,6 +216,9 @@ func (r *reconciler) rollback(startBlock uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.epoch++
+	if !r.ready && (!r.hasPending || startBlock < r.pending) {
+		r.pending, r.hasPending = startBlock, true
+	}
 	for b := range r.seen {
 		if b >= startBlock {
 			delete(r.seen, b)
@@ -291,7 +306,7 @@ func (s *EventSubscriber) reconcileLoop(ctx context.Context, label string, tick 
 		}
 		logger.Warn("reconcile failed; will retry", "error", err, "retry_in", min(retry, s.reconcileInterval))
 		wait = min(retry, s.reconcileInterval)
-		retry *= 2
+		retry = min(retry*2, s.reconcileInterval) // capped: never overflows or drops to 0
 	}
 }
 
@@ -361,13 +376,36 @@ func (s *EventSubscriber) reconcileRange(ctx context.Context, rec *reconciler, e
 	return nil
 }
 
-// splitRetry runs do on [from, to]; if it fails (e.g. a range too big for the
-// RPC timeout) the range is split in halves and each is retried, down to single
-// blocks, so one oversized range cannot stall reconcile forever. Each success
-// has already advanced lastReconciled inside do.
+// splittable reports whether err says the range itself was too big (timeout,
+// deadline, oversized response). Anything else (429, outage, bad gateway) is
+// not helped by smaller ranges and would only multiply the calls against a
+// struggling or rate-limited provider, so those are left to the retry backoff.
+func splittable(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, k := range []string{"timeout", "timed out", "deadline exceeded", "response size", "too large", "too big"} {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitRetry runs do on [from, to]; if it fails because the range is too big
+// for the RPC (see splittable) the range is split in halves and each is
+// retried, down to single blocks, so one oversized range cannot stall
+// reconcile forever. A range that keeps failing costs O(log2(range)) calls per
+// tick: the first failing half is descended and its error returned. Each
+// success has already advanced lastReconciled inside do.
 func (s *EventSubscriber) splitRetry(ctx context.Context, from, to uint64, logger *slog.Logger, do func(from, to uint64) error) error {
 	err := do(from, to)
-	if err == nil || from >= to || ctx.Err() != nil || errors.Is(err, errReconcileStale) {
+	if err == nil || from >= to || ctx.Err() != nil || errors.Is(err, errReconcileStale) || !splittable(err) {
 		return err
 	}
 	mid := from + (to-from)/2

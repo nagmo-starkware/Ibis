@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,10 @@ func (s *syncBuf) String() string {
 	defer s.mu.Unlock()
 	return s.b.String()
 }
+
+// reconTransports names the gap sites whose live stream is reconciled at this
+// point of the series; tests over "all transports" range over it.
+var reconTransports = []string{"keys-sub"}
 
 // reconSites are the gap sites whose live stream is reconciled.
 func reconSites(names ...string) []gapSite {
@@ -678,5 +683,216 @@ loop:
 	}
 	if n := got[newTestFelt(0xB2).String()+"@143"]; n != 0 {
 		t.Errorf("removed contract's event delivered %d times", n)
+	}
+}
+
+// --- split bounds, backoff, redaction, pending rollback ---------------------------
+
+// countEvents tallies non-sentinel events by "address@block" until d elapses.
+func countEvents(ch <-chan RawEvent, d time.Duration) map[string]int {
+	got := map[string]int{}
+	deadline := time.After(d)
+	for {
+		select {
+		case e := <-ch:
+			if !e.BackfillDone {
+				got[fmt.Sprintf("%s@%d", e.ContractAddress, e.BlockNumber)]++
+			}
+		case <-deadline:
+			return got
+		}
+	}
+}
+
+func bareRange(t *testing.T, fetch func(from, to uint64) ([]RawEvent, error), rec *reconciler, from, to uint64) error {
+	t.Helper()
+	sub := newBareSub(t, make(chan RawEvent, 4))
+	sc := reconcileScope{
+		label: "x",
+		fetch: func(_ context.Context, f, t uint64) ([]RawEvent, error) { return fetch(f, t) },
+		keep:  func(RawEvent) bool { return true },
+	}
+	_, epoch := rec.snapshot()
+	return sub.reconcileRange(context.Background(), rec, epoch, sc, from, to, testLogger)
+}
+
+var errTimeout = errors.New("fetching events: context deadline exceeded")
+
+// A range that keeps failing costs O(log2(range)) calls per tick, never one per
+// block, and does not advance; a mixed result advances exactly through the last
+// contiguous success.
+func TestReconcileSplitRetryBounds(t *testing.T) {
+	t.Run("persistent failure", func(t *testing.T) {
+		rec := newReconciler()
+		rec.start(0)
+		var calls int
+		for tick := 0; tick < 2; tick++ { // retried next tick, same bound, no progress
+			calls = 0
+			err := bareRange(t, func(f, to uint64) ([]RawEvent, error) { calls++; return nil, errTimeout }, rec, 1, 100)
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			if calls > 9 { // log2(100) ~ 6.6: 8 descents + the first call
+				t.Errorf("tick %d: %d calls for a persistently failing 100-block range, want O(log2) (<= 9)", tick, calls)
+			}
+			if last, _ := rec.state(); last != 0 {
+				t.Errorf("lastReconciled = %d after only failures, want 0", last)
+			}
+		}
+	})
+	t.Run("mixed result", func(t *testing.T) {
+		rec := newReconciler()
+		rec.start(0)
+		calls := 0
+		// Wide ranges time out; block 20 is bad on its own; everything else works.
+		err := bareRange(t, func(f, to uint64) ([]RawEvent, error) {
+			calls++
+			if to-f+1 > 8 || (f <= 20 && 20 <= to) {
+				return nil, errTimeout
+			}
+			return nil, nil
+		}, rec, 1, 64)
+		if err == nil {
+			t.Fatal("want an error from block 20")
+		}
+		if last, _ := rec.state(); last != 19 {
+			t.Errorf("lastReconciled = %d, want 19 (last contiguous success)", last)
+		}
+		if calls > 20 {
+			t.Errorf("%d calls, want a small multiple of log2(64)", calls)
+		}
+	})
+	t.Run("429 is not split", func(t *testing.T) {
+		rec := newReconciler()
+		rec.start(0)
+		calls := 0
+		err := bareRange(t, func(f, to uint64) ([]RawEvent, error) {
+			calls++
+			return nil, errors.New("429 Too Many Requests")
+		}, rec, 1, 100)
+		if err == nil || calls != 1 {
+			t.Errorf("err=%v calls=%d, want 1 call and an error (no splitting on a rate limit)", err, calls)
+		}
+	})
+}
+
+func TestSplittable(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{context.DeadlineExceeded, true},
+		{fmt.Errorf("x: %w", context.DeadlineExceeded), true},
+		{errors.New("Post: i/o timeout"), true},
+		{errors.New("response size exceeded"), true},
+		{errors.New("429 Too Many Requests"), false},
+		{errors.New("rate limit exceeded"), false},
+		{errors.New("503 Service Unavailable"), false},
+		{errors.New("connection refused"), false},
+	} {
+		if got := splittable(tc.err); got != tc.want {
+			t.Errorf("splittable(%q) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+// The retry backoff is capped at the interval: after many consecutive failures
+// the loop still waits (it used to overflow to 0 and spin).
+func TestReconcileLoopBackoffNeverCollapses(t *testing.T) {
+	sub := newBareSub(t, make(chan RawEvent, 1))
+	sub.reconcileInterval = 5 * time.Millisecond
+	var calls atomic.Int64
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+	sub.reconcileLoop(ctx, "x", func(context.Context, *slog.Logger) error {
+		calls.Add(1)
+		return errors.New("rpc down")
+	})
+	if n := calls.Load(); n > 200 || n < 20 { // ~140 at one tick per 5ms
+		t.Errorf("%d ticks in 700ms at a 5ms interval, want ~140 (a collapsed backoff spins)", n)
+	}
+}
+
+func TestRedactURLs(t *testing.T) {
+	in := `Post "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/SECRETKEY": dial tcp: lookup failed; ws: wss://user:pw@node.example/ws?apikey=SECRET2 and http://127.0.0.1:8080/`
+	out := redactURLs(in)
+	for _, leak := range []string{"SECRETKEY", "SECRET2", "pw@", "v0_10"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("%q leaked in %q", leak, out)
+		}
+	}
+	for _, keep := range []string{"https://starknet-mainnet.g.alchemy.com/<redacted>", "wss://node.example/<redacted>", "http://127.0.0.1:8080"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("%q missing in %q", keep, out)
+		}
+	}
+}
+
+// A failing reconcile against an RPC URL with a key in its path never logs the key.
+func TestReconcileLogMasksRPCURL(t *testing.T) {
+	server := mockRPCServer(t, newGapChain(1, 1).handlers())
+	logs := &syncBuf{}
+	p, err := New(context.Background(), server.URL+"/v0_10/SECRETTOKEN", slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	server.Close() // every call now fails with an error that embeds the URL
+	sub := p.NewSubscriber(nil, make(chan RawEvent, 1), &SubscriberConfig{ReconcileInterval: 10 * time.Millisecond})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	rec := newReconciler()
+	rec.start(0)
+	sub.reconcileLoop(ctx, "x", func(c context.Context, l *slog.Logger) error {
+		return sub.reconcileTick(c, rec, reconcileScope{label: "x"}, l)
+	})
+	out := logs.String()
+	if !strings.Contains(out, "reconcile failed") {
+		t.Fatalf("no failure logged:\n%s", out)
+	}
+	if strings.Contains(out, "SECRETTOKEN") {
+		t.Errorf("RPC URL key leaked in logs:\n%s", out)
+	}
+}
+
+// A reorg seen before start() (during the post-subscribe backfill, which may have
+// fetched orphaned data) is honoured: reconcile starts below the reorg.
+func TestReconcilerStartHonoursPendingRollback(t *testing.T) {
+	for _, tc := range []struct{ rollbackAt, p, want uint64 }{{50, 60, 49}, {50, 40, 40}, {0, 60, 0}} {
+		r := newReconciler()
+		r.rollback(tc.rollbackAt)
+		r.start(tc.p)
+		if last, _ := r.state(); last != tc.want {
+			t.Errorf("rollback(%d) then start(%d): last = %d, want %d", tc.rollbackAt, tc.p, last, tc.want)
+		}
+	}
+}
+
+// A reorg landing while the post-subscribe backfill runs makes reconcile re-read
+// from the reorg start, so the (possibly orphaned) backfilled events are redone.
+func TestReconcileReorgDuringBackfill(t *testing.T) {
+	for _, site := range reconSites(reconTransports...) {
+		t.Run(site.name, func(t *testing.T) {
+			chain := newGapChain(121, 121)
+			chain.gate = make(chan struct{})
+			reconAdd(chain, site, 120)
+			node := newGapNode()
+			sub, events, _ := startReconSite(t, site, chain, node, 20*time.Millisecond)
+			sess := node.nextFor(t, site)
+			<-chain.entered // the backfill is in flight
+			sess.reorgs <- &client.ReorgEvent{StartBlockNum: 119, EndBlockNum: 119}
+			for len(sess.reorgs) != 0 {
+				time.Sleep(time.Millisecond)
+			}
+			time.Sleep(30 * time.Millisecond) // the rollback has run
+			close(chain.gate)
+			waitLive(t, sub)
+			chain.tip.Store(130)
+			got := countEvents(events, 800*time.Millisecond)
+			key := fmt.Sprintf("%s@120", newTestFelt(site.addr))
+			if got[key] != 2 {
+				t.Errorf("event @120 delivered %d times, want 2 (backfill, then re-read after the reorg): %v", got[key], got)
+			}
+		})
 	}
 }

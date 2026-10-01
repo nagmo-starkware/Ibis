@@ -408,7 +408,14 @@ func TestSubscribeBackfillIncompleteResumesBelowGap(t *testing.T) {
 			<-chain.entered
 			sess.events <- liveEvent(site.addr, 125) // past the unfilled gap
 			waitEvent(t, events, "live @125", func(e RawEvent) bool { return e.BlockNumber == 125 })
+			closedBefore := node.closed.Load()
 			sess.errs <- fmt.Errorf("socket dropped")
+			// Release the gated fetch only once the session has been torn down
+			// (its backfill cancelled). Releasing earlier races the backfill to
+			// completion, which is a different scenario (a complete backfill).
+			for node.closed.Load() == closedBefore {
+				time.Sleep(time.Millisecond)
+			}
 			close(chain.gate)
 
 			second := node.nextFor(t, site)

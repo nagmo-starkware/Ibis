@@ -77,7 +77,7 @@ There is no general-purpose Starknet indexer that provide a modern, easy-to-use 
 
 ### Data Flow
 
-1. **Subscribe** -- Event Subscriber connects to Starknet RPC WSS and calls `starknet_subscribeEvents` per configured contract (with `from_address` and `block_id` params). Falls back to `starknet_getEvents` HTTP polling if WSS fails.
+1. **Subscribe** -- Event Subscriber connects to Starknet RPC WSS and calls `starknet_subscribeEvents` per configured contract (with `from_address` and `block_id` params). The node is not trusted to replay from `block_id` or to deliver every event: after each (re)subscribe the subscriber HTTP-backfills `[resume, pre_confirmed]` for the subscription's scope, and while live it periodically reconciles the stream against `starknet_getEvents` (`indexer.reconcile_interval`), recovering any event the live path missed. Falls back to `starknet_getEvents` HTTP polling if WSS fails.
 2. **Process** -- Event Processor matches incoming events by selector (`keys[0]`) against ABI event definitions, then decodes `keys[]` and `data[]` Felt arrays into typed data. Factory events trigger child contract registration. UDC events trigger class-hash-based contract discovery.
 3. **Store** -- Decoded events are written to the configured database backend using revert/add operation pairs (for pending block safety)
 4. **Serve** -- API Server exposes auto-generated REST endpoints, SSE streams, admin endpoints, and factory/discovery endpoints based on the ABI-derived table schemas

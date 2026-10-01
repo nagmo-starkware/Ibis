@@ -33,6 +33,8 @@ indexer:
   # start_block: 500000  # Omit to start from the latest block (chain tip). Set to backfill from a specific block
   pending_blocks: true  # Index pre-confirmed (pending) blocks
   batch_size: 10        # Blocks per batch during backfill
+  # reconcile_interval: 60s  # Re-read live streams over HTTP to recover events the WSS node silently dropped (0s = off)
+  # reconcile_lag: 2         # Blocks behind the tip left to the live stream before checking
   # udc_address: "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf"  # Override UDC address for devnet/appchains (default: mainnet/Sepolia UDC)
 
 # Contracts to index

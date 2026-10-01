@@ -942,9 +942,6 @@ func (e *Engine) FindContract(name string) *config.ContractConfig {
 	return nil
 }
 
-// parseDurationOrZero parses a duration string, returning 0 for an empty or
-// invalid value so callers fall back to their built-in defaults. Values are
-// validated up front in config.Validate; this is a defensive re-parse.
 // reconcileSettings maps the reconcile config knobs. An unset interval means
 // the default (on); an explicit 0 turns reconciliation off. An unset lag means
 // the provider default.
@@ -961,6 +958,9 @@ func reconcileSettings(ic *config.IndexerConfig) (time.Duration, *uint64) {
 	return interval, lag
 }
 
+// parseDurationOrZero parses a duration string, returning 0 for an empty or
+// invalid value so callers fall back to their built-in defaults. Values are
+// validated up front in config.Validate; this is a defensive re-parse.
 func parseDurationOrZero(s string) time.Duration {
 	if s == "" {
 		return 0
