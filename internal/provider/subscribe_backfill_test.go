@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,7 @@ type gapChain struct {
 	preFails  atomic.Int64  // pre_confirmed reads that still fail
 	preReads  atomic.Int64
 	fetches   atomic.Int64  // getEvents calls
+	addrCalls atomic.Int64  // getEvents calls filtered to one address
 	failFetch atomic.Bool   // getEvents returns an error
 	ahead     atomic.Int64  // getEvents calls bounded past the accepted tip
 	maxSpan   atomic.Uint64 // if set, getEvents fails for ranges wider than this many blocks
@@ -33,12 +35,19 @@ type gapChain struct {
 	gate    chan struct{} // if set, getEvents blocks until closed
 	entered chan struct{} // signalled (non-blocking) on each getEvents entry
 
-	mu  sync.Mutex
-	evs map[uint64][]uint64 // block -> emitting addresses
+	mu   sync.Mutex
+	evs  map[uint64][]uint64 // block -> emitting addresses (key 0x1: match any filter)
+	kevs map[uint64][]gapKeyed
+}
+
+// gapKeyed is an event with a real key, returned only to filters that select it.
+type gapKeyed struct {
+	addr uint64
+	key  *felt.Felt
 }
 
 func newGapChain(tip, pre uint64) *gapChain {
-	c := &gapChain{evs: map[uint64][]uint64{}, entered: make(chan struct{}, 64)}
+	c := &gapChain{evs: map[uint64][]uint64{}, kevs: map[uint64][]gapKeyed{}, entered: make(chan struct{}, 64)}
 	c.tip.Store(tip)
 	c.pre.Store(pre)
 	return c
@@ -47,6 +56,14 @@ func newGapChain(tip, pre uint64) *gapChain {
 func (c *gapChain) add(block, addr uint64) {
 	c.mu.Lock()
 	c.evs[block] = append(c.evs[block], addr)
+	c.mu.Unlock()
+}
+
+// addKeyed adds an event with key as keys[0]; unlike add it honours the
+// request's keys filter.
+func (c *gapChain) addKeyed(block, addr uint64, key *felt.Felt) {
+	c.mu.Lock()
+	c.kevs[block] = append(c.kevs[block], gapKeyed{addr, key})
 	c.mu.Unlock()
 }
 
@@ -82,7 +99,8 @@ func (c *gapChain) handlers() map[string]func(json.RawMessage) (interface{}, err
 				To struct {
 					N uint64 `json:"block_number"`
 				} `json:"to_block"`
-				Address string `json:"address"`
+				Address string     `json:"address"`
+				Keys    [][]string `json:"keys"`
 			}
 			if err := json.Unmarshal(params, &q); err != nil || len(q) != 1 {
 				return nil, fmt.Errorf("bad params %s", params)
@@ -93,6 +111,9 @@ func (c *gapChain) handlers() map[string]func(json.RawMessage) (interface{}, err
 			}
 			if m := c.maxSpan.Load(); m > 0 && q[0].To.N-q[0].From.N+1 > m {
 				return nil, fmt.Errorf("range too wide (timeout)")
+			}
+			if q[0].Address != "" {
+				c.addrCalls.Add(1)
 			}
 			out := []map[string]interface{}{}
 			c.mu.Lock()
@@ -105,6 +126,24 @@ func (c *gapChain) handlers() map[string]func(json.RawMessage) (interface{}, err
 					out = append(out, map[string]interface{}{
 						"block_number": b, "block_hash": "0x1", "transaction_hash": fmt.Sprintf("0x%x", b),
 						"from_address": addr, "keys": []string{"0x1"}, "data": []string{"0x2"},
+					})
+				}
+			}
+			for b := q[0].From.N; b <= q[0].To.N; b++ {
+				for _, k := range c.kevs[b] {
+					addr := newTestFelt(k.addr).String()
+					if q[0].Address != "" && q[0].Address != addr {
+						continue
+					}
+					if len(q[0].Keys) > 0 && len(q[0].Keys[0]) > 0 && !slices.ContainsFunc(q[0].Keys[0], func(h string) bool {
+						f, err := new(felt.Felt).SetString(h)
+						return err == nil && f.Equal(k.key)
+					}) {
+						continue
+					}
+					out = append(out, map[string]interface{}{
+						"block_number": b, "block_hash": "0x1", "transaction_hash": fmt.Sprintf("0x%x", b),
+						"from_address": addr, "keys": []string{k.key.String()}, "data": []string{"0x2"},
 					})
 				}
 			}
@@ -192,6 +231,7 @@ func gapSites() []gapSite {
 	return []gapSite{
 		{"keys-sub", []ContractSubscription{{Address: newTestFelt(0xA), StartBlock: 100, Wildcard: true}}, keysCfg, 0xA, 100, 0, 1},
 		{"keys-address-sub", []ContractSubscription{{Address: newTestFelt(0xB), StartBlock: 100}}, keysCfg, 0xB, 100, 0xB, 2},
+		{"keys-child-transfer", []ContractSubscription{{Address: newTestFelt(0xD), StartBlock: 100, Wildcard: true, ERC20: true}}, keysCfg, 0xD, 100, 0xD, 2},
 		{"shared-firehose", []ContractSubscription{{Address: newTestFelt(0xA), StartBlock: 100}}, SubscriberConfig{SharedFirehose: true}, 0xA, 100, 0, 1},
 		{"per-contract", []ContractSubscription{{Address: newTestFelt(0xA), StartBlock: 100}}, SubscriberConfig{}, 0xA, 100, 0xA, 1},
 	}
@@ -465,7 +505,7 @@ func TestSubscribeBackfillFailureEscalatesBackoff(t *testing.T) {
 // After a successful backfill a quiet contract (no live events) resumes from P,
 // not from its old cursor, so a reconnect does not re-fetch the same range.
 func TestSubscribePerContractQuietResumesFromP(t *testing.T) {
-	site := gapSites()[3] // per-contract
+	site := gapSites()[4] // per-contract
 	chain := newGapChain(121, 121)
 	chain.add(105, site.addr)
 	node := newGapNode()

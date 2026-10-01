@@ -77,6 +77,10 @@ type firehoseKeysStream struct {
 	address *felt.Felt     // nil for the keys-sub
 	keys    [][]*felt.Felt // event key filter for this stream's WSS input
 
+	// collective marks a child Transfer/Approval stream: reconciled together
+	// with its siblings (childReconcileLoop), not on its own.
+	collective bool
+
 	// runCtx is the context this stream's run-loop goroutine was launched
 	// with. Only set for dynamically-created address-sub streams (the
 	// keys-sub and the initial token streams are launched directly against
@@ -326,8 +330,19 @@ func (s *EventSubscriber) startKeysFirehose(ctx context.Context) error {
 	// Reserved at creation, above — before any other stream existed.
 	s.launchReservedKeysStream(ctx, keysStream, &wg)
 
+	if s.reconcileInterval > 0 {
+		wg.Add(1)
+		go func() { defer wg.Done(); s.childReconcileLoop(ctx) }()
+	}
+
 	wg.Wait()
 	return ctx.Err()
+}
+
+// childTransferKeys is the event-key filter shared by every child
+// Transfer/Approval stream.
+func childTransferKeys() [][]*felt.Felt {
+	return [][]*felt.Felt{{transferSelector, approvalSelector}}
 }
 
 // seedKeysStreamFill adds an option-family contract to the keys-sub's gap-fill
@@ -351,7 +366,8 @@ func (s *EventSubscriber) seedKeysStreamFill(keysStream *firehoseKeysStream, add
 // agree on the same context.
 func (s *EventSubscriber) newChildTransferStream(ctx context.Context, sub ContractSubscription, wssFrom uint64) *firehoseKeysStream {
 	addrHex := sub.Address.String()
-	st := newFirehoseKeysStream("child-transfer:"+addrHex, sub.Address, [][]*felt.Felt{{transferSelector, approvalSelector}})
+	st := newFirehoseKeysStream("child-transfer:"+addrHex, sub.Address, childTransferKeys())
+	st.collective = true
 
 	fillSub := sub
 	fillSub.Keys = st.keys
