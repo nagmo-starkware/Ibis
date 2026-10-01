@@ -15,7 +15,7 @@ import (
 )
 
 // replyNode is a WSS server answering starknet_subscribeEvents via reply
-// (nil: never). It records whether the reply was written.
+// (nil func or nil result: no reply). It records whether the reply was written.
 func replyNode(t *testing.T, reply func(id json.RawMessage) map[string]interface{}) (url string, replied *atomic.Bool) {
 	t.Helper()
 	replied = &atomic.Bool{}
@@ -38,8 +38,12 @@ func replyNode(t *testing.T, reply func(id json.RawMessage) map[string]interface
 				continue
 			}
 			time.Sleep(100 * time.Millisecond)
+			resp := reply(req.ID)
+			if resp == nil {
+				continue // no reply for this request
+			}
 			replied.Store(true)
-			_ = c.WriteJSON(reply(req.ID))
+			_ = c.WriteJSON(resp)
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -93,5 +97,60 @@ func TestDefaultDialerSubscribeErrorReply(t *testing.T) {
 	if sess, err := defaultWSSDialer(context.Background(), url, &rpc.EventSubscriptionInput{}); err == nil {
 		sess.close()
 		t.Fatal("dial succeeded on a JSON-RPC error reply")
+	}
+}
+
+func okReply(id json.RawMessage) map[string]interface{} {
+	return map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"}
+}
+
+// multiplexKeysDialer: a failed subscribe (no reply / error reply) is an error,
+// frees its pacing slot, and leaves the shared socket usable for the next one.
+func TestMultiplexDialerSubscribeFailureThenReuse(t *testing.T) {
+	cases := map[string]func(id json.RawMessage) map[string]interface{}{
+		"timeout": nil, // first request unanswered
+		"error": func(id json.RawMessage) map[string]interface{} {
+			return map[string]interface{}{"jsonrpc": "2.0", "id": id,
+				"error": map[string]interface{}{"code": 1, "message": "too many blocks back"}}
+		},
+	}
+	for name, firstReply := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer withReplyTimeout(300 * time.Millisecond)()
+			var n atomic.Int32
+			url, _ := replyNode(t, func(id json.RawMessage) map[string]interface{} {
+				if n.Add(1) == 1 {
+					if firstReply == nil {
+						return nil
+					}
+					return firstReply(id)
+				}
+				return okReply(id)
+			})
+			sub, _, cleanup := newKeysFirehoseSub(t, nil)
+			defer cleanup()
+			sub.wsCtx = context.Background()
+			defer sub.closeSharedAddrWS()
+			in := &rpc.EventSubscriptionInput{FromAddress: newTestFelt(0xB)}
+
+			sess, err := sub.multiplexKeysDialer(context.Background(), url, in)
+			if err == nil {
+				sess.close()
+				t.Fatal("subscribe without a usable reply must fail")
+			}
+			if l := len(sub.addrSubSem); l != 0 {
+				t.Fatalf("pacing slot not released after failed subscribe: %d held", l)
+			}
+			ws := sub.addrWS
+
+			sess, err = sub.multiplexKeysDialer(context.Background(), url, in)
+			if err != nil {
+				t.Fatalf("shared socket unusable after a failed subscribe: %v", err)
+			}
+			defer sess.close()
+			if sub.addrWS != ws {
+				t.Error("shared socket was redialed instead of reused")
+			}
+		})
 	}
 }
