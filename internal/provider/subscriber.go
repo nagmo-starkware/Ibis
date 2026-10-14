@@ -1046,7 +1046,7 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 		}
 
 		// Attempt to dial WSS.
-		session, p, err := s.dialWithGap(ctx, subInput)
+		session, p, err := s.dialWithGap(ctx, subInput, false)
 		if err != nil {
 			consecutiveDialFails++
 			if consecutiveDialFails >= maxWSSDialFailures {

@@ -164,6 +164,7 @@ type gapNode struct {
 	sessions  chan *gapSess
 	dials     atomic.Int32
 	failDials atomic.Int32
+	hangKeys  atomic.Bool // the keys-sub's subscribe never replies
 	closed    atomic.Int32
 	mu        sync.Mutex
 	resumes   []uint64
@@ -179,7 +180,11 @@ type gapSess struct {
 func newGapNode() *gapNode { return &gapNode{sessions: make(chan *gapSess, 32)} }
 
 func (n *gapNode) dialer() wssDialer {
-	return func(_ context.Context, _ string, in *rpc.EventSubscriptionInput) (*wssSession, error) {
+	return func(ctx context.Context, _ string, in *rpc.EventSubscriptionInput) (*wssSession, error) {
+		if in.FromAddress == nil && n.hangKeys.Load() {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
 		n.dials.Add(1)
 		if n.failDials.Add(-1) >= 0 {
 			return nil, fmt.Errorf("subscribe reply timeout")

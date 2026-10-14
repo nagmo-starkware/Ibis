@@ -520,12 +520,7 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 
 		// Gated (as is the backfill below) so a mass drop cannot fire every
 		// stream's post-subscribe RPCs at once.
-		release, err := s.acquireResubscribe(ctx)
-		if err != nil {
-			return err
-		}
-		session, p, err := s.dialWithGap(ctx, subInput)
-		release()
+		session, p, err := s.dialWithGap(ctx, subInput, true)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()

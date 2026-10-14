@@ -36,11 +36,20 @@ const (
 
 // dialWithGap dials a subscription and, once the node has replied, reads the
 // pre-confirmed block number P. A failed read closes the session: it is
-// reported like a failed dial, never used without a known P.
-func (s *EventSubscriber) dialWithGap(ctx context.Context, input *rpc.EventSubscriptionInput) (*wssSession, uint64, error) {
+// reported like a failed dial, never used without a known P. gated holds a
+// resubSem slot for the read only (subscribes are paced by addrSubSem).
+func (s *EventSubscriber) dialWithGap(ctx context.Context, input *rpc.EventSubscriptionInput, gated bool) (*wssSession, uint64, error) {
 	session, err := s.dialWSS(ctx, s.provider.wsURL, input)
 	if err != nil {
 		return nil, 0, err
+	}
+	if gated {
+		release, err := s.acquireResubscribe(ctx)
+		if err != nil {
+			session.close()
+			return nil, 0, err
+		}
+		defer release()
 	}
 	p, err := s.readPreConfirmed(ctx)
 	if err != nil {
