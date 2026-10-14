@@ -164,7 +164,8 @@ type gapNode struct {
 	sessions  chan *gapSess
 	dials     atomic.Int32
 	failDials atomic.Int32
-	hangKeys  atomic.Bool // the keys-sub's subscribe never replies
+	hangKeys  atomic.Bool   // the keys-sub's subscribe never replies
+	hold      chan struct{} // if set, dials block until closed
 	closed    atomic.Int32
 	mu        sync.Mutex
 	resumes   []uint64
@@ -184,6 +185,13 @@ func (n *gapNode) dialer() wssDialer {
 		if in.FromAddress == nil && n.hangKeys.Load() {
 			<-ctx.Done()
 			return nil, ctx.Err()
+		}
+		if n.hold != nil {
+			select {
+			case <-n.hold:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		n.dials.Add(1)
 		if n.failDials.Add(-1) >= 0 {

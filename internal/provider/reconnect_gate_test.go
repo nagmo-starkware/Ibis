@@ -23,6 +23,7 @@ func TestReconnectWavePeakConcurrency(t *testing.T) {
 	if peak > maxConcurrentResubscribe {
 		t.Fatalf("peak post-subscribe RPCs = %d, want <= %d", peak, maxConcurrentResubscribe)
 	}
+	assertSlotsFree(t, sub)
 }
 
 // gateSite is a keys-sub plus one address-sub sharing a resubscribe bound of
@@ -63,6 +64,7 @@ func TestResubscribeGateReleasedOnFailure(t *testing.T) {
 			tc.fail(t, chain, node)
 			sub, _ := startGapSite(t, gateSite(), chain, node)
 			waitLive(t, sub)
+			assertSlotsFree(t, sub)
 		})
 	}
 }
@@ -79,6 +81,7 @@ func TestResubscribeGateNotHeldWhileWaitingAccepted(t *testing.T) {
 	first.errs <- fmt.Errorf("socket dropped")
 	chain.tip.Store(121)
 	waitLive(t, sub)
+	assertSlotsFree(t, sub)
 }
 
 // A dial that hangs (subscribe reply never comes) holds no slot: with a bound
@@ -96,41 +99,74 @@ func TestResubscribeGateNotHeldByHungDial(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+	assertSlotsFree(t, sub)
 }
 
-// A stream canceled while it holds the slot, or while blocked acquiring it,
-// returns promptly, closes its session, and leaves the slot usable.
-func TestResubscribeGateCancel(t *testing.T) {
+// A stream canceled while blocked acquiring the slot returns promptly and
+// closes its session.
+func TestResubscribeGateCancelWhileAcquiring(t *testing.T) {
 	chain := newGapChain(121, 121)
-	chain.gate = make(chan struct{}) // the slot holder's backfill blocks
 	node := newGapNode()
+	node.hold = make(chan struct{})
 	site := gateSite()
 	sub, _ := startGapSite(t, site, chain, node)
 
-	select {
-	case <-chain.entered: // one stream holds the slot
-	case <-time.After(5 * time.Second):
-		t.Fatal("no backfill started")
-	}
-	for deadline := time.Now().Add(5 * time.Second); node.dials.Load() < 2; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("second stream never subscribed")
-		}
-	}
-	time.Sleep(50 * time.Millisecond) // the other reaches acquire
+	sub.resubSem <- struct{}{} // the test holds the only slot
+	close(node.hold)
+	// Both subscribed with the slot taken: each can only be blocked acquiring it.
+	waitFor(t, "both subscribes", func() bool { return node.dials.Load() == 2 })
 
 	sub.RemoveContract(newTestFelt(site.fromAddr).String())
-	deadline := time.Now().Add(2 * time.Second)
-	for node.closed.Load() < 1 {
+	waitFor(t, "canceled stream's session closed", func() bool { return node.closed.Load() == 1 })
+	if n := chain.preReads.Load(); n != 0 {
+		t.Fatalf("pre_confirmed reads = %d while the slot was held", n)
+	}
+	<-sub.resubSem
+	waitLive(t, sub) // the keys-sub
+	assertSlotsFree(t, sub)
+}
+
+// A stream canceled while holding the slot (mid-backfill) releases it.
+func TestResubscribeGateCancelWhileHolding(t *testing.T) {
+	chain := newGapChain(121, 121)
+	chain.gate = make(chan struct{}) // backfills block holding their slot
+	node := newGapNode()
+	site := gateSite()
+	site.cfg.MaxConcurrentResubscribes = 2
+	sub, _ := startGapSite(t, site, chain, node)
+
+	waitFor(t, "both backfills holding a slot", func() bool {
+		return chain.fetches.Load() == 2 && len(sub.resubSem) == 2
+	})
+	sub.RemoveContract(newTestFelt(site.fromAddr).String())
+	waitFor(t, "slot released", func() bool { return len(sub.resubSem) == 1 && node.closed.Load() == 1 })
+	close(chain.gate)
+	waitLive(t, sub) // the keys-sub
+	assertSlotsFree(t, sub)
+}
+
+// waitFor polls cond for up to 5s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatal("canceled stream did not close its session")
+			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	close(chain.gate)
-	waitLive(t, sub) // the keys-sub, through the same slot
-	if _, total, _ := sub.TransportStatus(); total != 1 {
-		t.Fatalf("total streams = %d, want 1 after removing the address-sub", total)
+}
+
+// assertSlotsFree checks every acquired slot was released (none leaked, none
+// released twice: a double release would block or panic instead).
+func assertSlotsFree(t *testing.T, sub *EventSubscriber) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(sub.resubSem) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d resubscribe slots still held after settling", len(sub.resubSem))
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
