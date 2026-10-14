@@ -25,7 +25,7 @@ const (
 	maxConcurrentCatchup = 16
 
 	// maxConcurrentResubscribe is the default bound on firehose-keys streams
-	// between dial and the end of their post-subscribe backfill. A dropped
+	// subscribing or running their post-subscribe backfill at once. A dropped
 	// shared socket resubscribes every address-sub at once; unbounded, their
 	// RPCs OOM'd prod. Overridable via indexer.max_concurrent_resubscribe.
 	maxConcurrentResubscribe = 32
