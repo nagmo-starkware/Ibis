@@ -81,6 +81,23 @@ func TestResubscribeGateNotHeldWhileWaitingAccepted(t *testing.T) {
 	waitLive(t, sub)
 }
 
+// A dial that hangs (subscribe reply never comes) holds no slot: with a bound
+// of 1 the other stream still goes live.
+func TestResubscribeGateNotHeldByHungDial(t *testing.T) {
+	chain := newGapChain(121, 121)
+	node := newGapNode()
+	node.hangKeys.Store(true)
+	sub, _ := startGapSite(t, gateSite(), chain, node)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for live, _, _ := sub.TransportStatus(); live < 1; live, _, _ = sub.TransportStatus() {
+		if time.Now().After(deadline) {
+			t.Fatal("address-sub starved behind a hung dial")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // A stream canceled while it holds the slot, or while blocked acquiring it,
 // returns promptly, closes its session, and leaves the slot usable.
 func TestResubscribeGateCancel(t *testing.T) {

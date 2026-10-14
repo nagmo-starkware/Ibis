@@ -102,7 +102,7 @@ func (s *EventSubscriber) runFirehoseWSS(ctx context.Context) error {
 			subInput.SubBlockID = rpc.SubscriptionBlockID{Number: &bn}
 		}
 
-		session, p, err := s.dialWithGap(ctx, subInput)
+		session, p, err := s.dialWithGap(ctx, subInput, false)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
