@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -185,31 +186,40 @@ func TestJitterSpreadsReconnects(t *testing.T) {
 	}
 }
 
+// newTipSub is a subscriber over a node whose blockNumber is *tip, with the
+// shared tip poller running (every interval) when shared.
+func newTipSub(t *testing.T, shared bool, interval time.Duration) (*EventSubscriber, *atomic.Uint64, *atomic.Int64) {
+	t.Helper()
+	var tip atomic.Uint64
+	var reads atomic.Int64
+	server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){
+		"starknet_blockNumber": func(json.RawMessage) (interface{}, error) { reads.Add(1); return tip.Load(), nil },
+	})
+	t.Cleanup(server.Close)
+	p, err := New(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { p.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	tip.Store(100)
+	sub := p.NewSubscriber(nil, nil, &SubscriberConfig{SharedTipPoller: shared, TipPollInterval: interval})
+	if shared {
+		p.StartTipPoller(ctx, interval)
+	}
+	return sub, &tip, &reads
+}
+
 // waitAccepted reads the shared cached tip when the poller runs (no RPC per
 // waiting stream), and the node directly when it does not.
 func TestWaitAcceptedUsesCachedTip(t *testing.T) {
 	for _, shared := range []bool{true, false} {
 		t.Run(fmt.Sprint("shared=", shared), func(t *testing.T) {
-			var reads atomic.Int64
-			server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){
-				"starknet_blockNumber": func(json.RawMessage) (interface{}, error) { reads.Add(1); return uint64(100), nil },
-			})
-			defer server.Close()
-			p, err := New(context.Background(), server.URL, nil)
-			if err != nil {
-				t.Fatalf("New() error: %v", err)
-			}
-			defer p.Close()
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			sub := p.NewSubscriber(nil, nil, &SubscriberConfig{SharedTipPoller: shared, TipPollInterval: time.Hour})
-			if shared {
-				p.StartTipPoller(ctx, time.Hour)
-			}
-
+			sub, _, reads := newTipSub(t, shared, time.Hour)
 			before := reads.Load()
 			for range 10 {
-				if err := sub.waitAccepted(ctx, 100); err != nil {
+				if err := sub.waitAccepted(context.Background(), 100); err != nil {
 					t.Fatalf("waitAccepted: %v", err)
 				}
 			}
@@ -221,5 +231,40 @@ func TestWaitAcceptedUsesCachedTip(t *testing.T) {
 				t.Fatalf("blockNumber RPCs = %d, want %d", got, want)
 			}
 		})
+	}
+}
+
+// A cached tip lagging P holds waitAccepted until it reaches P.
+func TestWaitAcceptedWaitsForCachedTip(t *testing.T) {
+	sub, tip, _ := newTipSub(t, true, 5*time.Millisecond)
+	done := make(chan error, 1)
+	go func() { done <- sub.waitAccepted(context.Background(), 101) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("returned (%v) while the tip was below P", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	tip.Store(101)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitAccepted: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not return once the tip reached P")
+	}
+}
+
+// A cached tip stuck below P ends the wait with the acceptWaitTimeout error.
+func TestWaitAcceptedTimesOutOnStuckTip(t *testing.T) {
+	old := acceptWaitTimeout
+	acceptWaitTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { acceptWaitTimeout = old })
+
+	sub, _, _ := newTipSub(t, true, 5*time.Millisecond)
+	err := sub.waitAccepted(context.Background(), 101)
+	if err == nil || !strings.Contains(err.Error(), "not accepted within") {
+		t.Fatalf("waitAccepted = %v, want the accept-wait timeout", err)
 	}
 }

@@ -28,11 +28,11 @@ const (
 	// preConfirmedAttempts is how often the pre-confirmed block is read after a
 	// subscribe before the session is abandoned.
 	preConfirmedAttempts = 3
-
-	// acceptWaitTimeout bounds the wait for block P to be accepted (getEvents
-	// with a numeric upper bound P only works once P is).
-	acceptWaitTimeout = 2 * time.Minute
 )
+
+// acceptWaitTimeout bounds the wait for block P to be accepted (getEvents with
+// a numeric upper bound P only works once P is). A var so tests can shorten it.
+var acceptWaitTimeout = 2 * time.Minute
 
 // dialWithGap dials a subscription and, once the node has replied, reads the
 // pre-confirmed block number P. A failed read closes the session: it is
@@ -86,8 +86,10 @@ func (s *EventSubscriber) waitAccepted(ctx context.Context, p uint64) error {
 	defer timeout.Stop()
 	for {
 		rctx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
-		// Shared cached tip when the poller runs: it can only under-report, so
-		// staleness delays (bounded by acceptWaitTimeout), never over-fetches.
+		// Cached tip when the shared poller runs. CachedBlockNumber may return a
+		// stale value with a nil error, but the tip is monotonic and never ahead
+		// of the node's accepted head, so staleness only delays (bounded by
+		// acceptWaitTimeout), never fetches an unaccepted range.
 		tip, err := s.tipBlockNumber(rctx)
 		cancel()
 		if err == nil && tip >= p {
