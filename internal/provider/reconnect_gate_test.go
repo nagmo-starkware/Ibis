@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -183,6 +185,28 @@ func TestJitterSpreadsReconnects(t *testing.T) {
 	}
 	if len(seen) < 50 {
 		t.Fatalf("jitter(1s) gave only %d distinct sleeps in 100 calls; streams would reconnect in lockstep", len(seen))
+	}
+	for _, d := range []time.Duration{0, -time.Second} {
+		if got := jitter(d); got != d {
+			t.Fatalf("jitter(%v) = %v, want it unchanged", d, got)
+		}
+	}
+}
+
+// MaxConcurrentResubscribes sizes the gate; unset or 0 means the default.
+func TestResubscribeGateSize(t *testing.T) {
+	p := &StarknetProvider{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	for _, tc := range []struct {
+		cfg  *SubscriberConfig
+		want int
+	}{
+		{nil, maxConcurrentResubscribe},
+		{&SubscriberConfig{}, maxConcurrentResubscribe},
+		{&SubscriberConfig{MaxConcurrentResubscribes: 7}, 7},
+	} {
+		if got := cap(p.NewSubscriber(nil, nil, tc.cfg).resubSem); got != tc.want {
+			t.Errorf("cfg %+v: gate size = %d, want %d", tc.cfg, got, tc.want)
+		}
 	}
 }
 

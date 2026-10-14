@@ -1009,20 +1009,19 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.cfg.Indexer.Transport == "firehose-keys"
 	subs := e.buildSubscriptions(startBlocks)
 	subscriber := e.provider.NewSubscriber(subs, e.events, &provider.SubscriberConfig{
-		BlocksPerQuery:      uint64(e.cfg.Indexer.BatchSize) * 10,
-		ForcePolling:        e.cfg.Indexer.Transport == "http",
-		CatchupWithPolling:  e.cfg.Indexer.Transport == "catchup",
-		SharedFirehose:      e.cfg.Indexer.Transport == "firehose",
-		KeysFirehose:        e.cfg.Indexer.Transport == "firehose-keys",
-		OptionSelectors:     e.optionSelectors,
-		SharedTipPoller:     useSharedTip,
-		TipPollInterval:     tipInterval,
-		CatchupPollInterval: catchupInterval,
-		MaxConcurrentPolls:  e.cfg.Indexer.MaxConcurrentCatchup,
-		ReconcileInterval:   reconcileInterval,
-		ReconcileLag:        reconcileLag,
-
+		BlocksPerQuery:            uint64(e.cfg.Indexer.BatchSize) * 10,
+		ForcePolling:              e.cfg.Indexer.Transport == "http",
+		CatchupWithPolling:        e.cfg.Indexer.Transport == "catchup",
+		SharedFirehose:            e.cfg.Indexer.Transport == "firehose",
+		KeysFirehose:              e.cfg.Indexer.Transport == "firehose-keys",
+		OptionSelectors:           e.optionSelectors,
+		SharedTipPoller:           useSharedTip,
+		TipPollInterval:           tipInterval,
+		CatchupPollInterval:       catchupInterval,
+		MaxConcurrentPolls:        e.cfg.Indexer.MaxConcurrentCatchup,
 		MaxConcurrentResubscribes: e.cfg.Indexer.MaxConcurrentResubscribe,
+		ReconcileInterval:         reconcileInterval,
+		ReconcileLag:              reconcileLag,
 	})
 	subscriber.SetReorgChan(e.reorgs)
 

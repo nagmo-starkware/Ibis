@@ -113,6 +113,9 @@ var errBackfillFailed = errors.New("post-subscribe backfill failed")
 // jitter spreads a reconnect sleep over [d, 1.5d), so streams dropped together
 // do not resubscribe in lockstep.
 func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
 	return d + rand.N(d/2+1)
 }
 
