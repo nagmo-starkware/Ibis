@@ -24,6 +24,12 @@ const (
 	// internal/engine/poller.go. Overridable via indexer.max_concurrent_catchup.
 	maxConcurrentCatchup = 16
 
+	// maxConcurrentResubscribe is the default bound on firehose-keys streams
+	// between dial and the end of their post-subscribe backfill. A dropped
+	// shared socket resubscribes every address-sub at once; unbounded, their
+	// RPCs OOM'd prod. Overridable via indexer.max_concurrent_resubscribe.
+	maxConcurrentResubscribe = 32
+
 	// WSS reconnection backoff bounds.
 	minBackoff = 1 * time.Second
 	maxBackoff = 30 * time.Second
@@ -250,6 +256,10 @@ type SubscriberConfig struct {
 	// catchup/poll iteration simultaneously. 0 = maxConcurrentCatchup.
 	MaxConcurrentPolls int
 
+	// MaxConcurrentResubscribes bounds how many firehose-keys streams may run
+	// their post-subscribe phase at once. 0 = maxConcurrentResubscribe.
+	MaxConcurrentResubscribes int
+
 	// SharedTipPoller makes the subscriber read the chain tip from the provider's
 	// shared cache (CachedBlockNumber) instead of issuing a direct BlockNumber per
 	// poll. The caller must also start StarknetProvider.StartTipPoller. Implied by
@@ -314,6 +324,10 @@ type EventSubscriber struct {
 	// resumeSem bounds concurrent BackfillBackground fetches (restart/freeze
 	// resumes), which can number in the tens of thousands at boot.
 	resumeSem chan struct{}
+
+	// resubSem bounds firehose-keys streams in their post-subscribe phase.
+	// See maxConcurrentResubscribe.
+	resubSem chan struct{}
 	// backfillGen numbers tracked backfills; 0 is never used.
 	backfillGen atomic.Uint64
 
@@ -395,6 +409,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 	tipInterval := defaultTipPollInterval
 	catchupInterval := defaultCatchupPollInterval
 	maxConcurrent := maxConcurrentCatchup
+	maxResub := maxConcurrentResubscribe
 	var reconcileInterval time.Duration
 	reconcileLag := defaultReconcileLag
 	if cfg != nil {
@@ -419,6 +434,9 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		if cfg.MaxConcurrentPolls > 0 {
 			maxConcurrent = cfg.MaxConcurrentPolls
 		}
+		if cfg.MaxConcurrentResubscribes > 0 {
+			maxResub = cfg.MaxConcurrentResubscribes
+		}
 	}
 
 	sub := &EventSubscriber{
@@ -441,6 +459,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		dialWSS:             defaultWSSDialer,
 		sem:                 make(chan struct{}, maxConcurrent),
 		resumeSem:           make(chan struct{}, maxConcurrent),
+		resubSem:            make(chan struct{}, maxResub),
 		cancels:             make(map[string]context.CancelFunc),
 		router:              make(map[string]*firehoseSink),
 		tracked:             make(map[string]ContractSubscription),

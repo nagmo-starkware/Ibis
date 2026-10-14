@@ -31,6 +31,7 @@ func TestValidate_PollingKnobsValid(t *testing.T) {
 	path := writeTestConfig(t, pollingConfigYAML(`  tip_poll_interval: 5s
   catchup_poll_interval: 200ms
   max_concurrent_catchup: 8
+  max_concurrent_resubscribe: 4
   shared_tip_poller: true`))
 
 	cfg, err := Load(path)
@@ -48,6 +49,9 @@ func TestValidate_PollingKnobsValid(t *testing.T) {
 	}
 	if cfg.Indexer.MaxConcurrentCatchup != 8 {
 		t.Errorf("MaxConcurrentCatchup = %d, want 8", cfg.Indexer.MaxConcurrentCatchup)
+	}
+	if cfg.Indexer.MaxConcurrentResubscribe != 4 {
+		t.Errorf("MaxConcurrentResubscribe = %d, want 4", cfg.Indexer.MaxConcurrentResubscribe)
 	}
 	// Sanity: the strings parse to the expected durations.
 	if d, _ := time.ParseDuration(cfg.Indexer.TipPollInterval); d != 5*time.Second {
@@ -76,6 +80,7 @@ func TestValidate_PollingKnobsInvalid(t *testing.T) {
 		{"bad_catchup_duration", "  catchup_poll_interval: soon"},
 		{"catchup_too_small", "  catchup_poll_interval: 5ms"},
 		{"negative_concurrency", "  max_concurrent_catchup: -1"},
+		{"negative_resubscribe", "  max_concurrent_resubscribe: -1"},
 		{"bad_reconcile_duration", "  reconcile_interval: soon"},
 		{"reconcile_too_small", "  reconcile_interval: 500ms"},
 		{"negative_reconcile_interval", "  reconcile_interval: -1m"},

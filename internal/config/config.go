@@ -66,9 +66,13 @@ type IndexerConfig struct {
 	//                          (duration string, e.g. "100ms"; default 100ms).
 	//   MaxConcurrentCatchup — bound on concurrent catchup/poll iterations across
 	//                          all contract goroutines (default 16).
-	TipPollInterval      string `yaml:"tip_poll_interval,omitempty"`
-	CatchupPollInterval  string `yaml:"catchup_poll_interval,omitempty"`
-	MaxConcurrentCatchup int    `yaml:"max_concurrent_catchup,omitempty"`
+	//   MaxConcurrentResubscribe — bound on firehose-keys streams resubscribing
+	//                          (dial through post-subscribe backfill) at once
+	//                          (default 32).
+	TipPollInterval          string `yaml:"tip_poll_interval,omitempty"`
+	CatchupPollInterval      string `yaml:"catchup_poll_interval,omitempty"`
+	MaxConcurrentCatchup     int    `yaml:"max_concurrent_catchup,omitempty"`
+	MaxConcurrentResubscribe int    `yaml:"max_concurrent_resubscribe,omitempty"`
 
 	// Live-stream reconciliation. A WSS subscription can silently miss events
 	// while connected (measured upstream of ibis), so every live stream is
