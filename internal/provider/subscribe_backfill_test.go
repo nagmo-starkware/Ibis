@@ -259,6 +259,9 @@ func startGapSite(t *testing.T, site gapSite, chain *gapChain, node *gapNode) (*
 	sub.dialWSS = node.dialer()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	if sub.sharedTipPoller {
+		p.StartTipPoller(ctx, cfg.TipPollInterval) // as the engine does
+	}
 	done := make(chan struct{})
 	go func() { defer close(done); _ = sub.Start(ctx) }()
 	t.Cleanup(func() {
