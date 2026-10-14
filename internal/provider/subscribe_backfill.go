@@ -77,7 +77,9 @@ func (s *EventSubscriber) waitAccepted(ctx context.Context, p uint64) error {
 	defer timeout.Stop()
 	for {
 		rctx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
-		tip, err := s.provider.BlockNumber(rctx) // uncached: this decides what we fetch
+		// Shared cached tip when the poller runs: it can only under-report, so
+		// staleness delays (bounded by acceptWaitTimeout), never over-fetches.
+		tip, err := s.tipBlockNumber(rctx)
 		cancel()
 		if err == nil && tip >= p {
 			return nil

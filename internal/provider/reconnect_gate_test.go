@@ -1,7 +1,10 @@
 package provider
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -126,5 +129,44 @@ func TestJitterSpreadsReconnects(t *testing.T) {
 	}
 	if len(seen) < 50 {
 		t.Fatalf("jitter(1s) gave only %d distinct sleeps in 100 calls; streams would reconnect in lockstep", len(seen))
+	}
+}
+
+// waitAccepted reads the shared cached tip when the poller runs (no RPC per
+// waiting stream), and the node directly when it does not.
+func TestWaitAcceptedUsesCachedTip(t *testing.T) {
+	for _, shared := range []bool{true, false} {
+		t.Run(fmt.Sprint("shared=", shared), func(t *testing.T) {
+			var reads atomic.Int64
+			server := mockRPCServer(t, map[string]func(json.RawMessage) (interface{}, error){
+				"starknet_blockNumber": func(json.RawMessage) (interface{}, error) { reads.Add(1); return uint64(100), nil },
+			})
+			defer server.Close()
+			p, err := New(context.Background(), server.URL, nil)
+			if err != nil {
+				t.Fatalf("New() error: %v", err)
+			}
+			defer p.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sub := p.NewSubscriber(nil, nil, &SubscriberConfig{SharedTipPoller: shared, TipPollInterval: time.Hour})
+			if shared {
+				p.StartTipPoller(ctx, time.Hour)
+			}
+
+			before := reads.Load()
+			for range 10 {
+				if err := sub.waitAccepted(ctx, 100); err != nil {
+					t.Fatalf("waitAccepted: %v", err)
+				}
+			}
+			want := int64(10)
+			if shared {
+				want = 0
+			}
+			if got := reads.Load() - before; got != want {
+				t.Fatalf("blockNumber RPCs = %d, want %d", got, want)
+			}
+		})
 	}
 }
