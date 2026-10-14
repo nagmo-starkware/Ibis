@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -95,6 +96,12 @@ func (s *EventSubscriber) waitAccepted(ctx context.Context, p uint64) error {
 // failing (as opposed to the session dropping first), so the caller escalates
 // its reconnect backoff.
 var errBackfillFailed = errors.New("post-subscribe backfill failed")
+
+// jitter spreads a reconnect sleep over [d, 1.5d), so streams dropped together
+// do not resubscribe in lockstep.
+func jitter(d time.Duration) time.Duration {
+	return d + rand.N(d/2+1)
+}
 
 // backoffAfterSession is the reconnect backoff after a session: reset unless
 // the session ended because its backfill failed.
