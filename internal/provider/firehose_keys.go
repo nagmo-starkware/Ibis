@@ -518,15 +518,15 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 			subInput.SubBlockID = rpc.SubscriptionBlockID{Number: &bn}
 		}
 
-		// Held until the post-subscribe backfill ends, so a mass drop cannot
-		// fire every stream's post-subscribe RPCs at once.
+		// Gated (as is the backfill below) so a mass drop cannot fire every
+		// stream's post-subscribe RPCs at once.
 		release, err := s.acquireResubscribe(ctx)
 		if err != nil {
 			return err
 		}
 		session, p, err := s.dialWithGap(ctx, subInput)
+		release()
 		if err != nil {
-			release()
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -552,6 +552,10 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 		st.rec.Store(rec)
 		backfilled, err := s.serveSession(ctx, live, p,
 			func(c context.Context, p uint64) error {
+				release, err := s.acquireResubscribe(c)
+				if err != nil {
+					return err
+				}
 				defer release()
 				if err := s.keysStreamBackfill(c, st, base, fromBlock, p); err != nil {
 					return err
@@ -561,7 +565,6 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 			},
 			func(c context.Context) error { return s.processKeysStream(c, st, session) },
 			s.streamReconcileRun(st, rec))
-		release() // no-op unless the session ended before its backfill ran
 		st.rec.Store(nil)
 		backoff = backoffAfterSession(backoff, err)
 		if !backfilled {
@@ -586,12 +589,11 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 	}
 }
 
-// acquireResubscribe takes a resubSem slot. The returned release is
-// idempotent, so every path may call it.
-func (s *EventSubscriber) acquireResubscribe(ctx context.Context) (func(), error) {
+// acquireResubscribe takes a resubSem slot; call release exactly once.
+func (s *EventSubscriber) acquireResubscribe(ctx context.Context) (release func(), err error) {
 	select {
 	case s.resubSem <- struct{}{}:
-		return sync.OnceFunc(func() { <-s.resubSem }), nil
+		return func() { <-s.resubSem }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

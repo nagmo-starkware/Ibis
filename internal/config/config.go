@@ -66,8 +66,8 @@ type IndexerConfig struct {
 	//                          (duration string, e.g. "100ms"; default 100ms).
 	//   MaxConcurrentCatchup — bound on concurrent catchup/poll iterations across
 	//                          all contract goroutines (default 16).
-	//   MaxConcurrentResubscribe — bound on firehose-keys streams resubscribing
-	//                          (dial through post-subscribe backfill) at once
+	//   MaxConcurrentResubscribe — bound on firehose-keys streams subscribing or
+	//                          running their post-subscribe backfill at once
 	//                          (default 32).
 	TipPollInterval          string `yaml:"tip_poll_interval,omitempty"`
 	CatchupPollInterval      string `yaml:"catchup_poll_interval,omitempty"`
