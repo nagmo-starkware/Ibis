@@ -237,3 +237,18 @@ func TestResubscribeGateReleasedOnCancel(t *testing.T) {
 	chain.tip.Store(121)
 	waitLive(t, sub)
 }
+
+// Reconnect sleeps never undercut the backoff and are spread across streams.
+func TestJitterSpreadsReconnects(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for range 100 {
+		d := jitter(time.Second)
+		if d < time.Second || d > 1500*time.Millisecond {
+			t.Fatalf("jitter(1s) = %v, want in [1s, 1.5s]", d)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 50 {
+		t.Fatalf("jitter(1s) gave only %d distinct sleeps in 100 calls; streams would reconnect in lockstep", len(seen))
+	}
+}
