@@ -1021,6 +1021,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		MaxConcurrentPolls:  e.cfg.Indexer.MaxConcurrentCatchup,
 		ReconcileInterval:   reconcileInterval,
 		ReconcileLag:        reconcileLag,
+
+		MaxConcurrentResubscribes: e.cfg.Indexer.MaxConcurrentResubscribe,
 	})
 	subscriber.SetReorgChan(e.reorgs)
 
