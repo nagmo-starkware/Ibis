@@ -110,13 +110,23 @@ func (s *EventSubscriber) waitAccepted(ctx context.Context, p uint64) error {
 // its reconnect backoff.
 var errBackfillFailed = errors.New("post-subscribe backfill failed")
 
-// jitter spreads a reconnect sleep over [d, 1.5d), so streams dropped together
-// do not resubscribe in lockstep.
-func jitter(d time.Duration) time.Duration {
+// Reconnect spread after a firehose-keys session ends: every stream on the
+// shared socket ends at once, so the window grows with the stream count
+// (~15s for 3.75k streams) instead of queueing the whole wave on the gates.
+const (
+	reconnectSpreadPerStream = 4 * time.Millisecond
+	maxReconnectSpread       = 30 * time.Second
+)
+
+// jitter spreads a reconnect sleep over [d, d+w), where w is d/2 or the
+// streams-scaled window, whichever is wider, so streams dropped together do
+// not resubscribe in lockstep.
+func jitter(d time.Duration, streams int64) time.Duration {
 	if d <= 0 {
 		return d
 	}
-	return d + rand.N(d/2+1)
+	w := min(time.Duration(streams)*reconnectSpreadPerStream, maxReconnectSpread)
+	return d + rand.N(max(w, d/2)+1)
 }
 
 // stableSessionAge is how long a session must have run before its end resets

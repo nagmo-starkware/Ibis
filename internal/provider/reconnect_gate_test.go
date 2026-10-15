@@ -178,18 +178,42 @@ func assertSlotsFree(t *testing.T, sub *EventSubscriber) {
 func TestJitterSpreadsReconnects(t *testing.T) {
 	seen := map[time.Duration]bool{}
 	for range 100 {
-		d := jitter(time.Second)
+		d := jitter(time.Second, 1)
 		if d < time.Second || d > 1500*time.Millisecond {
-			t.Fatalf("jitter(1s) = %v, want in [1s, 1.5s]", d)
+			t.Fatalf("jitter(1s, 1) = %v, want in [1s, 1.5s]", d)
 		}
 		seen[d] = true
 	}
 	if len(seen) < 50 {
-		t.Fatalf("jitter(1s) gave only %d distinct sleeps in 100 calls; streams would reconnect in lockstep", len(seen))
+		t.Fatalf("jitter(1s, 1) gave only %d distinct sleeps in 100 calls; streams would reconnect in lockstep", len(seen))
 	}
 	for _, d := range []time.Duration{0, -time.Second} {
-		if got := jitter(d); got != d {
+		if got := jitter(d, 1000); got != d {
 			t.Fatalf("jitter(%v) = %v, want it unchanged", d, got)
+		}
+	}
+}
+
+// The spread window grows with the number of streams ending together, up to
+// maxReconnectSpread.
+func TestJitterScalesWithStreams(t *testing.T) {
+	for _, tc := range []struct {
+		streams int64
+		window  time.Duration
+	}{
+		{3750, 3750 * reconnectSpreadPerStream},
+		{1_000_000, maxReconnectSpread},
+	} {
+		var hi time.Duration
+		for range 2000 {
+			d := jitter(time.Second, tc.streams)
+			if d < time.Second || d > time.Second+tc.window {
+				t.Fatalf("jitter(1s, %d) = %v, want in [1s, 1s+%v]", tc.streams, d, tc.window)
+			}
+			hi = max(hi, d)
+		}
+		if hi < time.Second+tc.window*3/4 {
+			t.Fatalf("jitter(1s, %d) max %v over 2000 draws; window %v not used", tc.streams, hi, tc.window)
 		}
 	}
 }
