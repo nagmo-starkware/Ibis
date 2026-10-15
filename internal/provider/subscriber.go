@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"sync"
@@ -50,6 +51,13 @@ const (
 	// burst. This is NOT a connection limit — multiplexing already collapses the
 	// address-subs onto one socket — just gentle pacing of the re-subscribe wave.
 	sharedSubscribeConcurrency = 16
+
+	// defaultAddrWSShards is how many shared sockets the firehose-keys
+	// address-subs are spread over (by address hash). A provider dropping one
+	// socket restarts only ~1/N of the streams; N stays far below the
+	// per-stream handshakes multiplexing removed. Overridable via
+	// indexer.addr_ws_shards.
+	defaultAddrWSShards = 4
 
 	// Default polling intervals. Overridable per deployment via SubscriberConfig
 	// (wired from indexer.catchup_poll_interval / indexer.tip_poll_interval).
@@ -130,7 +138,7 @@ func (s *EventSubscriber) multiplexKeysDialer(ctx context.Context, wsURL string,
 		return defaultWSSDialer(ctx, wsURL, input)
 	}
 
-	ws, err := s.sharedAddrWS(ctx, wsURL)
+	ws, err := s.sharedAddrWS(ctx, wsURL, s.addrShard(input.FromAddress))
 	if err != nil {
 		return nil, err
 	}
@@ -161,41 +169,53 @@ func (s *EventSubscriber) multiplexKeysDialer(ctx context.Context, wsURL string,
 	}, nil
 }
 
-// sharedAddrWS returns the shared address-sub websocket, dialing it exactly
-// once (serialized under addrWSMu, so only ONE handshake ever races even when
-// hundreds of address streams start together). Reused across reconnects — the
-// underlying starknet.go client reconnects the socket transparently, so a
-// dropped connection re-establishes without a fresh handshake per stream.
-func (s *EventSubscriber) sharedAddrWS(ctx context.Context, wsURL string) (*rpc.WsProvider, error) {
+// addrShard picks the shared socket an address-sub rides: a stable hash of its
+// address, so a stream always resubscribes on the same shard.
+func (s *EventSubscriber) addrShard(addr *felt.Felt) int {
+	h := fnv.New32a()
+	b := addr.Bytes()
+	h.Write(b[:])
+	return int(h.Sum32() % uint32(len(s.addrWS)))
+}
+
+// sharedAddrWS returns shard's shared address-sub websocket, dialing it exactly
+// once (serialized under addrWSMu, so only ONE handshake per shard ever races
+// even when hundreds of address streams start together). Reused across
+// reconnects — the underlying starknet.go client reconnects the socket
+// transparently, so a dropped connection re-establishes without a fresh
+// handshake per stream. A failed dial is not memoized: the next caller retries.
+func (s *EventSubscriber) sharedAddrWS(ctx context.Context, wsURL string, shard int) (*rpc.WsProvider, error) {
 	s.addrWSMu.Lock()
 	defer s.addrWSMu.Unlock()
-	if s.addrWS != nil {
-		return s.addrWS, nil
+	if s.addrWS[shard] != nil {
+		return s.addrWS[shard], nil
 	}
 	// Dial against the subscriber-scoped ctx, not the caller's per-stream ctx,
 	// so one stream's cancellation (e.g. a frozen child) can't close the socket
-	// every other address-sub shares.
+	// every other address-sub on the shard shares.
 	connCtx := s.wsCtx
 	if connCtx == nil {
 		connCtx = ctx
 	}
 	ws, err := s.dialSharedWS(connCtx, wsURL)
 	if err != nil {
-		return nil, fmt.Errorf("dialing shared address websocket: %w", err)
+		return nil, fmt.Errorf("dialing shared address websocket (shard %d): %w", shard, err)
 	}
-	s.addrWS = ws
+	s.addrWS[shard] = ws
 	return ws, nil
 }
 
-// closeSharedAddrWS tears down the shared address-sub socket. Called once on
+// closeSharedAddrWS tears down every shared address-sub socket. Called once on
 // firehose-keys shutdown, after every stream goroutine has exited.
 func (s *EventSubscriber) closeSharedAddrWS() {
 	s.addrWSMu.Lock()
-	ws := s.addrWS
-	s.addrWS = nil
+	socks := s.addrWS
+	s.addrWS = make([]*rpc.WsProvider, len(socks))
 	s.addrWSMu.Unlock()
-	if ws != nil {
-		ws.Close()
+	for _, ws := range socks {
+		if ws != nil {
+			ws.Close()
+		}
 	}
 }
 
@@ -256,6 +276,10 @@ type SubscriberConfig struct {
 	// MaxConcurrentPolls bounds how many contract goroutines may run an RPC-heavy
 	// catchup/poll iteration simultaneously. 0 = maxConcurrentCatchup.
 	MaxConcurrentPolls int
+
+	// AddrWSShards is how many shared sockets the firehose-keys address-subs
+	// are spread over. 0 = defaultAddrWSShards.
+	AddrWSShards int
 
 	// MaxConcurrentResubscribes bounds how many firehose-keys streams may run
 	// their post-subscribe phase at once. 0 = maxConcurrentResubscribe.
@@ -394,8 +418,8 @@ type EventSubscriber struct {
 	// catchup storm. Alchemy permits 1000 subscriptions per connection — far
 	// above the live child count.
 	addrWSMu   sync.Mutex
-	addrWS     *rpc.WsProvider // shared address-sub socket; lazily dialed, reused across reconnects
-	addrSubSem chan struct{}   // paces concurrent SubscribeEvents over addrWS
+	addrWS     []*rpc.WsProvider // shared address-sub sockets by shard (addrShard); lazily dialed, reused across reconnects
+	addrSubSem chan struct{}     // paces concurrent SubscribeEvents over addrWS
 
 	// wsCtx is the subscriber-scoped context governing the shared addrWS socket's
 	// lifetime, set at the top of startKeysFirehose. addrWS is dialed against it
@@ -425,6 +449,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 	catchupInterval := defaultCatchupPollInterval
 	maxConcurrent := maxConcurrentCatchup
 	maxResub := maxConcurrentResubscribe
+	addrShards := defaultAddrWSShards
 	var reconcileInterval time.Duration
 	reconcileLag := defaultReconcileLag
 	if cfg != nil {
@@ -451,6 +476,9 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		}
 		if cfg.MaxConcurrentResubscribes > 0 {
 			maxResub = cfg.MaxConcurrentResubscribes
+		}
+		if cfg.AddrWSShards > 0 {
+			addrShards = cfg.AddrWSShards
 		}
 	}
 
@@ -480,6 +508,7 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		tracked:             make(map[string]ContractSubscription),
 		addrStreams:         make(map[string]*firehoseKeysStream),
 		addrCancels:         make(map[string]context.CancelFunc),
+		addrWS:              make([]*rpc.WsProvider, addrShards),
 		addrSubSem:          make(chan struct{}, sharedSubscribeConcurrency),
 		memSoftLimit:        memSoftLimit(),
 		memUsage:            runtimeMemUsage,

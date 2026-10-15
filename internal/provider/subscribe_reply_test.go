@@ -141,14 +141,15 @@ func TestMultiplexDialerSubscribeFailureThenReuse(t *testing.T) {
 			if l := len(sub.addrSubSem); l != 0 {
 				t.Fatalf("pacing slot not released after failed subscribe: %d held", l)
 			}
-			ws := sub.addrWS
+			shard := sub.addrShard(in.FromAddress)
+			ws := sub.addrWS[shard]
 
 			sess, err = sub.multiplexKeysDialer(context.Background(), url, in)
 			if err != nil {
 				t.Fatalf("shared socket unusable after a failed subscribe: %v", err)
 			}
 			defer sess.close()
-			if sub.addrWS != ws {
+			if sub.addrWS[shard] != ws {
 				t.Error("shared socket was redialed instead of reused")
 			}
 		})

@@ -173,6 +173,9 @@ func validateIndexerPolling(ic *IndexerConfig) error {
 	if ic.MaxConcurrentResubscribe < 0 {
 		return fieldError("indexer.max_concurrent_resubscribe", "must be >= 0")
 	}
+	if ic.AddrWSShards < 0 {
+		return fieldError("indexer.addr_ws_shards", "must be >= 0")
+	}
 	return nil
 }
 
