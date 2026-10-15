@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,6 +98,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	s.logger.Info("API server starting", "addr", addr)
+	if s.cfg.PprofAddr != "" {
+		go s.servePprof(ctx)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -115,6 +119,26 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// servePprof serves net/http/pprof on cfg.PprofAddr until ctx is canceled. A
+// failure is logged, not fatal: profiling must never take the API down.
+func (s *Server) servePprof(ctx context.Context) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	srv := &http.Server{Addr: s.cfg.PprofAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	s.logger.Info("pprof server starting", "addr", s.cfg.PprofAddr)
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		s.logger.Error("pprof server failed", "error", err)
+	}
 }
 
 // readyGate 503s the data endpoints until the server is marked ready. Health

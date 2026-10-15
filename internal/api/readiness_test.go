@@ -1,10 +1,14 @@
 package api_test
 
 import (
+	"context"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/b-j-roberts/ibis/internal/api"
 	"github.com/b-j-roberts/ibis/internal/config"
@@ -76,7 +80,7 @@ func TestCatchupStatusAnswersWhileNotReady(t *testing.T) {
 	}
 
 	body := getJSON(t, ts, "/v1/catchup_status")
-	for _, k := range []string{"ready", "streams_live", "streams_total", "backfills_pending", "catchup_complete"} {
+	for _, k := range []string{"ready", "streams_live", "streams_total", "backfills_pending", "catchup_complete", "reconnect"} {
 		if _, ok := body[k]; !ok {
 			t.Errorf("catchup_status must expose %q - the promote gate reads it", k)
 		}
@@ -88,5 +92,42 @@ func TestCatchupStatusAnswersWhileNotReady(t *testing.T) {
 	// rather than trivially true, or a gate would pass on an idle instance.
 	if done, _ := body["catchup_complete"].(bool); done {
 		t.Error("catchup_complete must be false when no streams are running")
+	}
+}
+
+// pprof_addr serves the profiling endpoints on their own listener, apart from
+// the API.
+func TestPprofServer(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserving a port: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	srv := api.New(&api.ServerConfig{
+		Store:     memory.New(),
+		APIConfig: &config.APIConfig{Host: "127.0.0.1", Port: 0, PprofAddr: addr},
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = srv.Start(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := http.Get("http://" + addr + "/debug/pprof/heap?debug=1")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET /debug/pprof/heap = %d, want 200", resp.StatusCode)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pprof server never answered: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

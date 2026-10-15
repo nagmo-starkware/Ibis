@@ -30,6 +30,27 @@ func TestReconnectWavePeakConcurrency(t *testing.T) {
 	assertSlotsFree(t, sub)
 }
 
+// A shared-socket drop shows in ReconnectStats as one ended session per stream,
+// and nothing is left queued once every stream is live again.
+func TestReconnectStatsCountDrop(t *testing.T) {
+	const n = 50
+	w := &waveNode{latency: time.Millisecond}
+	sub, ss := startReconnectWave(t, n, w, SubscriberConfig{})
+	dropAndRecover(t, n, w, sub, ss, 10*time.Second)
+
+	rs := sub.ReconnectStats()
+	if rs.SessionsEnded < n {
+		t.Fatalf("SessionsEnded = %d after dropping %d streams, want >= %d", rs.SessionsEnded, n, n)
+	}
+	if rs.ResubscribesWaiting != 0 || rs.MemGateWaiting != 0 {
+		t.Fatalf("after recovery: ResubscribesWaiting = %d, MemGateWaiting = %d, want 0",
+			rs.ResubscribesWaiting, rs.MemGateWaiting)
+	}
+	if rs.MemBytes == 0 {
+		t.Fatal("MemBytes = 0, want the process's memory")
+	}
+}
+
 // gateSite is a keys-sub plus one address-sub sharing a resubscribe bound of
 // 1: a slot leaked on any path leaves the other stream never live.
 func gateSite() gapSite {

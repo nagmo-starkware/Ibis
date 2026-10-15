@@ -1659,6 +1659,14 @@ func (e *Engine) BackfillsPending() int64 {
 	return e.subscriber.BackfillsPending()
 }
 
+// ReconnectStats proxies the subscriber's reconnect counters to the API.
+func (e *Engine) ReconnectStats() provider.ReconnectStats {
+	if e.subscriber == nil {
+		return provider.ReconnectStats{}
+	}
+	return e.subscriber.ReconnectStats()
+}
+
 func (e *Engine) ViewStatuses() []ViewStatus {
 	if e.poller == nil {
 		return nil
