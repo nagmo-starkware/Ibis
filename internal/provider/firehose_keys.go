@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime/debug"
+	"runtime/metrics"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -585,14 +587,88 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 	}
 }
 
-// acquireResubscribe takes a resubSem slot; call release exactly once.
+// acquireResubscribe takes a resubSem slot, first waiting out memory pressure
+// (see waitForMemory); call release exactly once.
 func (s *EventSubscriber) acquireResubscribe(ctx context.Context) (release func(), err error) {
+	if err := s.waitForMemory(ctx); err != nil {
+		return nil, err
+	}
 	select {
 	case s.resubSem <- struct{}{}:
 		return func() { <-s.resubSem }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// Memory gate defaults: hold new resubscribes while Go-managed memory is above
+// memGateFraction of GOMEMLIMIT, re-checking every memGatePoll, for at most
+// memGateMaxWait per caller.
+const (
+	memGateFraction = 0.8
+	memGatePoll     = 250 * time.Millisecond
+	memGateMaxWait  = 60 * time.Second
+)
+
+// memSoftLimit is the gate threshold: memGateFraction of the GOMEMLIMIT soft
+// limit, or 0 (gate off) when no limit is set.
+func memSoftLimit() uint64 {
+	limit := debug.SetMemoryLimit(-1) // reads without changing it
+	if limit <= 0 || limit == math.MaxInt64 {
+		return 0
+	}
+	return uint64(float64(limit) * memGateFraction)
+}
+
+var memSamples = []metrics.Sample{
+	{Name: "/memory/classes/total:bytes"},
+	{Name: "/memory/classes/heap/released:bytes"},
+}
+
+// runtimeMemUsage is the Go-managed memory GOMEMLIMIT counts against: all
+// mapped memory minus heap returned to the OS. Cheap (no stop-the-world).
+func runtimeMemUsage() uint64 {
+	samples := make([]metrics.Sample, len(memSamples))
+	copy(samples, memSamples)
+	metrics.Read(samples)
+	total, released := samples[0].Value.Uint64(), samples[1].Value.Uint64()
+	if released > total {
+		return 0
+	}
+	return total - released
+}
+
+// waitForMemory holds a resubscribe while memory is above the soft limit, so a
+// reconnect wave slows down near the container limit instead of being
+// OOM-killed (which also takes the API down). It gives up after memMaxWait and
+// proceeds: steady-state memory alone may sit above the threshold, and an
+// indexer that never resubscribes is worse than a slow one.
+func (s *EventSubscriber) waitForMemory(ctx context.Context) error {
+	if s.memSoftLimit == 0 || s.memUsage() < s.memSoftLimit {
+		return nil
+	}
+	start := time.Now()
+	// Log the first waiter only: a wave would otherwise log once per stream.
+	if s.memWaiting.Add(1) == 1 {
+		s.logger.Warn("memory above soft limit; holding resubscribes",
+			"mem_bytes", s.memUsage(), "soft_limit_bytes", s.memSoftLimit)
+	}
+	defer s.memWaiting.Add(-1)
+	tick := time.NewTicker(s.memPoll)
+	defer tick.Stop()
+	for s.memUsage() >= s.memSoftLimit {
+		if time.Since(start) >= s.memMaxWait {
+			s.logger.Debug("memory still above soft limit; resubscribing anyway",
+				"mem_bytes", s.memUsage(), "soft_limit_bytes", s.memSoftLimit, "waited", time.Since(start))
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+	return nil
 }
 
 // keysStreamGapFill brings every contract in st's gap-fill set within
