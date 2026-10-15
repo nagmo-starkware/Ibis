@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -1102,7 +1103,12 @@ func (s *EventSubscriber) subscribeWSS(ctx context.Context, contract ContractSub
 				return err
 			},
 			s.contractReconcileRun(contract, rec))
-		backoff = backoffAfterSession(backoff, err)
+		// Per-contract sockets are not shared, so a drop is not a wave: keep
+		// resetting (unless the backfill failed) and let the session-failure
+		// count below fall a flapping socket back to polling.
+		if !errors.Is(err, errBackfillFailed) {
+			backoff = minBackoff
+		}
 		if backfilled {
 			// The backfill covered through P, so a quiet contract advances too.
 			*lastBlock = max(liveLast, p)

@@ -545,6 +545,7 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 		base := st.streamBase()
 		rec := s.streamReconciler(st)
 		st.rec.Store(rec)
+		started := time.Now()
 		backfilled, err := s.serveSession(ctx, live, p,
 			func(c context.Context, p uint64) error {
 				release, err := s.acquireResubscribe(c)
@@ -561,7 +562,7 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 			func(c context.Context) error { return s.processKeysStream(c, st, session) },
 			s.streamReconcileRun(st, rec))
 		st.rec.Store(nil)
-		backoff = backoffAfterSession(backoff, err)
+		backoff = backoffAfterSession(backoff, err, time.Since(started))
 		if !backfilled {
 			st.capCursors(base)
 		} else if f := rec.resumeFloor(); f > 0 {
