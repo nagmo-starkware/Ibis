@@ -579,7 +579,7 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(jitter(backoff)):
+		case <-time.After(jitter(backoff, s.streamsTotal.Load())):
 		}
 		backoff = time.Duration(math.Min(float64(backoff)*2, float64(maxBackoff)))
 	}
