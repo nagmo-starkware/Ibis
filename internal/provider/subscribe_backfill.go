@@ -119,10 +119,18 @@ func jitter(d time.Duration) time.Duration {
 	return d + rand.N(d/2+1)
 }
 
-// backoffAfterSession is the reconnect backoff after a session: reset unless
-// the session ended because its backfill failed.
-func backoffAfterSession(cur time.Duration, err error) time.Duration {
-	if errors.Is(err, errBackfillFailed) {
+// stableSessionAge is how long a session must have run before its end resets
+// the reconnect backoff. Shorter sessions keep escalating it, so a
+// provider that drops the socket again right after every reconnect is met with
+// a growing delay instead of a fresh resubscribe wave every ~1s. A var only so
+// tests of other behavior can reconnect quickly; never changed in production.
+var stableSessionAge = 60 * time.Second
+
+// backoffAfterSession is the reconnect backoff after a session: reset only if
+// the session stayed up for stableSessionAge and did not end because its
+// backfill failed.
+func backoffAfterSession(cur time.Duration, err error, lasted time.Duration) time.Duration {
+	if errors.Is(err, errBackfillFailed) || lasted < stableSessionAge {
 		return cur
 	}
 	return minBackoff

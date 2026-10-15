@@ -658,6 +658,12 @@ func TestReconcileReorgRecoversFromReorgStart(t *testing.T) {
 func TestReconcileReconnectRedeliveryBounded(t *testing.T) {
 	for _, site := range reconSites("keys-sub", "keys-address-sub", "keys-child-transfer", "shared-firehose", "per-contract") {
 		t.Run(site.name, func(t *testing.T) {
+			// Reconnect at the base backoff each time: this test is about
+			// re-delivery, not the flapping-socket backoff. Restored after
+			// the subscriber stops (cleanups run in reverse).
+			prev := stableSessionAge
+			stableSessionAge = 0
+			t.Cleanup(func() { stableSessionAge = prev })
 			chain := newGapChain(121, 121)
 			node := newGapNode()
 			sub, events, _ := startReconSite(t, site, chain, node, 20*time.Millisecond)

@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -189,6 +190,30 @@ func TestJitterSpreadsReconnects(t *testing.T) {
 	for _, d := range []time.Duration{0, -time.Second} {
 		if got := jitter(d); got != d {
 			t.Fatalf("jitter(%v) = %v, want it unchanged", d, got)
+		}
+	}
+}
+
+// Only a session that stayed up resets the backoff; a socket that keeps
+// dropping right after each reconnect keeps escalating it.
+func TestBackoffAfterSession(t *testing.T) {
+	cur := 8 * time.Second
+	dropped := errors.New("socket dropped")
+	failed := fmt.Errorf("%w [..1]: boom", errBackfillFailed)
+	for _, tc := range []struct {
+		name   string
+		err    error
+		lasted time.Duration
+		want   time.Duration
+	}{
+		{"stable", dropped, stableSessionAge, minBackoff},
+		{"long_stable", dropped, time.Hour, minBackoff},
+		{"flapping", dropped, stableSessionAge - time.Second, cur},
+		{"backfill_failed", failed, time.Hour, cur},
+	} {
+		if got := backoffAfterSession(cur, tc.err, tc.lasted); got != tc.want {
+			t.Errorf("%s: backoffAfterSession(%v, %v, %v) = %v, want %v",
+				tc.name, cur, tc.err, tc.lasted, got, tc.want)
 		}
 	}
 }
