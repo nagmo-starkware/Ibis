@@ -329,6 +329,15 @@ type EventSubscriber struct {
 	// resubSem bounds firehose-keys streams in their post-subscribe phase.
 	// See maxConcurrentResubscribe.
 	resubSem chan struct{}
+
+	// Memory gate in front of resubSem (see waitForMemory). memSoftLimit 0 =
+	// off; set from GOMEMLIMIT. memUsage and the timings are test seams.
+	memSoftLimit uint64
+	memUsage     func() uint64
+	memPoll      time.Duration
+	memMaxWait   time.Duration
+	memWaiting   atomic.Int64 // resubscribes currently held by the gate
+
 	// backfillGen numbers tracked backfills; 0 is never used.
 	backfillGen atomic.Uint64
 
@@ -467,6 +476,10 @@ func (p *StarknetProvider) NewSubscriber(contracts []ContractSubscription, event
 		addrStreams:         make(map[string]*firehoseKeysStream),
 		addrCancels:         make(map[string]context.CancelFunc),
 		addrSubSem:          make(chan struct{}, sharedSubscribeConcurrency),
+		memSoftLimit:        memSoftLimit(),
+		memUsage:            runtimeMemUsage,
+		memPoll:             memGatePoll,
+		memMaxWait:          memGateMaxWait,
 		dialSharedWS: func(ctx context.Context, wsURL string) (*rpc.WsProvider, error) {
 			return rpc.NewWebsocketProvider(ctx, wsURL)
 		},
