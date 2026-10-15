@@ -77,6 +77,10 @@ type IndexerConfig struct {
 	CatchupPollInterval      string `yaml:"catchup_poll_interval,omitempty"`
 	MaxConcurrentCatchup     int    `yaml:"max_concurrent_catchup,omitempty"`
 	MaxConcurrentResubscribe int    `yaml:"max_concurrent_resubscribe,omitempty"`
+	// AddrWSShards — how many shared sockets the firehose-keys address-subs
+	// are spread over, so one dropped socket restarts only part of them
+	// (default 4).
+	AddrWSShards int `yaml:"addr_ws_shards,omitempty"`
 
 	// Live-stream reconciliation. A WSS subscription can silently miss events
 	// while connected (measured upstream of ibis), so every live stream is

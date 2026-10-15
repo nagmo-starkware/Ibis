@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -106,7 +107,7 @@ func TestSharedAddrWSDialedOnce(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			got[i], errs[i] = sub.sharedAddrWS(context.Background(), "ws://mock")
+			got[i], errs[i] = sub.sharedAddrWS(context.Background(), "ws://mock", 0)
 		}(i)
 	}
 	wg.Wait()
@@ -122,6 +123,61 @@ func TestSharedAddrWSDialedOnce(t *testing.T) {
 			t.Fatalf("caller %d got a different provider; all address-subs must share one", i)
 		}
 	}
+}
+
+// Address-subs spread over the configured shards by a stable hash: each shard
+// dials its own socket once, and an address always lands on the same shard.
+func TestSharedAddrWSShards(t *testing.T) {
+	p := &StarknetProvider{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	for _, tc := range []struct {
+		cfg  *SubscriberConfig
+		want int
+	}{
+		{nil, defaultAddrWSShards},
+		{&SubscriberConfig{AddrWSShards: 1}, 1},
+		{&SubscriberConfig{AddrWSShards: 8}, 8},
+	} {
+		if got := len(p.NewSubscriber(nil, nil, tc.cfg).addrWS); got != tc.want {
+			t.Errorf("cfg %+v: %d shards, want %d", tc.cfg, got, tc.want)
+		}
+	}
+
+	sub := p.NewSubscriber(nil, nil, &SubscriberConfig{AddrWSShards: 4})
+	sub.wsCtx = context.Background()
+	var dials atomic.Int64
+	sub.dialSharedWS = func(_ context.Context, _ string) (*rpc.WsProvider, error) {
+		dials.Add(1)
+		return &rpc.WsProvider{}, nil
+	}
+
+	perShard := map[int]int{}
+	sockets := map[*rpc.WsProvider]int{}
+	for i := range 1000 {
+		addr := newTestFelt(0x10000 + uint64(i))
+		shard := sub.addrShard(addr)
+		if again := sub.addrShard(addr); again != shard {
+			t.Fatalf("address %v hashed to shard %d then %d", addr, shard, again)
+		}
+		ws, err := sub.sharedAddrWS(context.Background(), "ws://mock", shard)
+		if err != nil {
+			t.Fatalf("sharedAddrWS(shard %d): %v", shard, err)
+		}
+		if prev, ok := sockets[ws]; ok && prev != shard {
+			t.Fatalf("shards %d and %d share a socket", prev, shard)
+		}
+		sockets[ws] = shard
+		perShard[shard]++
+	}
+	if d := dials.Load(); d != 4 {
+		t.Fatalf("dialed %d sockets for 4 shards, want 4", d)
+	}
+	for shard := range 4 {
+		// A uniform split is 250 each; a drop must never hit (nearly) all.
+		if n := perShard[shard]; n < 150 || n > 350 {
+			t.Fatalf("shard %d got %d of 1000 addresses, want ~250: %v", shard, n, perShard)
+		}
+	}
+
 }
 
 // TestSharedAddrWSDialErrorNotMemoized verifies a failed dial is not cached:
@@ -140,10 +196,10 @@ func TestSharedAddrWSDialErrorNotMemoized(t *testing.T) {
 		return sentinel, nil
 	}
 
-	if _, err := sub.sharedAddrWS(context.Background(), "ws://mock"); err == nil {
+	if _, err := sub.sharedAddrWS(context.Background(), "ws://mock", 0); err == nil {
 		t.Fatal("expected first dial to error")
 	}
-	ws, err := sub.sharedAddrWS(context.Background(), "ws://mock")
+	ws, err := sub.sharedAddrWS(context.Background(), "ws://mock", 0)
 	if err != nil {
 		t.Fatalf("second dial should retry and succeed, got %v", err)
 	}

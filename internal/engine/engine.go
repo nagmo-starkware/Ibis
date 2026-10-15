@@ -1020,6 +1020,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		CatchupPollInterval:       catchupInterval,
 		MaxConcurrentPolls:        e.cfg.Indexer.MaxConcurrentCatchup,
 		MaxConcurrentResubscribes: e.cfg.Indexer.MaxConcurrentResubscribe,
+		AddrWSShards:              e.cfg.Indexer.AddrWSShards,
 		ReconcileInterval:         reconcileInterval,
 		ReconcileLag:              reconcileLag,
 	})
