@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/b-j-roberts/ibis/internal/config"
+	"github.com/b-j-roberts/ibis/internal/provider"
 	"github.com/b-j-roberts/ibis/internal/store"
 	"github.com/b-j-roberts/ibis/internal/types"
 )
@@ -193,6 +194,9 @@ type transportStatus struct {
 	// (or retrying). Informational — gate on catchup_complete.
 	BackfillsPending int64 `json:"backfills_pending"`
 	CatchupComplete  bool  `json:"catchup_complete"`
+	// Reconnect is informational: what a shared-socket drop is doing right
+	// now (sessions ended, streams queued, memory against the gate).
+	Reconnect provider.ReconnectStats `json:"reconnect"`
 }
 
 // transportStatus reads stream liveness from the engine. With no engine wired
@@ -208,6 +212,7 @@ func (s *Server) transportStatus() transportStatus {
 		StreamsTotal:     total,
 		BackfillsPending: s.engine.BackfillsPending(),
 		CatchupComplete:  complete,
+		Reconnect:        s.engine.ReconnectStats(),
 	}
 }
 

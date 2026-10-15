@@ -575,6 +575,7 @@ func (s *EventSubscriber) runFirehoseKeysStream(ctx context.Context, st *firehos
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		s.sessionsEnded.Add(1)
 		s.logger.Warn("firehose-keys WSS session ended, reconnecting",
 			"stream", st.label, "error", err, "backoff", backoff)
 
@@ -593,6 +594,8 @@ func (s *EventSubscriber) acquireResubscribe(ctx context.Context) (release func(
 	if err := s.waitForMemory(ctx); err != nil {
 		return nil, err
 	}
+	s.resubWaiting.Add(1)
+	defer s.resubWaiting.Add(-1)
 	select {
 	case s.resubSem <- struct{}{}:
 		return func() { <-s.resubSem }, nil

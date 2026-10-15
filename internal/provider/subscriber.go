@@ -338,6 +338,11 @@ type EventSubscriber struct {
 	memMaxWait   time.Duration
 	memWaiting   atomic.Int64 // resubscribes currently held by the gate
 
+	// Reconnect counters (see ReconnectStats). sessionsEnded is cumulative;
+	// resubWaiting counts streams queued on resubSem.
+	sessionsEnded atomic.Int64
+	resubWaiting  atomic.Int64
+
 	// backfillGen numbers tracked backfills; 0 is never used.
 	backfillGen atomic.Uint64
 
@@ -876,17 +881,49 @@ func (l *streamLiveness) set(live bool) {
 func (s *EventSubscriber) reportTransportStatus(ctx context.Context) {
 	ticker := time.NewTicker(s.statusInterval)
 	defer ticker.Stop()
+	var prevEnded int64
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			live, total, complete := s.TransportStatus()
+			rs := s.ReconnectStats()
 			s.logger.Info("transport status",
 				"streams_live", live,
 				"streams_total", total,
-				"catchup_complete", complete)
+				"catchup_complete", complete,
+				// Per interval, for a log-based alert: a shared-socket drop
+				// shows up as a spike of the order of streams_total.
+				"sessions_ended", rs.SessionsEnded-prevEnded,
+				"resubscribes_waiting", rs.ResubscribesWaiting,
+				"mem_gate_waiting", rs.MemGateWaiting,
+				"mem_bytes", rs.MemBytes,
+				"mem_soft_limit_bytes", rs.MemSoftLimitBytes)
+			prevEnded = rs.SessionsEnded
 		}
+	}
+}
+
+// ReconnectStats is the firehose-keys reconnect picture: how many sessions
+// have ended (a shared-socket drop ends every stream on it at once), how many
+// streams are queued to resubscribe, and the memory the gate in front of them
+// reads. Counters only; cheap to read on every probe.
+type ReconnectStats struct {
+	SessionsEnded       int64  `json:"sessions_ended"`
+	ResubscribesWaiting int64  `json:"resubscribes_waiting"`
+	MemGateWaiting      int64  `json:"mem_gate_waiting"`
+	MemBytes            uint64 `json:"mem_bytes"`
+	MemSoftLimitBytes   uint64 `json:"mem_soft_limit_bytes"`
+}
+
+func (s *EventSubscriber) ReconnectStats() ReconnectStats {
+	return ReconnectStats{
+		SessionsEnded:       s.sessionsEnded.Load(),
+		ResubscribesWaiting: s.resubWaiting.Load(),
+		MemGateWaiting:      s.memWaiting.Load(),
+		MemBytes:            s.memUsage(),
+		MemSoftLimitBytes:   s.memSoftLimit,
 	}
 }
 

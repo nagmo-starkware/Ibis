@@ -218,9 +218,29 @@ func TestReconnectRecoveryBench(t *testing.T) {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {
 			w := &waveNode{latency: 20 * time.Millisecond, blockTime: time.Second}
 			sub, ss := startReconnectWave(t, n, w, SubscriberConfig{})
+			waitAllLive(t, sub, 10*time.Minute)
+			base := runtimeMemUsage()
+			var peak atomic.Uint64
+			stop := make(chan struct{})
+			go func() {
+				tick := time.NewTicker(10 * time.Millisecond)
+				defer tick.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-tick.C:
+						if m := runtimeMemUsage(); m > peak.Load() {
+							peak.Store(m)
+						}
+					}
+				}
+			}()
 			took := dropAndRecover(t, n, w, sub, ss, 10*time.Minute)
-			t.Logf("N=%d recovery=%v peak_post_rpcs=%d peak_blockNumber=%d",
-				n, took.Round(10*time.Millisecond), w.post.peak.Load(), w.tipReads.peak.Load())
+			close(stop)
+			t.Logf("N=%d recovery=%v peak_post_rpcs=%d peak_blockNumber=%d mem_before=%dMiB peak_mem=%dMiB",
+				n, took.Round(10*time.Millisecond), w.post.peak.Load(), w.tipReads.peak.Load(),
+				base>>20, peak.Load()>>20)
 		})
 	}
 }

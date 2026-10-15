@@ -44,6 +44,10 @@ type APIConfig struct {
 	Port        int      `yaml:"port"`
 	CORSOrigins []string `yaml:"cors_origins"`
 	AdminKey    string   `yaml:"admin_key"`
+	// PprofAddr serves net/http/pprof on its own listener (e.g.
+	// "127.0.0.1:6060") for heap profiles during a reconnect storm. Empty =
+	// off. Never expose it publicly: profiles leak internals.
+	PprofAddr string `yaml:"pprof_addr,omitempty"`
 }
 
 type IndexerConfig struct {
